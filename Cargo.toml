@@ -10,7 +10,7 @@ name = "privacy-indexer"
 path = "src/main.rs"
 
 [dependencies]
-privacy-core = { path = "../privacy-core" }
+privacy-core = "0.1.0"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
