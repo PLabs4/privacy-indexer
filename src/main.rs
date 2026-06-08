@@ -137,10 +137,6 @@ struct Cli {
     /// Re-loaded on startup so dynamically-added pools survive restarts.
     #[arg(long, env = "PRIVACYBTC_INDEXER_POOLS_REGISTRY")]
     pools_registry: Option<String>,
-    /// Optional bearer token required by the `POST /pools` admin endpoint.
-    /// When set, callers must send `Authorization: Bearer <token>`.
-    #[arg(long, env = "PRIVACYBTC_INDEXER_ADMIN_TOKEN")]
-    admin_token: Option<String>,
 }
 
 // ─── Domain types ────────────────────────────────────────────────────────────
@@ -372,7 +368,9 @@ struct PoolRegistry {
     primary: Arc<RwLock<Option<String>>>,
     builder: Arc<PoolBuilder>,
     registry_file: Option<String>,
-    admin_token: Option<String>,
+    /// Cache of addresses already verified as genuine pERC20 assets (lowercase
+    /// 0x). Avoids a repeat `eth_getLogs` on every re-registration attempt.
+    verified_pools: Arc<RwLock<HashSet<String>>>,
 }
 
 impl PoolRegistry {
@@ -411,6 +409,24 @@ impl PoolRegistry {
         }
         println!("[indexer] watching pool {address} (start_block={start_block})");
         Ok(true)
+    }
+
+    /// Confirm `pool_lc` (lowercase 0x) is a genuine pERC20 asset by checking it
+    /// emitted `Perc20Created(pool,…)` on-chain. Cached after the first success so
+    /// repeated registrations don't re-hit the RPC. Already-watched pools are
+    /// trivially genuine (we indexed their logs), so they short-circuit to true.
+    async fn verify_pool_genuine(&self, pool_lc: &str) -> Result<bool> {
+        if self.verified_pools.read().await.contains(pool_lc) {
+            return Ok(true);
+        }
+        if self.pools.read().await.contains_key(pool_lc) {
+            return Ok(true);
+        }
+        let genuine = self.builder.rpc.is_perc20_created(pool_lc).await?;
+        if genuine {
+            self.verified_pools.write().await.insert(pool_lc.to_string());
+        }
+        Ok(genuine)
     }
 
     /// Resolve the target pool from a `?pool=0x...` query param. When `pool` is
@@ -606,7 +622,7 @@ async fn main() -> Result<()> {
         primary: Arc::new(RwLock::new(None)),
         builder,
         registry_file: cli.pools_registry.clone(),
-        admin_token: cli.admin_token.clone(),
+        verified_pools: Arc::new(RwLock::new(HashSet::new())),
     };
 
     // 1) CLI pools (the first one becomes primary and owns the confirm signer).
@@ -654,6 +670,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// topic0 of `Perc20Created(address,address,string,string,uint8)` (the pERC20
+/// asset-creation event), used to verify a runtime-registered pool is genuine.
+fn perc20_created_topic0() -> String {
+    let hash = Keccak256::digest(b"Perc20Created(address,address,string,string,uint8)");
+    format!("0x{}", hex::encode(hash))
+}
+
 /// Same env as relayer: comma-separated origins in `PRIVACYBTC_CORS_ORIGINS`.
 /// Defaults to Vite dev server on localhost and 127.0.0.1.
 fn build_cors_layer() -> CorsLayer {
@@ -694,29 +717,38 @@ struct RegisterPoolRequest {
 }
 
 /// `POST /pools` — register a pool at runtime. Idempotent: returns 201 when the
-/// pool is newly added and 200 when it was already being watched. Guarded by
-/// `--admin-token` when configured.
+/// pool is newly added and 200 when it was already being watched. Gated by
+/// on-chain verification that the address is a genuine pERC20 (it emitted
+/// `Perc20Created`); no shared secret is required.
 async fn register_pool(
     State(reg): State<PoolRegistry>,
-    headers: HeaderMap,
     Json(req): Json<RegisterPoolRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
-    if let Some(expected) = &reg.admin_token {
-        let ok = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .map(|t| t == expected)
-            .unwrap_or(false);
-        if !ok {
-            return Err((StatusCode::UNAUTHORIZED, "missing or invalid admin token".to_owned()));
-        }
-    }
     if parse_address20(&req.contract_address).is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             "contract_address must be a 20-byte hex address".to_owned(),
         ));
+    }
+    // The only gate for runtime registration: the address must be a genuine pERC20
+    // asset — it emitted `Perc20Created(self,…)` on-chain (factory-deployed or
+    // standalone, both conformant). This needs no shared secret, so the browser
+    // can register pools directly; verified addresses are cached.
+    let addr_lc = normalize_hex_0x(&req.contract_address).to_lowercase();
+    match reg.verify_pool_genuine(&addr_lc).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "address is not a pERC20 asset (no Perc20Created event on-chain)".to_owned(),
+            ))
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("on-chain verification failed: {e:#}"),
+            ))
+        }
     }
     let added = reg
         .add_pool(&req.contract_address, req.start_block, true)
@@ -2025,6 +2057,26 @@ impl RpcClient {
         self.rpc_call("eth_getLogs", serde_json::json!([filter]))
             .await
             .with_context(|| format!("eth_getLogs failed for [{from_block}, {to_block}]"))
+    }
+
+    /// True if `pool` (0x-prefixed) emitted `Perc20Created(pool,…)` at construction
+    /// — i.e. it is a genuine pERC20 asset (factory-deployed or standalone, both
+    /// conformant). The event's indexed `pool` arg equals the emitting contract,
+    /// so we filter by both `address` and `topics[1]` for a precise, cheap lookup.
+    async fn is_perc20_created(&self, pool: &str) -> Result<bool> {
+        let addr = normalize_hex_0x(pool);
+        let topic1 = format!("0x{:0>64}", addr.trim_start_matches("0x"));
+        let filter = serde_json::json!({
+            "fromBlock": "0x0",
+            "toBlock":   "latest",
+            "address":   addr,
+            "topics":    [perc20_created_topic0(), topic1],
+        });
+        let logs: Vec<EthLog> = self
+            .rpc_call("eth_getLogs", serde_json::json!([filter]))
+            .await
+            .context("eth_getLogs (Perc20Created verification) failed")?;
+        Ok(!logs.is_empty())
     }
 
     async fn rpc_call<T: DeserializeOwned>(
