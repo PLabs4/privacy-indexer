@@ -90,7 +90,11 @@ struct Cli {
     /// e.g. --contract-address 0xBTC... --contract-address 0xERC...
     /// All pools are scanned by the same process on the same port; use ?pool=0x...
     /// query param on HTTP endpoints to select a specific pool.
-    #[arg(long, required = true)]
+    ///
+    /// Optional: an issuance-platform indexer can start with zero CLI pools and
+    /// have them registered at runtime via `POST /pools` (persisted with
+    /// --pools-registry). The first pool added (CLI or runtime) becomes primary.
+    #[arg(long)]
     contract_address: Vec<String>,
     /// `PrivacyBTC.sol` compatible logs: `NoteAdded`, `ShieldCompleted`, `NoteConfirmed`
     /// (topic0 OR filter). Default: on.
@@ -376,7 +380,8 @@ impl PoolRegistry {
     /// `Ok(false)` when it already existed (idempotent). When `persist` is set the
     /// pool is recorded in the registry file so it is re-added on restart.
     async fn add_pool(&self, raw_addr: &str, start_block: u64, persist: bool) -> Result<bool> {
-        let address = normalize_hex_0x(raw_addr);
+        // Pool keys are case-insensitive (Ethereum addresses), so normalise to lowercase.
+        let address = normalize_hex_0x(raw_addr).to_lowercase();
         if self.pools.read().await.contains_key(&address) {
             return Ok(false);
         }
@@ -414,7 +419,7 @@ impl PoolRegistry {
         let map = self.pools.read().await;
         match pool {
             Some(addr) => {
-                let key = normalize_hex_0x(addr);
+                let key = normalize_hex_0x(addr).to_lowercase();
                 map.get(&key)
                     .cloned()
                     .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown pool: {addr}")))
@@ -616,6 +621,11 @@ async fn main() -> Result<()> {
             }
         }
         println!("[indexer] pools registry: {path}");
+    }
+    if registry.pools.read().await.is_empty() {
+        println!(
+            "[indexer] no pools configured yet — idle until a pool is registered via POST /pools"
+        );
     }
 
     let app = Router::new()
