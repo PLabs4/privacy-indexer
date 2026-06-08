@@ -74,12 +74,12 @@ fn http_root_hex(state: &SharedState) -> Option<String> {
 struct Cli {
     /// HTTP(S) JSON-RPC URL. Used for receipt fetches; the WebSocket URL is derived
     /// from it (https→wss) unless --ws-url is given.
-    #[arg(long)]
+    #[arg(long, env = "PRIVACYBTC_ETH_RPC_URL")]
     rpc_url: String,
     /// Explicit WebSocket URL for the log subscription. Needed when the provider's WS
     /// path differs from its HTTP path (e.g. Infura: HTTP /v3/<key> vs WS /ws/v3/<key>),
     /// where a naive scheme swap would produce the wrong URL.
-    #[arg(long)]
+    #[arg(long, env = "PRIVACYBTC_ETH_WS_URL")]
     ws_url: Option<String>,
     /// PostgreSQL connection URL (e.g. postgres://user:pass@host:5432/privacybtc).
     /// When set, state is persisted to PG (queryable) instead of the JSON state file;
@@ -103,7 +103,7 @@ struct Cli {
     /// Legacy_TOPIC0: log `data` = single ABI `bytes` UTF-8 JSON [`OrchardStoredBundle`].
     #[arg(long)]
     legacy_bundle_topic0: Option<String>,
-    #[arg(long, default_value = "127.0.0.1:8787")]
+    #[arg(long, env = "PRIVACYBTC_INDEXER_BIND", default_value = "127.0.0.1:8787")]
     bind: String,
     #[arg(long, default_value_t = 512)]
     max_batches_in_memory: usize,
@@ -113,16 +113,16 @@ struct Cli {
     /// Path to a JSON file for persisting the last scanned block height.
     /// If the file exists on startup, `next_block` is restored from it (never
     /// going below --start-block). Updated after every successful scan chunk.
-    #[arg(long)]
+    #[arg(long, env = "PRIVACYBTC_INDEXER_STATE_FILE")]
     state_file: Option<String>,
     /// First block to scan when no checkpoint exists; resume never goes below this.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, env = "PRIVACYBTC_START_BLOCK", default_value_t = 0)]
     start_block: u64,
     /// Hex-encoded secp256k1 private key for the indexer's signing account.
     /// Required to relay Phase 2 confirmations on-chain.
-    #[arg(long)]
+    #[arg(long, env = "PRIVACYBTC_INDEXER_SIGNER_KEY")]
     signer_key: Option<String>,
-    #[arg(long, default_value_t = 1u64)]
+    #[arg(long, env = "PRIVACYBTC_CHAIN_ID", default_value_t = 1u64)]
     chain_id: u64,
     /// Gas price in wei for confirm transactions. Default: 1 Gwei.
     #[arg(long, default_value_t = 1_000_000_000u64)]
@@ -135,7 +135,7 @@ struct Cli {
     confirm_topic0: Option<String>,
     /// Path to a JSON file persisting pools registered at runtime via `POST /pools`.
     /// Re-loaded on startup so dynamically-added pools survive restarts.
-    #[arg(long)]
+    #[arg(long, env = "PRIVACYBTC_INDEXER_POOLS_REGISTRY")]
     pools_registry: Option<String>,
     /// Optional bearer token required by the `POST /pools` admin endpoint.
     /// When set, callers must send `Authorization: Bearer <token>`.
@@ -537,6 +537,9 @@ struct RootResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load a local `.env` (if present) before parsing, so CLI flags with `env = …`
+    // pick up values from the environment / docker-compose env_file.
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     let bind: SocketAddr = cli.bind.parse().context("invalid --bind address")?;
 

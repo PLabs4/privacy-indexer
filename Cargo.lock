@@ -1556,6 +1556,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "dotenvy",
  "ethabi",
  "futures-util",
  "hex",
