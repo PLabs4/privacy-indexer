@@ -129,6 +129,14 @@ struct Cli {
     /// Override `NoteConfirmed(bytes32,bytes32)` topic0 (default: canonical hash).
     #[arg(long)]
     confirm_topic0: Option<String>,
+    /// Path to a JSON file persisting pools registered at runtime via `POST /pools`.
+    /// Re-loaded on startup so dynamically-added pools survive restarts.
+    #[arg(long)]
+    pools_registry: Option<String>,
+    /// Optional bearer token required by the `POST /pools` admin endpoint.
+    /// When set, callers must send `Authorization: Bearer <token>`.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_ADMIN_TOKEN")]
+    admin_token: Option<String>,
 }
 
 // ─── Domain types ────────────────────────────────────────────────────────────
@@ -220,26 +228,244 @@ struct AppContext {
     recover_trigger: Arc<tokio::sync::Notify>,
 }
 
-/// Multi-pool HTTP state: maps normalised contract address → per-pool context.
-type PoolMap = Arc<HashMap<String, AppContext>>;
+/// Everything required to construct a per-pool `AppContext` and spawn its WS
+/// event loop. Shared by startup (CLI pools) and the runtime `POST /pools`
+/// endpoint so both paths build pools identically.
+struct PoolBuilder {
+    rpc: RpcClient,
+    wss_url: String,
+    signer: Option<Arc<SignerConfig>>,
+    pg_pool: Option<sqlx::PgPool>,
+    state_file_base: Option<String>,
+    /// When true, derive a unique JSON state file per pool from `state_file_base`.
+    /// Always true once multiple pools exist or a runtime registry is enabled.
+    derive_state_file: bool,
+    max_batches: usize,
+    pending_timeout_blocks: u64,
+    privacybtc_abi_logs: bool,
+    legacy_bundle_topic0: Option<String>,
+    note_confirmed_topic0: String,
+}
 
-/// Resolve the target pool from a `?pool=0x...` query param.
-/// If `pool` is None, returns the first (primary / only) pool.
-fn resolve_pool<'a>(
-    pools: &'a HashMap<String, AppContext>,
-    pool: Option<&str>,
-) -> Result<&'a AppContext, (StatusCode, String)> {
-    match pool {
-        Some(addr) => {
-            let key = normalize_hex_0x(addr);
-            pools.get(&key).ok_or_else(|| {
-                (StatusCode::NOT_FOUND, format!("unknown pool: {addr}"))
-            })
-        }
-        None => pools.values().next().ok_or_else(|| {
-            (StatusCode::INTERNAL_SERVER_ERROR, "no pools configured".to_owned())
-        }),
+impl PoolBuilder {
+    /// Resolve the JSON state file path for a pool (None when using PG / no file).
+    fn state_file_for(&self, contract_address: &str) -> Option<String> {
+        self.state_file_base.as_ref().map(|base| {
+            if !self.derive_state_file {
+                base.clone()
+            } else {
+                // e.g. /path/state.json → /path/state-0xabc....json
+                let (stem, ext) = base.rsplit_once('.').unwrap_or((base.as_str(), ""));
+                let short = &contract_address[..contract_address.len().min(10)];
+                if ext.is_empty() {
+                    format!("{stem}-{short}")
+                } else {
+                    format!("{stem}-{short}.{ext}")
+                }
+            }
+        })
     }
+
+    /// Build the pool context, rebuild its Poseidon tree from the checkpoint, and
+    /// spawn the WS event loop. `attach_signer` wires the on-chain confirm signer
+    /// (only the primary pool gets it, matching prior single-signer behaviour).
+    async fn build(
+        &self,
+        contract_address: &str,
+        start_block: u64,
+        attach_signer: bool,
+    ) -> AppContext {
+        let backend = match &self.pg_pool {
+            Some(p) => StateBackend::Pgsql(p.clone()),
+            None => StateBackend::Json(self.state_file_for(contract_address)),
+        };
+        let ck = backend.load(contract_address, start_block).await;
+        let (persist_tx, persist_rx) = tokio::sync::watch::channel(std::sync::Arc::new(
+            CheckpointSnapshot::from_checkpoint_data(&ck),
+        ));
+        tokio::spawn(persist_task(backend, contract_address.to_string(), persist_rx));
+        let persist = Persist { tx: persist_tx };
+
+        // Rebuild Poseidon tree from checkpoint.
+        let mut restored_tree = OrchardCommitmentTree::new();
+        let mut restored_cmx_to_pos: HashMap<[u8; 32], u64> = HashMap::new();
+        for cmx_be in &ck.cmx_ordered {
+            if let Some(pos) = restored_tree.append(*cmx_be) {
+                restored_cmx_to_pos.insert(*cmx_be, pos);
+            }
+        }
+        if !ck.cmx_ordered.is_empty() {
+            let restored_checkpoint = ck.next_block.saturating_sub(1);
+            restored_tree.checkpoint(restored_checkpoint);
+            println!(
+                "[indexer][{}] rebuilt tree with {} leaves, checkpoint at block {}",
+                &contract_address[..10.min(contract_address.len())],
+                ck.cmx_ordered.len(),
+                restored_checkpoint
+            );
+        }
+
+        let shared = Arc::new(RwLock::new(SharedState {
+            next_block: ck.next_block,
+            latest_seq: ck.latest_seq,
+            seen_event_ids: HashSet::new(),
+            confirm_seen_ids: HashSet::new(),
+            batches: ck.batches,
+            max_batches: self.max_batches,
+            tree: restored_tree,
+            cmx_to_position: restored_cmx_to_pos,
+            cmx_ordered: ck.cmx_ordered,
+            pending_notes: HashMap::new(),
+            confirmed_cmx: HashSet::new(),
+            active_root: ck.active_root,
+            pending_timeout_blocks: self.pending_timeout_blocks,
+            pending_tx_hashes: ck.pending_tx_hashes,
+            bundle_out_cache: HashMap::new(),
+        }));
+
+        let (batch_tx, _) = broadcast::channel::<BatchEnvelope>(256);
+        let recover_trigger = Arc::new(tokio::sync::Notify::new());
+
+        let poll_ctx = PollContext {
+            rpc: self.rpc.clone(),
+            wss_url: self.wss_url.clone(),
+            contract_address: contract_address.to_string(),
+            privacybtc_abi_logs: self.privacybtc_abi_logs,
+            legacy_bundle_topic0: self.legacy_bundle_topic0.clone(),
+            note_confirmed_topic0: self.note_confirmed_topic0.clone(),
+            shared: Arc::clone(&shared),
+            persist: persist.clone(),
+            batch_tx: batch_tx.clone(),
+            recover_trigger: Arc::clone(&recover_trigger),
+            start_block,
+        };
+        let addr_label = contract_address.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = run_event_loop(poll_ctx).await {
+                eprintln!("indexer event loop stopped [{addr_label}]: {e:#}");
+            }
+        });
+
+        AppContext {
+            state: shared,
+            signer: if attach_signer { self.signer.clone() } else { None },
+            rpc: self.rpc.clone(),
+            contract_address: contract_address.to_string(),
+            persist,
+            batch_tx,
+            recover_trigger,
+        }
+    }
+}
+
+/// Runtime-mutable multi-pool HTTP state. New pools can be added while the
+/// indexer is running via `POST /pools`; reads clone the per-pool context out
+/// from under a read lock so handlers never hold the lock across `.await`.
+#[derive(Clone)]
+struct PoolRegistry {
+    pools: Arc<RwLock<HashMap<String, AppContext>>>,
+    /// First pool ever added; used as the default when `?pool=` is omitted.
+    primary: Arc<RwLock<Option<String>>>,
+    builder: Arc<PoolBuilder>,
+    registry_file: Option<String>,
+    admin_token: Option<String>,
+}
+
+impl PoolRegistry {
+    /// Add a pool if not already present. Returns `Ok(true)` when newly added and
+    /// `Ok(false)` when it already existed (idempotent). When `persist` is set the
+    /// pool is recorded in the registry file so it is re-added on restart.
+    async fn add_pool(&self, raw_addr: &str, start_block: u64, persist: bool) -> Result<bool> {
+        let address = normalize_hex_0x(raw_addr);
+        if self.pools.read().await.contains_key(&address) {
+            return Ok(false);
+        }
+        // The first pool ever added becomes primary and owns the confirm signer.
+        let attach_signer = self.primary.read().await.is_none();
+        let ctx = self.builder.build(&address, start_block, attach_signer).await;
+        {
+            let mut map = self.pools.write().await;
+            // Re-check under the write lock to avoid a concurrent double-insert.
+            if map.contains_key(&address) {
+                return Ok(false);
+            }
+            map.insert(address.clone(), ctx);
+        }
+        {
+            let mut prim = self.primary.write().await;
+            if prim.is_none() {
+                *prim = Some(address.clone());
+            }
+        }
+        if persist {
+            if let Some(path) = &self.registry_file {
+                if let Err(e) = append_pools_registry(path, &address, start_block) {
+                    eprintln!("[indexer] failed to persist pools registry {path}: {e:#}");
+                }
+            }
+        }
+        println!("[indexer] watching pool {address} (start_block={start_block})");
+        Ok(true)
+    }
+
+    /// Resolve the target pool from a `?pool=0x...` query param. When `pool` is
+    /// None, returns the primary pool (falling back to any pool).
+    async fn resolve(&self, pool: Option<&str>) -> Result<AppContext, (StatusCode, String)> {
+        let map = self.pools.read().await;
+        match pool {
+            Some(addr) => {
+                let key = normalize_hex_0x(addr);
+                map.get(&key)
+                    .cloned()
+                    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown pool: {addr}")))
+            }
+            None => {
+                if let Some(p) = self.primary.read().await.clone() {
+                    if let Some(c) = map.get(&p) {
+                        return Ok(c.clone());
+                    }
+                }
+                map.values().next().cloned().ok_or_else(|| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "no pools configured".to_owned())
+                })
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct PoolsRegistryFile {
+    pools: Vec<PoolRegistryEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PoolRegistryEntry {
+    address: String,
+    #[serde(default)]
+    start_block: u64,
+}
+
+fn load_pools_registry(path: &str) -> Vec<PoolRegistryEntry> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<PoolsRegistryFile>(&raw)
+            .map(|f| f.pools)
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn append_pools_registry(path: &str, address: &str, start_block: u64) -> Result<()> {
+    let mut reg = PoolsRegistryFile { pools: load_pools_registry(path) };
+    let norm = normalize_hex_0x(address);
+    if reg.pools.iter().any(|e| normalize_hex_0x(&e.address) == norm) {
+        return Ok(());
+    }
+    reg.pools.push(PoolRegistryEntry { address: norm, start_block });
+    let json = serde_json::to_string_pretty(&reg)?;
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 // ─── HTTP request/response types ─────────────────────────────────────────────
@@ -343,126 +569,54 @@ async fn main() -> Result<()> {
         }
     };
 
-    // ── Build one AppContext + one poll task per contract address ─────────────
-    let mut pool_map: HashMap<String, AppContext> = HashMap::new();
+    // ── Pool factory: shared config used by both CLI pools and POST /pools ────
+    let wss_url = cli.ws_url.clone().unwrap_or_else(|| {
+        cli.rpc_url
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1)
+    });
+    // Derive per-pool state files when there is more than one pool, or when the
+    // runtime registry is enabled (so a single CLI pool and runtime pools never
+    // collide on the same file).
+    let derive_state_file = cli.contract_address.len() > 1 || cli.pools_registry.is_some();
+    let builder = Arc::new(PoolBuilder {
+        rpc: rpc.clone(),
+        wss_url,
+        signer: signer.clone(),
+        pg_pool: pg_pool.clone(),
+        state_file_base: cli.state_file.clone(),
+        derive_state_file,
+        max_batches: cli.max_batches_in_memory,
+        pending_timeout_blocks: cli.pending_timeout_blocks,
+        privacybtc_abi_logs: cli.privacybtc_abi_logs,
+        legacy_bundle_topic0: cli.legacy_bundle_topic0.as_deref().map(normalize_hex_0x),
+        note_confirmed_topic0: note_confirmed.clone(),
+    });
 
-    for (idx, raw_addr) in cli.contract_address.iter().enumerate() {
-        let contract_address = normalize_hex_0x(raw_addr);
+    let registry = PoolRegistry {
+        pools: Arc::new(RwLock::new(HashMap::new())),
+        primary: Arc::new(RwLock::new(None)),
+        builder,
+        registry_file: cli.pools_registry.clone(),
+        admin_token: cli.admin_token.clone(),
+    };
 
-        // Per-pool state file: if --state-file is provided, derive unique file per pool.
-        let pool_state_file: Option<String> = cli.state_file.as_ref().map(|base| {
-            if cli.contract_address.len() == 1 {
-                base.clone()
-            } else {
-                // e.g. /path/state.json → /path/state-0xabc....json
-                let (stem, ext) = base.rsplit_once('.').unwrap_or((base.as_str(), ""));
-                let short = &contract_address[..contract_address.len().min(10)];
-                if ext.is_empty() { format!("{stem}-{short}") } else { format!("{stem}-{short}.{ext}") }
-            }
-        });
-
-        // Per-pool backend: shared PG pool (keyed by address) or this pool's JSON file.
-        let backend = match &pg_pool {
-            Some(p) => StateBackend::Pgsql(p.clone()),
-            None => StateBackend::Json(pool_state_file.clone()),
-        };
-        let ck = backend.load(&contract_address, cli.start_block).await;
-        // Coalescing persistence: a watch channel feeds a background save task.
-        let (persist_tx, persist_rx) =
-            tokio::sync::watch::channel(std::sync::Arc::new(CheckpointSnapshot::from_checkpoint_data(&ck)));
-        tokio::spawn(persist_task(backend, contract_address.clone(), persist_rx));
-        let persist = Persist { tx: persist_tx };
-        if cli.start_block > 0 && ck.next_block == cli.start_block && ck.cmx_ordered.is_empty() {
-            println!(
-                "[indexer][{}] fresh scan from block {}",
-                &contract_address[..10.min(contract_address.len())],
-                cli.start_block
-            );
+    // 1) CLI pools (the first one becomes primary and owns the confirm signer).
+    for raw_addr in &cli.contract_address {
+        if let Err(e) = registry.add_pool(raw_addr, cli.start_block, false).await {
+            eprintln!("[indexer] add CLI pool {raw_addr} failed: {e:#}");
         }
-
-        // Rebuild Poseidon tree from checkpoint.
-        let mut restored_tree = OrchardCommitmentTree::new();
-        let mut restored_cmx_to_pos: HashMap<[u8; 32], u64> = HashMap::new();
-        for cmx_be in &ck.cmx_ordered {
-            if let Some(pos) = restored_tree.append(*cmx_be) {
-                restored_cmx_to_pos.insert(*cmx_be, pos);
-            }
-        }
-        // Create an initial checkpoint at the restored block so that /merkle_path
-        // works immediately after restart without waiting for the first on-demand scan.
-        // The checkpoint ID is the last processed block (next_block - 1), or
-        // start_block when starting fresh.
-        if !ck.cmx_ordered.is_empty() {
-            let restored_checkpoint = ck.next_block.saturating_sub(1);
-            restored_tree.checkpoint(restored_checkpoint);
-            println!("[indexer][{}] rebuilt tree with {} leaves, checkpoint at block {}",
-                &contract_address[..10], ck.cmx_ordered.len(), restored_checkpoint);
-        }
-
-        let shared = Arc::new(RwLock::new(SharedState {
-            next_block: ck.next_block,
-            latest_seq: ck.latest_seq,
-            seen_event_ids: HashSet::new(),
-            confirm_seen_ids: HashSet::new(),
-            batches: ck.batches,
-            max_batches: cli.max_batches_in_memory,
-            tree: restored_tree,
-            cmx_to_position: restored_cmx_to_pos,
-            cmx_ordered: ck.cmx_ordered,
-            pending_notes: HashMap::new(),
-            confirmed_cmx: HashSet::new(),
-            active_root: ck.active_root,
-            pending_timeout_blocks: cli.pending_timeout_blocks,
-            pending_tx_hashes: ck.pending_tx_hashes,
-            bundle_out_cache: HashMap::new(),
-        }));
-
-        let (batch_tx, _) = broadcast::channel::<BatchEnvelope>(256);
-
-        let recover_trigger = Arc::new(tokio::sync::Notify::new());
-
-        let wss_url = cli.ws_url.clone().unwrap_or_else(|| {
-            cli.rpc_url
-                .replacen("https://", "wss://", 1)
-                .replacen("http://", "ws://", 1)
-        });
-
-        let poll_ctx = PollContext {
-            rpc: rpc.clone(),
-            wss_url,
-            contract_address: contract_address.clone(),
-            privacybtc_abi_logs: cli.privacybtc_abi_logs,
-            legacy_bundle_topic0: cli.legacy_bundle_topic0.as_deref().map(normalize_hex_0x),
-            note_confirmed_topic0: note_confirmed.clone(),
-            shared: Arc::clone(&shared),
-            persist: persist.clone(),
-            batch_tx: batch_tx.clone(),
-            recover_trigger: Arc::clone(&recover_trigger),
-            start_block: cli.start_block,
-        };
-
-        let addr_label = contract_address.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_event_loop(poll_ctx).await {
-                eprintln!("indexer event loop stopped [{addr_label}]: {e:#}");
-            }
-        });
-
-        let signer_for_pool = if idx == 0 { signer.clone() } else { None };
-        let app_ctx = AppContext {
-            state: shared,
-            signer: signer_for_pool,
-            rpc: rpc.clone(),
-            contract_address: contract_address.clone(),
-            persist,
-            batch_tx,
-            recover_trigger,
-        };
-        pool_map.insert(contract_address.clone(), app_ctx);
-        println!("[indexer] watching pool [{idx}] {contract_address}");
     }
-
-    let pools: PoolMap = Arc::new(pool_map);
+    // 2) Pools registered at runtime in a previous run.
+    if let Some(path) = &cli.pools_registry {
+        for entry in load_pools_registry(path) {
+            let sb = if entry.start_block == 0 { cli.start_block } else { entry.start_block };
+            if let Err(e) = registry.add_pool(&entry.address, sb, false).await {
+                eprintln!("[indexer] re-add registry pool {} failed: {e:#}", entry.address);
+            }
+        }
+        println!("[indexer] pools registry: {path}");
+    }
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -474,8 +628,9 @@ async fn main() -> Result<()> {
         .route("/note", get(get_note))
         .route("/confirm", post(post_confirm))
         .route("/notify_tx", post(post_notify_tx))
+        .route("/pools", get(list_pools).post(register_pool))
         .layer(build_cors_layer())
-        .with_state(pools);
+        .with_state(registry);
 
     println!("privacybtc-indexer listening on http://{bind}");
     for t in note_added_topic0_alternatives() {
@@ -508,16 +663,74 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+/// `GET /pools` — list the pools currently being watched and the primary pool.
+async fn list_pools(State(reg): State<PoolRegistry>) -> Json<serde_json::Value> {
+    let addrs: Vec<String> = reg.pools.read().await.keys().cloned().collect();
+    let primary = reg.primary.read().await.clone();
+    Json(serde_json::json!({ "pools": addrs, "primary": primary }))
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterPoolRequest {
+    /// 20-byte pool contract address (0x-prefixed).
+    contract_address: String,
+    /// Block to start scanning from (typically the pool's deploy block). When
+    /// omitted/0 the indexer falls back to its global `--start-block`.
+    #[serde(default)]
+    start_block: u64,
+}
+
+/// `POST /pools` — register a pool at runtime. Idempotent: returns 201 when the
+/// pool is newly added and 200 when it was already being watched. Guarded by
+/// `--admin-token` when configured.
+async fn register_pool(
+    State(reg): State<PoolRegistry>,
+    headers: HeaderMap,
+    Json(req): Json<RegisterPoolRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    if let Some(expected) = &reg.admin_token {
+        let ok = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(|t| t == expected)
+            .unwrap_or(false);
+        if !ok {
+            return Err((StatusCode::UNAUTHORIZED, "missing or invalid admin token".to_owned()));
+        }
+    }
+    if parse_address20(&req.contract_address).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "contract_address must be a 20-byte hex address".to_owned(),
+        ));
+    }
+    let added = reg
+        .add_pool(&req.contract_address, req.start_block, true)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("add_pool failed: {e:#}")))?;
+    let address = normalize_hex_0x(&req.contract_address);
+    let status = if added { StatusCode::CREATED } else { StatusCode::OK };
+    Ok((
+        status,
+        Json(serde_json::json!({
+            "pool": address,
+            "added": added,
+            "start_block": req.start_block,
+        })),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 struct SimplePoolQuery {
     pool: Option<String>,
 }
 
 async fn status(
-    State(pools): State<PoolMap>,
+    State(reg): State<PoolRegistry>,
     Query(q): Query<SimplePoolQuery>,
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
-    let ctx = resolve_pool(&pools, q.pool.as_deref())?;
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
     let s = ctx.state.read().await;
     let local_tree_root_hex = s.tree.latest_root().map(hex::encode);
     Ok(Json(StatusResponse {
@@ -534,10 +747,10 @@ async fn status(
 }
 
 async fn get_batches(
-    State(pools): State<PoolMap>,
+    State(reg): State<PoolRegistry>,
     Query(q): Query<BatchesQuery>,
 ) -> Result<Json<Vec<BatchEnvelope>>, (StatusCode, String)> {
-    let ctx = resolve_pool(&pools, q.pool.as_deref())?;
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
     let after = q.after_seq.unwrap_or(0);
     let s = ctx.state.read().await;
     let out = s
@@ -558,11 +771,11 @@ async fn get_batches(
 /// The browser's EventSource will send `Last-Event-ID` on reconnect, so the
 /// client automatically resumes without missing any batches.
 async fn get_batches_stream(
-    State(pools): State<PoolMap>,
+    State(reg): State<PoolRegistry>,
     Query(q): Query<BatchesQuery>,
     headers: HeaderMap,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
-    let ctx = resolve_pool(&pools, q.pool.as_deref())?;
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
 
     // Determine after_seq: Last-Event-ID (reconnect) takes priority over query param.
     let after_seq = headers
@@ -601,10 +814,10 @@ async fn get_batches_stream(
 }
 
 async fn get_root(
-    State(pools): State<PoolMap>,
+    State(reg): State<PoolRegistry>,
     Query(q): Query<SimplePoolQuery>,
 ) -> Result<Json<RootResponse>, (StatusCode, String)> {
-    let ctx = resolve_pool(&pools, q.pool.as_deref())?;
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
     let s = ctx.state.read().await;
     Ok(Json(RootResponse {
         root_hex: http_root_hex(&s),
@@ -623,10 +836,10 @@ struct NoteLookupQuery {
 /// Return the full `NoteAdded` payload for one cmx (enc_ciphertext, epk, nf_old).
 /// Used by the prover to refresh wallet note fields before witness construction.
 async fn get_note(
-    State(pools): State<PoolMap>,
+    State(reg): State<PoolRegistry>,
     Query(q): Query<NoteLookupQuery>,
 ) -> Result<Json<OrchardIndexedAbiNote>, (StatusCode, String)> {
-    let ctx = resolve_pool(&pools, q.pool.as_deref())?;
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
     let cmx = parse_hex32(&q.cmx)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx hex".to_owned()))?;
 
@@ -642,10 +855,10 @@ async fn get_note(
 }
 
 async fn get_merkle_path(
-    State(pools): State<PoolMap>,
+    State(reg): State<PoolRegistry>,
     Query(q): Query<MerklePathQuery>,
 ) -> Result<Json<privacy_core::commitment_tree::OrchardMerklePath>, (StatusCode, String)> {
-    let ctx = resolve_pool(&pools, q.pool.as_deref())?;
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
     let cmx = parse_hex32(&q.cmx)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx hex".to_owned()))?;
 
@@ -670,11 +883,11 @@ async fn get_merkle_path(
 }
 
 async fn post_confirm(
-    State(pools): State<PoolMap>,
+    State(reg): State<PoolRegistry>,
     Query(q): Query<SimplePoolQuery>,
     Json(req): Json<ConfirmRequest>,
 ) -> Result<Json<ConfirmResponse>, (StatusCode, String)> {
-    let ctx = resolve_pool(&pools, q.pool.as_deref())?;
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
     let cmx = parse_hex32(&req.cmx_hex)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx_hex".to_owned()))?;
     let ack_preimage = parse_hex32(&req.ack_preimage_hex)
@@ -749,11 +962,11 @@ struct NotifyTxRequest {
 /// The indexer queues the tx_hash; on WS reconnect, any still-pending hashes
 /// are recovered by fetching their receipts and replaying the logs.
 async fn post_notify_tx(
-    State(pools): State<PoolMap>,
+    State(reg): State<PoolRegistry>,
     Query(q): Query<SimplePoolQuery>,
     Json(req): Json<NotifyTxRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let ctx = resolve_pool(&pools, q.pool.as_deref())?;
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
     let tx_hash = normalize_hex_0x(&req.tx_hash);
     let mut s = ctx.state.write().await;
     if !s.pending_tx_hashes.iter().any(|h| h == &tx_hash) {
@@ -2038,6 +2251,11 @@ fn parse_hex_u64(hex_str: &str) -> Result<u64> {
 }
 
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(strip_0x(s)).ok()?;
+    bytes.try_into().ok()
+}
+
+fn parse_address20(s: &str) -> Option<[u8; 20]> {
     let bytes = hex::decode(strip_0x(s)).ok()?;
     bytes.try_into().ok()
 }
