@@ -1,0 +1,32 @@
+# Standalone deployment for the privacy-indexer.
+#
+#   cp .env.example .env   # then edit RPC URL, chain id, CORS origins, …
+#   docker compose up -d --build
+#
+# Pools can be left empty here and registered at runtime via POST /pools
+# (the issuance frontend does this automatically when an asset is created).
+services:
+  indexer:
+    build: .
+    image: privacy-indexer:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Bind on all interfaces inside the container (host maps the port below).
+      PRIVACYBTC_INDEXER_BIND: 0.0.0.0:8787
+      # Persist scan checkpoint + runtime-registered pools across restarts.
+      PRIVACYBTC_INDEXER_STATE_FILE: /data/indexer-state.json
+      PRIVACYBTC_INDEXER_POOLS_REGISTRY: /data/pools.json
+    ports:
+      - "${INDEXER_HOST_PORT:-8787}:8787"
+    volumes:
+      - indexer-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  indexer-data:
