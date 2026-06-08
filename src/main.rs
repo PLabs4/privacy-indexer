@@ -137,6 +137,28 @@ struct Cli {
     /// Re-loaded on startup so dynamically-added pools survive restarts.
     #[arg(long, env = "PRIVACYBTC_INDEXER_POOLS_REGISTRY")]
     pools_registry: Option<String>,
+    /// Auto-discover pools by scanning `Perc20Created` chain-wide (no address
+    /// filter) and registering each match automatically. With this on, the
+    /// frontend never needs to call `POST /pools` — the indexer self-heals.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_DISCOVER_POOLS", default_value_t = false, value_parser = parse_bool_flag)]
+    discover_pools: bool,
+    /// Restrict auto-discovery to these issuer addresses (repeatable or comma-
+    /// separated). Empty ⇒ discover every pERC20 on the chain.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_DISCOVER_ISSUER", value_delimiter = ',')]
+    discover_issuer: Vec<String>,
+    /// Poll interval (seconds) for the auto-discovery scan.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_DISCOVER_POLL_SECS", default_value_t = 12)]
+    discover_poll_secs: u64,
+}
+
+/// Lenient boolean parser for env/CLI flags so deployers can use 1/0/yes/no/on/off
+/// in addition to true/false (docker-compose env_file commonly uses "1").
+fn parse_bool_flag(s: &str) -> Result<bool, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!("invalid boolean '{other}' (use 1/0/true/false/yes/no)")),
+    }
 }
 
 // ─── Domain types ────────────────────────────────────────────────────────────
@@ -641,7 +663,34 @@ async fn main() -> Result<()> {
         }
         println!("[indexer] pools registry: {path}");
     }
-    if registry.pools.read().await.is_empty() {
+    // 3) Auto-discovery: continuously scan `Perc20Created` chain-wide and register
+    //    matching pools automatically (primary path; POST /pools stays as a manual
+    //    fallback for e.g. pools created before --start-block).
+    if cli.discover_pools {
+        let issuer_topics: Vec<String> = cli
+            .discover_issuer
+            .iter()
+            .filter(|a| parse_address20(a).is_some())
+            .map(|a| address_to_topic(a))
+            .collect();
+        let scope = if issuer_topics.is_empty() {
+            "all issuers".to_string()
+        } else {
+            format!("{} issuer(s)", issuer_topics.len())
+        };
+        println!(
+            "[indexer] pool auto-discovery ON (Perc20Created, {scope}, poll {}s, from block {})",
+            cli.discover_poll_secs, cli.start_block
+        );
+        tokio::spawn(pool_discovery_task(
+            registry.clone(),
+            rpc.clone(),
+            perc20_created_topic0(),
+            issuer_topics,
+            cli.start_block,
+            cli.discover_poll_secs,
+        ));
+    } else if registry.pools.read().await.is_empty() {
         println!(
             "[indexer] no pools configured yet — idle until a pool is registered via POST /pools"
         );
@@ -675,6 +724,67 @@ async fn main() -> Result<()> {
 fn perc20_created_topic0() -> String {
     let hash = Keccak256::digest(b"Perc20Created(address,address,string,string,uint8)");
     format!("0x{}", hex::encode(hash))
+}
+
+/// 20-byte address → 32-byte left-padded log topic (for indexed address filters).
+fn address_to_topic(addr: &str) -> String {
+    let a = normalize_hex_0x(addr);
+    format!("0x{:0>64}", a.trim_start_matches("0x").to_lowercase())
+}
+
+/// 32-byte indexed-address topic → 20-byte 0x address (last 20 bytes).
+fn topic_to_address(topic: &str) -> Option<String> {
+    let h = topic.trim_start_matches("0x");
+    if h.len() < 40 {
+        return None;
+    }
+    Some(format!("0x{}", &h[h.len() - 40..].to_lowercase()))
+}
+
+/// Background task: poll `Perc20Created` chain-wide and auto-register pools.
+/// Re-scans from `start_block` on boot; `add_pool` is idempotent so already-known
+/// pools are skipped. The cursor only advances past fully-scanned ranges, so a
+/// transient RPC error is retried on the next tick.
+async fn pool_discovery_task(
+    reg: PoolRegistry,
+    rpc: RpcClient,
+    topic0: String,
+    issuer_topics: Vec<String>,
+    start_block: u64,
+    poll_secs: u64,
+) {
+    const CHUNK: u64 = 50_000;
+    let mut from = start_block;
+    loop {
+        if let Ok(head) = rpc.block_number().await {
+            let mut lo = from;
+            while lo <= head {
+                let hi = (lo + CHUNK - 1).min(head);
+                match rpc.fetch_created_pools(lo, hi, &topic0, &issuer_topics).await {
+                    Ok(found) => {
+                        for (pool, block) in found {
+                            match reg.add_pool(&pool, block, false).await {
+                                Ok(true) => {
+                                    println!("[indexer] auto-discovered pool {pool} (block {block})")
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    eprintln!("[indexer] auto-discover add_pool {pool} failed: {e:#}")
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[indexer] discovery getLogs [{lo},{hi}] failed: {e:#}");
+                        break; // leave `lo` here so we retry this range next tick
+                    }
+                }
+                lo = hi + 1;
+            }
+            from = lo;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(poll_secs.max(1))).await;
+    }
 }
 
 /// Same env as relayer: comma-separated origins in `PRIVACYBTC_CORS_ORIGINS`.
@@ -2077,6 +2187,48 @@ impl RpcClient {
             .await
             .context("eth_getLogs (Perc20Created verification) failed")?;
         Ok(!logs.is_empty())
+    }
+
+    /// Scan `Perc20Created` chain-wide (no address filter) over [from, to] and
+    /// return `(pool_address, block_number)` for each match. When `issuer_topics`
+    /// is non-empty, only those issuers (indexed topic[2]) are returned.
+    async fn fetch_created_pools(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        topic0: &str,
+        issuer_topics: &[String],
+    ) -> Result<Vec<(String, u64)>> {
+        let topics = if issuer_topics.is_empty() {
+            serde_json::json!([topic0])
+        } else {
+            let issuers: Vec<serde_json::Value> =
+                issuer_topics.iter().cloned().map(Into::into).collect();
+            // [topic0, null(pool, any), [issuer…]]
+            serde_json::json!([topic0, serde_json::Value::Null, issuers])
+        };
+        let filter = serde_json::json!({
+            "fromBlock": format!("0x{:x}", from_block),
+            "toBlock":   format!("0x{:x}", to_block),
+            "topics":    topics,
+        });
+        let logs: Vec<EthLog> = self
+            .rpc_call("eth_getLogs", serde_json::json!([filter]))
+            .await
+            .with_context(|| format!("eth_getLogs (Perc20Created discovery) [{from_block},{to_block}]"))?;
+        let mut out = Vec::new();
+        for l in logs {
+            let pool = l
+                .topics
+                .as_ref()
+                .and_then(|t| t.get(1))
+                .and_then(|t| topic_to_address(t));
+            let block = parse_hex_u64(&l.block_number).ok();
+            if let (Some(p), Some(b)) = (pool, block) {
+                out.push((p, b));
+            }
+        }
+        Ok(out)
     }
 
     async fn rpc_call<T: DeserializeOwned>(
