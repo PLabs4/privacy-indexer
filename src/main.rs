@@ -23,6 +23,9 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use clap::Parser;
 use k256::ecdsa::{RecoveryId, SigningKey};
 use privacy_core::commitment_tree::OrchardCommitmentTree;
+use privacy_core::commitment_tree::frozen::{
+    fr_from_be_bytes, fr_to_be_bytes, fr_to_le_hex, FrozenImt,
+};
 use privacy_core::types::{
     OrchardIndexBatch, OrchardIndexedAbiNote, OrchardIndexedBundle, OrchardStoredBundle,
 };
@@ -196,6 +199,10 @@ struct SharedState {
     pending_tx_hashes: VecDeque<String>,
     /// Parsed `bundle()` calldata per tx (for OVK `out_ciphertext` + `cv_net_x`).
     bundle_out_cache: HashMap<String, HashMap<[u8; 32], BundleActionCiphertexts>>,
+    /// Compliance frozen-set (sorted Indexed Merkle Tree). `frozen.root()` is the
+    /// `rt_frozen` / `cmxFrozenRoot()` the prover and contract must agree on. Starts
+    /// as the empty-blacklist tree; admins freeze a `cmx` via `POST /frozen`.
+    frozen: FrozenImt,
 }
 
 // ─── Signing (ETH transaction relay) ─────────────────────────────────────────
@@ -309,6 +316,11 @@ impl PoolBuilder {
             );
         }
 
+        // Rebuild the compliance frozen Indexed-MT by replaying frozen cmx in order.
+        let restored_frozen = FrozenImt::from_frozen_values(
+            &ck.frozen_cmx.iter().filter_map(fr_from_be_bytes).collect::<Vec<_>>(),
+        );
+
         let shared = Arc::new(RwLock::new(SharedState {
             next_block: ck.next_block,
             latest_seq: ck.latest_seq,
@@ -325,6 +337,7 @@ impl PoolBuilder {
             pending_timeout_blocks: self.pending_timeout_blocks,
             pending_tx_hashes: ck.pending_tx_hashes,
             bundle_out_cache: HashMap::new(),
+            frozen: restored_frozen,
         }));
 
         let (batch_tx, _) = broadcast::channel::<BatchEnvelope>(256);
@@ -639,6 +652,9 @@ async fn main() -> Result<()> {
         .route("/confirm", post(post_confirm))
         .route("/notify_tx", post(post_notify_tx))
         .route("/pools", get(list_pools).post(register_pool))
+        .route("/frozen_root", get(get_frozen_root))
+        .route("/frozen_witness", get(get_frozen_witness))
+        .route("/frozen", post(post_frozen))
         .layer(build_cors_layer())
         .with_state(registry);
 
@@ -892,6 +908,116 @@ async fn get_merkle_path(
         .map(Json)
 }
 
+// ─── Compliance frozen Indexed-MT (rt_frozen) ────────────────────────────────
+
+/// Bearer-token admin gate, mirroring `register_pool`.
+fn require_admin(reg: &PoolRegistry, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    if let Some(expected) = &reg.admin_token {
+        let ok = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(|t| t == expected)
+            .unwrap_or(false);
+        if !ok {
+            return Err((StatusCode::UNAUTHORIZED, "missing or invalid admin token".to_owned()));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct FrozenRootResponse {
+    /// `rt_frozen` as 0x-prefixed little-endian 32-byte hex (prover `parse_fr_le`).
+    /// Set this on-chain via `setFrozenRoot(rt_frozen)`.
+    root_hex: String,
+    /// Number of frozen `cmx` (excludes the `{0,0}` sentinel).
+    frozen_count: usize,
+}
+
+/// `GET /frozen_root` — current compliance root for a pool's blacklist.
+async fn get_frozen_root(
+    State(reg): State<PoolRegistry>,
+    Query(q): Query<SimplePoolQuery>,
+) -> Result<Json<FrozenRootResponse>, (StatusCode, String)> {
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
+    let s = ctx.state.read().await;
+    Ok(Json(FrozenRootResponse {
+        root_hex: fr_to_le_hex(s.frozen.root()),
+        frozen_count: s.frozen.len().saturating_sub(1),
+    }))
+}
+
+#[derive(Serialize)]
+struct FrozenWitnessResponse {
+    /// Bracketing low-leaf and its `next` pointer (LE hex).
+    low_val: String,
+    low_next_val: String,
+    /// 20 Merkle siblings + path bits (LE hex), matching `FrozenCmxNonMember`.
+    siblings: Vec<String>,
+    path_bits: Vec<String>,
+    /// The root this witness opens to (== `/frozen_root`).
+    root_hex: String,
+}
+
+/// `GET /frozen_witness?cmx=` — non-membership witness for `cmx`, or 409 if frozen.
+async fn get_frozen_witness(
+    State(reg): State<PoolRegistry>,
+    Query(q): Query<NoteLookupQuery>,
+) -> Result<Json<FrozenWitnessResponse>, (StatusCode, String)> {
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
+    let cmx_be = parse_hex32(&q.cmx)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx hex".to_owned()))?;
+    let cmx = fr_from_be_bytes(&cmx_be).ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "cmx is not a canonical field element".to_owned())
+    })?;
+    let s = ctx.state.read().await;
+    let w = s.frozen.non_membership_witness(cmx).ok_or_else(|| {
+        (StatusCode::CONFLICT, "cmx is frozen; no non-membership witness".to_owned())
+    })?;
+    Ok(Json(FrozenWitnessResponse {
+        low_val: fr_to_le_hex(w.low_val),
+        low_next_val: fr_to_le_hex(w.low_next_val),
+        siblings: w.siblings.iter().map(|f| fr_to_le_hex(*f)).collect(),
+        path_bits: w.path_bits.iter().map(|f| fr_to_le_hex(*f)).collect(),
+        root_hex: fr_to_le_hex(s.frozen.root()),
+    }))
+}
+
+#[derive(Deserialize)]
+struct FreezeRequest {
+    /// `cmx` to freeze, big-endian hex (with or without `0x`).
+    cmx_hex: String,
+}
+
+/// `POST /frozen` (admin) — freeze a `cmx`: splice it into the sorted IMT
+/// (update predecessor's `next` + append) and return the new root. Idempotent.
+async fn post_frozen(
+    State(reg): State<PoolRegistry>,
+    headers: HeaderMap,
+    Query(q): Query<SimplePoolQuery>,
+    Json(req): Json<FreezeRequest>,
+) -> Result<Json<FrozenRootResponse>, (StatusCode, String)> {
+    require_admin(&reg, &headers)?;
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
+    let cmx_be = parse_hex32(&req.cmx_hex)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx_hex".to_owned()))?;
+    let cmx = fr_from_be_bytes(&cmx_be).ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "cmx is not a canonical field element".to_owned())
+    })?;
+    let resp = {
+        let mut s = ctx.state.write().await;
+        s.frozen.insert(cmx); // no-op if already frozen or cmx == 0
+        let resp = FrozenRootResponse {
+            root_hex: fr_to_le_hex(s.frozen.root()),
+            frozen_count: s.frozen.len().saturating_sub(1),
+        };
+        ctx.persist.notify(&s); // persist the updated frozen set
+        resp
+    };
+    Ok(Json(resp))
+}
+
 async fn post_confirm(
     State(reg): State<PoolRegistry>,
     Query(q): Query<SimplePoolQuery>,
@@ -1013,6 +1139,9 @@ struct IndexerCheckpoint {
     /// Tx hashes notified by relayer but not yet confirmed via WS event.
     #[serde(default)]
     pending_tx_hashes: Vec<String>,
+    /// Frozen `cmx` (BE hex) in insertion order — replayed to rebuild the frozen IMT.
+    #[serde(default)]
+    frozen_cmx_hex: Vec<String>,
 }
 
 /// Loaded result from a checkpoint file.
@@ -1023,6 +1152,7 @@ struct CheckpointData {
     latest_seq: u64,
     batches: VecDeque<BatchEnvelope>,
     pending_tx_hashes: VecDeque<String>,
+    frozen_cmx: Vec<[u8; 32]>,
 }
 
 fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
@@ -1059,7 +1189,20 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                 );
                 let batches = VecDeque::from(ck.batches);
                 let pending_tx_hashes = VecDeque::from(ck.pending_tx_hashes);
-                CheckpointData { next_block: resumed, cmx_ordered, active_root, latest_seq: ck.latest_seq, batches, pending_tx_hashes }
+                let frozen_cmx: Vec<[u8; 32]> = ck
+                    .frozen_cmx_hex
+                    .iter()
+                    .filter_map(|h| {
+                        let bytes = hex::decode(h.trim_start_matches("0x")).ok()?;
+                        if bytes.len() != 32 {
+                            return None;
+                        }
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        Some(arr)
+                    })
+                    .collect();
+                CheckpointData { next_block: resumed, cmx_ordered, active_root, latest_seq: ck.latest_seq, batches, pending_tx_hashes, frozen_cmx }
             }
             Err(e) => {
                 eprintln!(
@@ -1072,6 +1215,7 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                     latest_seq: 0,
                     batches: VecDeque::new(),
                     pending_tx_hashes: VecDeque::new(),
+                    frozen_cmx: vec![],
                 }
             }
         },
@@ -1082,6 +1226,7 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
             latest_seq: 0,
             batches: VecDeque::new(),
             pending_tx_hashes: VecDeque::new(),
+            frozen_cmx: vec![],
         },
     }
 }
@@ -1094,6 +1239,7 @@ fn save_checkpoint(
     latest_seq: u64,
     batches: &[BatchEnvelope],
     pending_tx_hashes: &[String],
+    frozen_cmx: &[[u8; 32]],
 ) {
     let ck = IndexerCheckpoint {
         next_block,
@@ -1102,6 +1248,7 @@ fn save_checkpoint(
         latest_seq,
         batches: batches.to_vec(),
         pending_tx_hashes: pending_tx_hashes.to_vec(),
+        frozen_cmx_hex: frozen_cmx.iter().map(hex::encode).collect(),
     };
     if let Ok(json) = serde_json::to_string(&ck) {
         let tmp = format!("{path}.tmp");
@@ -1123,6 +1270,7 @@ struct CheckpointSnapshot {
     latest_seq: u64,
     batches: Vec<BatchEnvelope>,
     pending_tx_hashes: Vec<String>,
+    frozen_cmx: Vec<[u8; 32]>,
 }
 
 impl CheckpointSnapshot {
@@ -1134,6 +1282,7 @@ impl CheckpointSnapshot {
             latest_seq: s.latest_seq,
             batches: s.batches.iter().cloned().collect(),
             pending_tx_hashes: s.pending_tx_hashes.iter().cloned().collect(),
+            frozen_cmx: s.frozen.frozen_values().into_iter().map(fr_to_be_bytes).collect(),
         }
     }
     fn from_checkpoint_data(ck: &CheckpointData) -> Self {
@@ -1144,6 +1293,7 @@ impl CheckpointSnapshot {
             latest_seq: ck.latest_seq,
             batches: ck.batches.iter().cloned().collect(),
             pending_tx_hashes: ck.pending_tx_hashes.iter().cloned().collect(),
+            frozen_cmx: ck.frozen_cmx.clone(),
         }
     }
 }
@@ -1169,7 +1319,7 @@ impl StateBackend {
             StateBackend::Json(Some(path)) => {
                 save_checkpoint(
                     path, snap.next_block, &snap.cmx_ordered, snap.active_root,
-                    snap.latest_seq, &snap.batches, &snap.pending_tx_hashes,
+                    snap.latest_seq, &snap.batches, &snap.pending_tx_hashes, &snap.frozen_cmx,
                 );
                 Ok(())
             }
@@ -1187,6 +1337,7 @@ fn empty_checkpoint(start_block: u64) -> CheckpointData {
         latest_seq: 0,
         batches: VecDeque::new(),
         pending_tx_hashes: VecDeque::new(),
+        frozen_cmx: vec![],
     }
 }
 
@@ -1255,6 +1406,17 @@ async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnaps
         .execute(&mut *tx).await.context("insert cmx_leaves")?;
     }
 
+    // Frozen-set leaves (append-only, insertion order) — mirrors cmx_leaves so the
+    // FrozenImt can be replayed on restart to recompute the same rt_frozen.
+    for (pos, cmx) in snap.frozen_cmx.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO frozen_cmx (pool_address, position, cmx_hex) VALUES ($1,$2,$3) \
+             ON CONFLICT (pool_address, position) DO NOTHING",
+        )
+        .bind(pool_address).bind(pos as i64).bind(hex::encode(cmx))
+        .execute(&mut *tx).await.context("insert frozen_cmx")?;
+    }
+
     for env in &snap.batches {
         for n in &env.batch.abi_notes {
             sqlx::query(NOTES_UPSERT)
@@ -1310,11 +1472,17 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
             .bind(pool_address).fetch_all(pool).await.unwrap_or_default();
     let pending_tx_hashes: VecDeque<String> = pend_rows.into_iter().map(|(h,)| h).collect();
 
+    // Frozen-set leaves in insertion order → replayed to rebuild the FrozenImt.
+    let frozen_rows: Vec<(String,)> =
+        sqlx::query_as("SELECT cmx_hex FROM frozen_cmx WHERE pool_address=$1 ORDER BY position")
+            .bind(pool_address).fetch_all(pool).await.unwrap_or_default();
+    let frozen_cmx: Vec<[u8; 32]> = frozen_rows.iter().filter_map(|(h,)| parse_hex32(h)).collect();
+
     println!(
-        "[indexer] pg load: pool={} next_block={next_block} leaves={} pending={}",
-        &pool_address[..10.min(pool_address.len())], cmx_ordered.len(), pending_tx_hashes.len()
+        "[indexer] pg load: pool={} next_block={next_block} leaves={} pending={} frozen={}",
+        &pool_address[..10.min(pool_address.len())], cmx_ordered.len(), pending_tx_hashes.len(), frozen_cmx.len()
     );
-    CheckpointData { next_block, cmx_ordered, active_root, latest_seq, batches: VecDeque::new(), pending_tx_hashes }
+    CheckpointData { next_block, cmx_ordered, active_root, latest_seq, batches: VecDeque::new(), pending_tx_hashes, frozen_cmx }
 }
 
 /// Load `out_ciphertext` + `cv_net_x` for one action from the tx `bundle()` calldata.
@@ -1745,6 +1913,8 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         let seq_snap = state.latest_seq;
         let batches_snap: Vec<BatchEnvelope> = state.batches.iter().cloned().collect();
         let pending_snap: Vec<String> = state.pending_tx_hashes.iter().cloned().collect();
+        let frozen_snap: Vec<[u8; 32]> =
+            state.frozen.frozen_values().into_iter().map(fr_to_be_bytes).collect();
         drop(state);
         ctx.batch_tx.send(envelope).ok();
         ctx.persist.notify_owned(CheckpointSnapshot {
@@ -1754,6 +1924,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             latest_seq: seq_snap,
             batches: batches_snap,
             pending_tx_hashes: pending_snap,
+            frozen_cmx: frozen_snap,
         });
 
     } else if t0.as_deref() == Some(nc.as_str()) {
@@ -1805,6 +1976,8 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 let next_block = state.next_block;
                 let batches_snap: Vec<BatchEnvelope> = state.batches.iter().cloned().collect();
                 let pending_snap: Vec<String> = state.pending_tx_hashes.iter().cloned().collect();
+                let frozen_snap: Vec<[u8; 32]> =
+                    state.frozen.frozen_values().into_iter().map(fr_to_be_bytes).collect();
                 drop(state);
                 ctx.batch_tx.send(envelope).ok();
                 ctx.persist.notify_owned(CheckpointSnapshot {
@@ -1814,6 +1987,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                     latest_seq: seq_snap,
                     batches: batches_snap,
                     pending_tx_hashes: pending_snap,
+                    frozen_cmx: frozen_snap,
                 });
                 return Ok(());
             }
@@ -2292,8 +2466,53 @@ mod tests {
         decode_orchard_bundle_from_log_data, encode_confirm_receipt_calldata, normalize_hex_0x,
         rlp_bytes, rlp_list, rlp_uint,
     };
-    use privacybtc_core::OrchardStoredBundle;
+    use privacy_core::types::OrchardStoredBundle;
     use sha3::{Digest, Keccak256};
+
+    /// The indexer's empty frozen tree must publish the same `rt_frozen` the PERC20
+    /// circuit/prover expect, and a freeze must change the root while the witness for
+    /// a non-frozen cmx still opens to the live root.
+    #[test]
+    fn frozen_imt_root_matches_perc20_and_updates_on_freeze() {
+        use privacy_core::commitment_tree::frozen::{
+            fr_from_be_bytes, fr_to_le_hex, FrozenImt,
+        };
+
+        // Empty-blacklist root == poseidon_merkle_bn254::frozen_empty_tree_root.
+        const EMPTY_ROOT_DEC: &str =
+            "9079151408671112139333676443195611613776084922747126087146403043120709007371";
+        let empty_be = primitive_u256_dec_to_be32(EMPTY_ROOT_DEC);
+        let empty_fr = fr_from_be_bytes(&empty_be).unwrap();
+        let mut t = FrozenImt::new();
+        assert_eq!(fr_to_le_hex(t.root()), fr_to_le_hex(empty_fr));
+
+        // A non-frozen cmx has a witness that opens to the current root.
+        let cmx = fr_from_be_bytes(&primitive_u256_dec_to_be32("12345")).unwrap();
+        assert!(t.non_membership_witness(cmx).is_some());
+
+        // Freezing changes the root; the frozen cmx no longer has a witness.
+        let root_before = t.root();
+        assert!(t.insert(cmx));
+        assert_ne!(t.root(), root_before);
+        assert!(t.non_membership_witness(cmx).is_none());
+    }
+
+    /// Minimal decimal-uint256 → big-endian 32-byte parser for the test vector.
+    fn primitive_u256_dec_to_be32(dec: &str) -> [u8; 32] {
+        let mut bytes = vec![0u8; 32];
+        for ch in dec.bytes() {
+            let d = (ch - b'0') as u16;
+            let mut carry = d;
+            for b in bytes.iter_mut().rev() {
+                let v = (*b as u16) * 10 + carry;
+                *b = (v & 0xff) as u8;
+                carry = v >> 8;
+            }
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        out
+    }
 
     fn sample_bundle() -> OrchardStoredBundle {
         OrchardStoredBundle {

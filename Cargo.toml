@@ -27,3 +27,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ethabi = "18"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "migrate"] }
+
+# Use the local privacy-core (sibling checkout) so the new compliance frozen
+# Indexed-MT module (`commitment_tree::frozen`) is available. The published
+# crates.io 0.1.0 predates it.
+[patch.crates-io]
+privacy-core = { path = "../privacy-core" }
