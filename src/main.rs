@@ -1054,23 +1054,6 @@ async fn get_merkle_path(
 }
 
 // ─── Compliance frozen Indexed-MT (rt_frozen) ────────────────────────────────
-
-/// Bearer-token admin gate, mirroring `register_pool`.
-fn require_admin(reg: &PoolRegistry, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
-    if let Some(expected) = &reg.admin_token {
-        let ok = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .map(|t| t == expected)
-            .unwrap_or(false);
-        if !ok {
-            return Err((StatusCode::UNAUTHORIZED, "missing or invalid admin token".to_owned()));
-        }
-    }
-    Ok(())
-}
-
 #[derive(Serialize)]
 struct FrozenRootResponse {
     /// `rt_frozen` as 0x-prefixed little-endian 32-byte hex (prover `parse_fr_le`).
@@ -1143,7 +1126,6 @@ async fn post_frozen(
     Query(q): Query<SimplePoolQuery>,
     Json(req): Json<FreezeRequest>,
 ) -> Result<Json<FrozenRootResponse>, (StatusCode, String)> {
-    require_admin(&reg, &headers)?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let cmx_be = parse_hex32(&req.cmx_hex)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx_hex".to_owned()))?;
