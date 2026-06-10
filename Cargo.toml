@@ -1,6 +1,6 @@
 [package]
 name = "privacy-indexer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Standalone privacy-pool indexer: WS event scan, Poseidon commitment tree, JSON/PostgreSQL state. No atomic-swap, no halo2."
@@ -10,7 +10,7 @@ name = "privacy-indexer"
 path = "src/main.rs"
 
 [dependencies]
-privacy-core = "0.1.0"
+privacy-core = "0.1.1"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
@@ -28,8 +28,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 ethabi = "18"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "migrate"] }
 
-# Use the local privacy-core (sibling checkout) so the new compliance frozen
-# Indexed-MT module (`commitment_tree::frozen`) is available. The published
-# crates.io 0.1.0 predates it.
-[patch.crates-io]
-privacy-core = { path = "../privacy-core" }
+
