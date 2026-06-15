@@ -416,6 +416,13 @@ impl PoolRegistry {
         // Pool keys are case-insensitive (Ethereum addresses), so normalise to lowercase.
         let address = normalize_hex_0x(raw_addr).to_lowercase();
         if self.pools.read().await.contains_key(&address) {
+            if persist {
+                if let Some(path) = &self.registry_file {
+                    if let Err(e) = append_pools_registry(path, &address, start_block) {
+                        eprintln!("[indexer] failed to update pools registry {path}: {e:#}");
+                    }
+                }
+            }
             return Ok(false);
         }
         // The first pool ever added becomes primary and owns the confirm signer.
@@ -513,10 +520,23 @@ fn load_pools_registry(path: &str) -> Vec<PoolRegistryEntry> {
 fn append_pools_registry(path: &str, address: &str, start_block: u64) -> Result<()> {
     let mut reg = PoolsRegistryFile { pools: load_pools_registry(path) };
     let norm = normalize_hex_0x(address);
-    if reg.pools.iter().any(|e| normalize_hex_0x(&e.address) == norm) {
+    let mut changed = false;
+    if let Some(entry) = reg.pools.iter_mut().find(|e| normalize_hex_0x(&e.address) == norm) {
+        if entry.address != norm {
+            entry.address = norm.clone();
+            changed = true;
+        }
+        if start_block != 0 && entry.start_block != start_block {
+            entry.start_block = start_block;
+            changed = true;
+        }
+    } else {
+        reg.pools.push(PoolRegistryEntry { address: norm, start_block });
+        changed = true;
+    }
+    if !changed {
         return Ok(());
     }
-    reg.pools.push(PoolRegistryEntry { address: norm, start_block });
     let json = serde_json::to_string_pretty(&reg)?;
     let tmp = format!("{path}.tmp");
     std::fs::write(&tmp, &json)?;
@@ -1523,6 +1543,20 @@ async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnaps
     .bind(snap.active_root.map(hex::encode))
     .bind(snap.latest_seq as i64)
     .execute(&mut *tx).await.context("upsert indexer_meta")?;
+
+    // These are derived rows. Replace the per-pool snapshot so a repaired
+    // backfill cannot leave stale leaves in PostgreSQL and resurrect a bad root
+    // on the next restart.
+    sqlx::query("DELETE FROM cmx_leaves WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("replace cmx_leaves")?;
+    sqlx::query("DELETE FROM frozen_cmx WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("replace frozen_cmx")?;
 
     for (pos, cmx) in snap.cmx_ordered.iter().enumerate() {
         sqlx::query(
