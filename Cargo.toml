@@ -10,7 +10,7 @@ name = "privacy-indexer"
 path = "src/main.rs"
 
 [dependencies]
-privacy-core = "0.1.1"
+privacy-core = "0.1.2"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"

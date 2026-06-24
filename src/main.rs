@@ -33,6 +33,8 @@ use privacy_core::ethereum::{
     bundle_actions_by_cmx, decode_note_added_log, decode_note_confirmed_log,
     decode_shield_completed_log, BundleActionCiphertexts,
     note_added_topic0_alternatives, note_confirmed_topic0_hex, shield_completed_topic0_hex,
+    // WS-6: WrappedPERC20 discovery/verification + metadata (privacy-core 0.1.2).
+    decode_wrapped_created_log, wrapped_created_topic0_hex, DecodedWrappedCreated,
 };
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -406,6 +408,93 @@ struct PoolRegistry {
     /// Cache of addresses already verified as genuine pERC20 assets (lowercase
     /// 0x). Avoids a repeat `eth_getLogs` on every re-registration attempt.
     verified_pools: Arc<RwLock<HashSet<String>>>,
+    /// Cache of per-pool metadata (type/scale/underlying/name/symbol/decimals),
+    /// keyed by lowercase 0x address. Populated lazily from the pool's genesis event.
+    metadata: Arc<RwLock<HashMap<String, PoolMeta>>>,
+}
+
+/// Public pool metadata surfaced by the API. `Issuer` pools are PERC20 assets minted by an
+/// issuer; `Wrapped` pools back a shielded balance with a custodied ERC20 (shield/unshield).
+#[derive(Clone, Debug, Serialize)]
+struct PoolMeta {
+    pool: String,
+    /// "wrapped" or "issuer".
+    pool_type: String,
+    /// Underlying ERC20 (wrapped pools only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    underlying: Option<String>,
+    /// Note-unit → underlying-wei multiplier (wrapped pools only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scale: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decimals: Option<u8>,
+}
+
+impl PoolMeta {
+    fn from_wrapped(pool: &str, d: &DecodedWrappedCreated) -> Self {
+        PoolMeta {
+            pool: normalize_hex_0x(pool).to_lowercase(),
+            pool_type: "wrapped".to_string(),
+            underlying: Some(format!("0x{}", hex::encode(d.underlying))),
+            scale: Some(d.scale.to_string()),
+            name: Some(d.name.clone()),
+            symbol: Some(d.symbol.clone()),
+            decimals: Some(d.decimals),
+        }
+    }
+
+    fn issuer_minimal(pool: &str) -> Self {
+        PoolMeta {
+            pool: normalize_hex_0x(pool).to_lowercase(),
+            pool_type: "issuer".to_string(),
+            underlying: None,
+            scale: None,
+            name: None,
+            symbol: None,
+            decimals: None,
+        }
+    }
+
+    /// Decode `Perc20Created(address issuer, address asset?, string name, string symbol,
+    /// uint8 decimals)` data (non-indexed tail) into issuer metadata. Best-effort.
+    fn try_from_perc20_created(pool: &str, data_hex: &str) -> Option<Self> {
+        let raw = hex::decode(strip_0x(data_hex)).ok()?;
+        // Perc20Created indexes the first two address args; data holds (string,string,uint8).
+        let tokens = ethabi::decode(
+            &[
+                ethabi::ParamType::String,
+                ethabi::ParamType::String,
+                ethabi::ParamType::Uint(8),
+            ],
+            &raw,
+        )
+        .ok()?;
+        let name = match tokens.first()? {
+            ethabi::Token::String(s) => s.clone(),
+            _ => return None,
+        };
+        let symbol = match tokens.get(1)? {
+            ethabi::Token::String(s) => s.clone(),
+            _ => return None,
+        };
+        let decimals = match tokens.get(2)? {
+            ethabi::Token::Uint(u) => u8::try_from(*u).ok()?,
+            _ => return None,
+        };
+        Some(PoolMeta {
+            pool: normalize_hex_0x(pool).to_lowercase(),
+            pool_type: "issuer".to_string(),
+            underlying: None,
+            scale: None,
+            name: Some(name),
+            symbol: Some(symbol),
+            decimals: Some(decimals),
+        })
+    }
 }
 
 impl PoolRegistry {
@@ -464,11 +553,34 @@ impl PoolRegistry {
         if self.pools.read().await.contains_key(pool_lc) {
             return Ok(true);
         }
-        let genuine = self.builder.rpc.is_perc20_created(pool_lc).await?;
+        // Genuine if it emitted either the issuer (`Perc20Created`) or the wrapped
+        // (`WrappedCreated`) genesis event for itself.
+        let genuine = self.builder.rpc.is_perc20_created(pool_lc).await?
+            || self.builder.rpc.is_wrapped_created(pool_lc).await?;
         if genuine {
             self.verified_pools.write().await.insert(pool_lc.to_string());
         }
         Ok(genuine)
+    }
+
+    /// Best-effort: fetch + cache pool metadata (issuer or wrapped) from its genesis event.
+    /// Returns the cached value when already known. Never fails the caller — metadata is
+    /// supplemental; `None` means the genesis event was not found / not decodable.
+    async fn ensure_metadata(&self, pool_lc: &str) -> Option<PoolMeta> {
+        if let Some(m) = self.metadata.read().await.get(pool_lc).cloned() {
+            return Some(m);
+        }
+        match self.builder.rpc.fetch_pool_metadata(pool_lc).await {
+            Ok(Some(meta)) => {
+                self.metadata.write().await.insert(pool_lc.to_string(), meta.clone());
+                Some(meta)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("[indexer] metadata fetch for {pool_lc} failed: {e:#}");
+                None
+            }
+        }
     }
 
     /// Resolve the target pool from a `?pool=0x...` query param. When `pool` is
@@ -678,6 +790,7 @@ async fn main() -> Result<()> {
         builder,
         registry_file: cli.pools_registry.clone(),
         verified_pools: Arc::new(RwLock::new(HashSet::new())),
+        metadata: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // 1) CLI pools (the first one becomes primary and owns the confirm signer).
@@ -740,6 +853,7 @@ async fn main() -> Result<()> {
         .route("/confirm", post(post_confirm))
         .route("/notify_tx", post(post_notify_tx))
         .route("/pools", get(list_pools).post(register_pool))
+        .route("/pool_meta", get(get_pool_meta))
         .route("/frozen_root", get(get_frozen_root))
         .route("/frozen_witness", get(get_frozen_witness))
         .route("/frozen", post(post_frozen))
@@ -845,11 +959,39 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// `GET /pools` — list the pools currently being watched and the primary pool.
+/// `GET /pools` — list the pools currently being watched, the primary pool, and any known
+/// per-pool metadata (type/scale/underlying/name/symbol/decimals). Metadata is fetched lazily
+/// and best-effort; pools without a decodable genesis event simply omit it.
 async fn list_pools(State(reg): State<PoolRegistry>) -> Json<serde_json::Value> {
     let addrs: Vec<String> = reg.pools.read().await.keys().cloned().collect();
     let primary = reg.primary.read().await.clone();
-    Json(serde_json::json!({ "pools": addrs, "primary": primary }))
+    let mut metas: Vec<PoolMeta> = Vec::with_capacity(addrs.len());
+    for a in &addrs {
+        if let Some(m) = reg.ensure_metadata(a).await {
+            metas.push(m);
+        }
+    }
+    Json(serde_json::json!({ "pools": addrs, "primary": primary, "metadata": metas }))
+}
+
+#[derive(Debug, Deserialize)]
+struct PoolMetaQuery {
+    pool: String,
+}
+
+/// `GET /pool_meta?pool=0x...` — metadata for a single pool (lazy fetch + cache).
+async fn get_pool_meta(
+    State(reg): State<PoolRegistry>,
+    Query(q): Query<PoolMetaQuery>,
+) -> Result<Json<PoolMeta>, (StatusCode, String)> {
+    if parse_address20(&q.pool).is_none() {
+        return Err((StatusCode::BAD_REQUEST, "pool must be a 20-byte hex address".to_owned()));
+    }
+    let key = normalize_hex_0x(&q.pool).to_lowercase();
+    reg.ensure_metadata(&key)
+        .await
+        .map(Json)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no metadata for pool {}", q.pool)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -886,7 +1028,7 @@ async fn register_pool(
         Ok(false) => {
             return Err((
                 StatusCode::FORBIDDEN,
-                "address is not a pERC20 asset (no Perc20Created event on-chain)".to_owned(),
+                "address is not a pERC20 asset (no Perc20Created / WrappedCreated event on-chain)".to_owned(),
             ))
         }
         Err(e) => {
@@ -2377,6 +2519,69 @@ impl RpcClient {
             .await
             .context("eth_getLogs (Perc20Created verification) failed")?;
         Ok(!logs.is_empty())
+    }
+
+    /// True if `pool` emitted `WrappedCreated(pool,…)` at construction — i.e. it is a genuine
+    /// `WrappedPERC20` backed pool. Mirrors `is_perc20_created` but for the wrapped event.
+    async fn is_wrapped_created(&self, pool: &str) -> Result<bool> {
+        let addr = normalize_hex_0x(pool);
+        let topic1 = format!("0x{:0>64}", addr.trim_start_matches("0x"));
+        let filter = serde_json::json!({
+            "fromBlock": "0x0",
+            "toBlock":   "latest",
+            "address":   addr,
+            "topics":    [wrapped_created_topic0_hex(), topic1],
+        });
+        let logs: Vec<EthLog> = self
+            .rpc_call("eth_getLogs", serde_json::json!([filter]))
+            .await
+            .context("eth_getLogs (WrappedCreated verification) failed")?;
+        Ok(!logs.is_empty())
+    }
+
+    /// Fetch pool metadata by reading the pool's genesis event. Returns wrapped metadata
+    /// (scale/underlying/name/symbol/decimals) when `WrappedCreated` is present, else issuer
+    /// metadata (name/symbol/decimals) from `Perc20Created`, else `None`.
+    async fn fetch_pool_metadata(&self, pool: &str) -> Result<Option<PoolMeta>> {
+        let addr = normalize_hex_0x(pool);
+        let topic1 = format!("0x{:0>64}", addr.trim_start_matches("0x"));
+        // Prefer the wrapped genesis event (carries scale + underlying).
+        let wrapped_filter = serde_json::json!({
+            "fromBlock": "0x0",
+            "toBlock":   "latest",
+            "address":   addr,
+            "topics":    [wrapped_created_topic0_hex(), topic1],
+        });
+        let logs: Vec<EthLog> = self
+            .rpc_call("eth_getLogs", serde_json::json!([wrapped_filter]))
+            .await
+            .context("eth_getLogs (WrappedCreated metadata) failed")?;
+        if let Some(l) = logs.first() {
+            if let Some(topics) = l.topics.as_ref() {
+                if let Ok(d) = decode_wrapped_created_log(topics, &l.data) {
+                    return Ok(Some(PoolMeta::from_wrapped(&addr, &d)));
+                }
+            }
+        }
+        // Fall back to issuer genesis (name/symbol/decimals only).
+        let issuer_filter = serde_json::json!({
+            "fromBlock": "0x0",
+            "toBlock":   "latest",
+            "address":   addr,
+            "topics":    [perc20_created_topic0(), topic1],
+        });
+        let logs: Vec<EthLog> = self
+            .rpc_call("eth_getLogs", serde_json::json!([issuer_filter]))
+            .await
+            .context("eth_getLogs (Perc20Created metadata) failed")?;
+        if let Some(l) = logs.first() {
+            if let Some(meta) = PoolMeta::try_from_perc20_created(&addr, &l.data) {
+                return Ok(Some(meta));
+            }
+            // Event present but body not decodable — still a known issuer pool.
+            return Ok(Some(PoolMeta::issuer_minimal(&addr)));
+        }
+        Ok(None)
     }
 
     /// Scan `Perc20Created` chain-wide (no address filter) over [from, to] and
