@@ -33,8 +33,8 @@ use privacy_core::ethereum::{
     bundle_actions_by_cmx, decode_note_added_log, decode_note_confirmed_log,
     decode_shield_completed_log, BundleActionCiphertexts,
     note_added_topic0_alternatives, note_confirmed_topic0_hex, shield_completed_topic0_hex,
-    // WS-6: WrappedPERC20 discovery/verification + metadata (privacy-core 0.1.2).
-    decode_wrapped_created_log, wrapped_created_topic0_hex, DecodedWrappedCreated,
+    // WS-6: ERC20Shield pool discovery/verification + metadata (privacy-core 0.1.3).
+    decode_shield_pool_created_log, shield_pool_created_topic0_hex, DecodedShieldPoolCreated,
 };
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -435,9 +435,11 @@ struct PoolMeta {
 }
 
 impl PoolMeta {
-    fn from_wrapped(pool: &str, d: &DecodedWrappedCreated) -> Self {
+    fn from_shield_pool(pool: &str, d: &DecodedShieldPoolCreated) -> Self {
         PoolMeta {
             pool: normalize_hex_0x(pool).to_lowercase(),
+            // API value kept as "wrapped" for frontend backward-compatibility (shield pools were
+            // formerly WrappedPERC20); the on-chain event is now `ShieldPoolCreated`.
             pool_type: "wrapped".to_string(),
             underlying: Some(format!("0x{}", hex::encode(d.underlying))),
             scale: Some(d.scale.to_string()),
@@ -553,10 +555,10 @@ impl PoolRegistry {
         if self.pools.read().await.contains_key(pool_lc) {
             return Ok(true);
         }
-        // Genuine if it emitted either the issuer (`Perc20Created`) or the wrapped
-        // (`WrappedCreated`) genesis event for itself.
+        // Genuine if it emitted either the issuer (`Perc20Created`) or the shield-pool
+        // (`ShieldPoolCreated`) genesis event for itself.
         let genuine = self.builder.rpc.is_perc20_created(pool_lc).await?
-            || self.builder.rpc.is_wrapped_created(pool_lc).await?;
+            || self.builder.rpc.is_shield_pool_created(pool_lc).await?;
         if genuine {
             self.verified_pools.write().await.insert(pool_lc.to_string());
         }
@@ -1028,7 +1030,7 @@ async fn register_pool(
         Ok(false) => {
             return Err((
                 StatusCode::FORBIDDEN,
-                "address is not a pERC20 asset (no Perc20Created / WrappedCreated event on-chain)".to_owned(),
+                "address is not a pERC20 asset (no Perc20Created / ShieldPoolCreated event on-chain)".to_owned(),
             ))
         }
         Err(e) => {
@@ -2521,45 +2523,45 @@ impl RpcClient {
         Ok(!logs.is_empty())
     }
 
-    /// True if `pool` emitted `WrappedCreated(pool,…)` at construction — i.e. it is a genuine
-    /// `WrappedPERC20` backed pool. Mirrors `is_perc20_created` but for the wrapped event.
-    async fn is_wrapped_created(&self, pool: &str) -> Result<bool> {
+    /// True if `pool` emitted `ShieldPoolCreated(pool,…)` at construction — i.e. it is a genuine
+    /// `ERC20Shield` backed pool. Mirrors `is_perc20_created` but for the shield-pool event.
+    async fn is_shield_pool_created(&self, pool: &str) -> Result<bool> {
         let addr = normalize_hex_0x(pool);
         let topic1 = format!("0x{:0>64}", addr.trim_start_matches("0x"));
         let filter = serde_json::json!({
             "fromBlock": "0x0",
             "toBlock":   "latest",
             "address":   addr,
-            "topics":    [wrapped_created_topic0_hex(), topic1],
+            "topics":    [shield_pool_created_topic0_hex(), topic1],
         });
         let logs: Vec<EthLog> = self
             .rpc_call("eth_getLogs", serde_json::json!([filter]))
             .await
-            .context("eth_getLogs (WrappedCreated verification) failed")?;
+            .context("eth_getLogs (ShieldPoolCreated verification) failed")?;
         Ok(!logs.is_empty())
     }
 
-    /// Fetch pool metadata by reading the pool's genesis event. Returns wrapped metadata
-    /// (scale/underlying/name/symbol/decimals) when `WrappedCreated` is present, else issuer
+    /// Fetch pool metadata by reading the pool's genesis event. Returns shield-pool metadata
+    /// (scale/underlying/name/symbol/decimals) when `ShieldPoolCreated` is present, else issuer
     /// metadata (name/symbol/decimals) from `Perc20Created`, else `None`.
     async fn fetch_pool_metadata(&self, pool: &str) -> Result<Option<PoolMeta>> {
         let addr = normalize_hex_0x(pool);
         let topic1 = format!("0x{:0>64}", addr.trim_start_matches("0x"));
-        // Prefer the wrapped genesis event (carries scale + underlying).
-        let wrapped_filter = serde_json::json!({
+        // Prefer the shield-pool genesis event (carries scale + underlying).
+        let shield_filter = serde_json::json!({
             "fromBlock": "0x0",
             "toBlock":   "latest",
             "address":   addr,
-            "topics":    [wrapped_created_topic0_hex(), topic1],
+            "topics":    [shield_pool_created_topic0_hex(), topic1],
         });
         let logs: Vec<EthLog> = self
-            .rpc_call("eth_getLogs", serde_json::json!([wrapped_filter]))
+            .rpc_call("eth_getLogs", serde_json::json!([shield_filter]))
             .await
-            .context("eth_getLogs (WrappedCreated metadata) failed")?;
+            .context("eth_getLogs (ShieldPoolCreated metadata) failed")?;
         if let Some(l) = logs.first() {
             if let Some(topics) = l.topics.as_ref() {
-                if let Ok(d) = decode_wrapped_created_log(topics, &l.data) {
-                    return Ok(Some(PoolMeta::from_wrapped(&addr, &d)));
+                if let Ok(d) = decode_shield_pool_created_log(topics, &l.data) {
+                    return Ok(Some(PoolMeta::from_shield_pool(&addr, &d)));
                 }
             }
         }
