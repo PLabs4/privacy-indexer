@@ -852,6 +852,7 @@ async fn main() -> Result<()> {
         .route("/root", get(get_root))
         .route("/merkle_path", get(get_merkle_path))
         .route("/note", get(get_note))
+        .route("/tx", get(get_tx))
         .route("/confirm", post(post_confirm))
         .route("/notify_tx", post(post_notify_tx))
         .route("/pools", get(list_pools).post(register_pool))
@@ -1187,6 +1188,38 @@ async fn get_note(
         }
     }
     Err((StatusCode::NOT_FOUND, "cmx not found in indexer batches".to_owned()))
+}
+
+#[derive(Debug, Deserialize)]
+struct TxLookupQuery {
+    /// Transaction hash in hex (with or without 0x prefix).
+    hash: String,
+    /// Contract address of the pool to query. Omit to use the primary pool.
+    pool: Option<String>,
+}
+
+/// Return every ciphertext note added by a single transaction, keyed by tx hash.
+/// Powers the ciphertext explorer's "search by tx hash" so the client doesn't have
+/// to download the whole pool's batch history and filter locally. One tx can carry
+/// multiple notes (e.g. a transfer's recipient + change note), so this returns a list.
+async fn get_tx(
+    State(reg): State<PoolRegistry>,
+    Query(q): Query<TxLookupQuery>,
+) -> Result<Json<Vec<OrchardIndexedAbiNote>>, (StatusCode, String)> {
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
+    let want = normalize_hex_0x(&q.hash).to_lowercase();
+
+    let s = ctx.state.read().await;
+    let mut out: Vec<OrchardIndexedAbiNote> = Vec::new();
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    for batch in s.batches.iter() {
+        for note in &batch.batch.abi_notes {
+            if normalize_hex_0x(&note.tx_hash).to_lowercase() == want && seen.insert(note.cmx) {
+                out.push(note.clone());
+            }
+        }
+    }
+    Ok(Json(out))
 }
 
 async fn get_merkle_path(
