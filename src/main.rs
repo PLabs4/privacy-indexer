@@ -1867,6 +1867,7 @@ async fn lookup_bundle_out_fields(
 
 // ─── WebSocket event loop ─────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct PollContext {
     rpc: RpcClient,
     /// WebSocket URL derived from rpc_url (https→wss, http→ws).
@@ -1982,18 +1983,142 @@ async fn backfill_from_chain(ctx: &PollContext) {
     );
 }
 
+/// How often the incremental gap-filler polls the chain to reconcile logs the WebSocket
+/// subscription may have silently dropped.
+const CATCHUP_INTERVAL_SECS: u64 = 20;
+
+/// Split the inclusive block range `[from, head]` into `eth_getLogs` windows of at most
+/// `chunk` blocks each. Returns an empty vec when already caught up (`from > head`) or when
+/// `chunk == 0` (guards against an infinite loop). Windows are contiguous and non-overlapping.
+fn catchup_ranges(from: u64, head: u64, chunk: u64) -> Vec<(u64, u64)> {
+    let mut ranges = Vec::new();
+    if from > head || chunk == 0 {
+        return ranges;
+    }
+    let mut cur = from;
+    while cur <= head {
+        let to = (cur + chunk - 1).min(head);
+        ranges.push((cur, to));
+        if to == u64::MAX {
+            break; // avoid overflow on `to + 1`
+        }
+        cur = to + 1;
+    }
+    ranges
+}
+
+/// Monotonic cursor advance: move `next_block` to just past the reconciled `head`, but never
+/// backwards (a concurrent WS log or a later backfill may have already advanced it further).
+fn advance_cursor(current: u64, head: u64) -> u64 {
+    current.max(head.saturating_add(1))
+}
+
+/// Incremental gap-filler. Scans `eth_getLogs` from the persisted `next_block` up to the
+/// current chain head and replays any logs the live WebSocket missed, WITHOUT resetting the
+/// tree. `process_single_log` dedups atomically by `(tx_hash, log_index)` under the state
+/// write lock, so overlap with WS-delivered logs is a no-op.
+///
+/// This is the durability backstop for `run_ws_subscription`: some providers' WS endpoints
+/// (notably several Monad ones) silently drop `eth_subscribe` logs or go quiet after a
+/// reconnect, which used to leave a permanent gap between the one-shot startup backfill and
+/// live streaming. Polling forward on an interval lets the indexer self-heal and keep
+/// `next_block` advancing toward chain head instead of freezing.
+async fn catchup_from_chain(ctx: &PollContext) {
+    let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
+    let head = match ctx.rpc.block_number().await {
+        Ok(h) => h,
+        Err(_) => return, // transient RPC error — retry next tick from the same cursor
+    };
+    let from = { ctx.shared.read().await.next_block };
+    if from > head {
+        return; // already caught up
+    }
+
+    let mut topic0s: Vec<String> = note_added_topic0_alternatives()
+        .iter()
+        .map(|t| normalize_hex_0x(t))
+        .collect();
+    topic0s.push(normalize_hex_0x(&shield_completed_topic0_hex()));
+    topic0s.push(normalize_hex_0x(&ctx.note_confirmed_topic0));
+
+    const CHUNK: u64 = 5_000;
+    let mut total = 0usize;
+    for (lo, hi) in catchup_ranges(from, head, CHUNK) {
+        match ctx
+            .rpc
+            .fetch_logs_topic0_or(lo, hi, &ctx.contract_address, &topic0s)
+            .await
+        {
+            Ok(mut logs) => {
+                logs.sort_by(|a, b| {
+                    let ka = (
+                        parse_hex_u64(&a.block_number).unwrap_or(0),
+                        parse_hex_u64(&a.log_index).unwrap_or(0),
+                    );
+                    let kb = (
+                        parse_hex_u64(&b.block_number).unwrap_or(0),
+                        parse_hex_u64(&b.log_index).unwrap_or(0),
+                    );
+                    ka.cmp(&kb)
+                });
+                for log in logs {
+                    if let Err(e) = process_single_log(ctx, log).await {
+                        eprintln!("[indexer][{label}] catchup log error: {e:#}");
+                    } else {
+                        total += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                // Leave `next_block` where it is so the next tick retries this range.
+                eprintln!("[indexer][{label}] catchup getLogs [{lo},{hi}] failed: {e:#}");
+                return;
+            }
+        }
+    }
+
+    // Advance the cursor past the reconciled head (never move it backwards).
+    let mut s = ctx.shared.write().await;
+    s.next_block = advance_cursor(s.next_block, head);
+    ctx.persist.notify(&s);
+    drop(s);
+    if total > 0 {
+        println!(
+            "[indexer][{label}] catchup: reconciled {total} log(s) up to block {head}, next_block={}",
+            head + 1
+        );
+    }
+}
+
 /// WebSocket event-driven loop.
 ///
 /// 1. Subscribe: `eth_subscribe logs` on the contract address.
 /// 2. Process each incoming log immediately — no block polling.
 /// 3. On disconnect: recover any pending tx hashes via receipt lookup, then resubscribe.
 /// 4. Also listens for recover_trigger signals from post_notify_tx for immediate recovery.
+/// 5. A concurrent `catchup_from_chain` task reconciles anything the WS silently dropped.
 async fn run_event_loop(ctx: PollContext) -> Result<()> {
     // Rebuild the commitment tree from chain so the indexer matches on-chain state
     // (correct leaf positions / root) even after restarts or a partial checkpoint.
     backfill_from_chain(&ctx).await;
     // On every startup, recover any pending txs persisted in the checkpoint.
     recover_pending_txs(&ctx).await;
+
+    // Durability backstop: poll the chain forward on an interval so a flaky WS that
+    // silently drops logs can no longer leave a permanent gap after go-live.
+    {
+        let ctx_catchup = ctx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(CATCHUP_INTERVAL_SECS));
+            // The first tick fires immediately; skip it since backfill just ran.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                catchup_from_chain(&ctx_catchup).await;
+            }
+        });
+    }
+
     loop {
         let ws_future = run_ws_subscription(&ctx);
         tokio::select! {
@@ -2934,8 +3059,8 @@ fn strip_0x(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_orchard_bundle_from_log_data, encode_confirm_receipt_calldata, normalize_hex_0x,
-        rlp_bytes, rlp_list, rlp_uint,
+        advance_cursor, catchup_ranges, decode_orchard_bundle_from_log_data,
+        encode_confirm_receipt_calldata, normalize_hex_0x, rlp_bytes, rlp_list, rlp_uint,
     };
     use privacy_core::types::OrchardStoredBundle;
     use sha3::{Digest, Keccak256};
@@ -3079,5 +3204,51 @@ mod tests {
         let hash: [u8; 32] = Keccak256::digest(secret).into();
         let recomputed: [u8; 32] = Keccak256::digest(secret).into();
         assert_eq!(hash, recomputed);
+    }
+
+    // ── Incremental catch-up gap-filler ─────────────────────────────────────
+    //
+    // Regression for "indexer stops advancing after backfill→WS live": the periodic
+    // gap-filler must chunk `[next_block, head]` correctly and advance the cursor
+    // monotonically so a flaky WS can no longer freeze `next_block`.
+
+    #[test]
+    fn catchup_ranges_already_caught_up_is_empty() {
+        assert!(catchup_ranges(101, 100, 5_000).is_empty());
+        assert!(catchup_ranges(1, 0, 5_000).is_empty());
+    }
+
+    #[test]
+    fn catchup_ranges_single_block() {
+        assert_eq!(catchup_ranges(0, 0, 5_000), vec![(0, 0)]);
+        assert_eq!(catchup_ranges(42, 42, 5_000), vec![(42, 42)]);
+    }
+
+    #[test]
+    fn catchup_ranges_chunks_are_contiguous_and_cover_everything() {
+        let ranges = catchup_ranges(1, 12_000, 5_000);
+        assert_eq!(ranges, vec![(1, 5_000), (5_001, 10_000), (10_001, 12_000)]);
+        // Contiguous, non-overlapping, and fully covering [1, 12_000].
+        assert_eq!(ranges.first().unwrap().0, 1);
+        assert_eq!(ranges.last().unwrap().1, 12_000);
+        for w in ranges.windows(2) {
+            assert_eq!(w[0].1 + 1, w[1].0, "windows must be contiguous with no gap/overlap");
+        }
+    }
+
+    #[test]
+    fn catchup_ranges_zero_chunk_does_not_loop_forever() {
+        // Guard: a misconfigured chunk of 0 returns empty instead of hanging.
+        assert!(catchup_ranges(1, 100, 0).is_empty());
+    }
+
+    #[test]
+    fn advance_cursor_moves_forward_never_backward() {
+        // Normal advance: cursor jumps to head+1.
+        assert_eq!(advance_cursor(50, 100), 101);
+        // Never regress: a concurrent WS log / later backfill already moved it past head.
+        assert_eq!(advance_cursor(200, 100), 200);
+        // Idempotent at the boundary.
+        assert_eq!(advance_cursor(101, 100), 101);
     }
 }
