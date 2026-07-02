@@ -196,6 +196,9 @@ struct SharedState {
     seen_event_ids: HashSet<String>,
     /// Dedup set for Phase 2 (NoteConfirmed) events.
     confirm_seen_ids: HashSet<String>,
+    /// Dedup set for ShieldCompleted events (they re-emit a batch envelope, so
+    /// WS/catchup overlap must not process them twice).
+    shield_seen_ids: HashSet<String>,
     batches: VecDeque<BatchEnvelope>,
     max_batches: usize,
     /// Orchard note commitment tree (all cmx, pending + confirmed).
@@ -346,6 +349,7 @@ impl PoolBuilder {
             latest_seq: ck.latest_seq,
             seen_event_ids: HashSet::new(),
             confirm_seen_ids: HashSet::new(),
+            shield_seen_ids: HashSet::new(),
             batches: ck.batches,
             max_batches: self.max_batches,
             tree: restored_tree,
@@ -375,6 +379,7 @@ impl PoolBuilder {
             batch_tx: batch_tx.clone(),
             recover_trigger: Arc::clone(&recover_trigger),
             start_block,
+            ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let addr_label = contract_address.to_string();
         tokio::spawn(async move {
@@ -1885,6 +1890,14 @@ struct PollContext {
     recover_trigger: Arc<tokio::sync::Notify>,
     /// First block to scan when rebuilding the tree from chain on startup.
     start_block: u64,
+    /// Serializes ALL log ingestion paths (WS, catchup, backfill, recovery).
+    ///
+    /// The commitment tree is append-only, so leaves MUST be appended in exact
+    /// (block, log_index) order. Without this lock a catchup replay of older
+    /// blocks can interleave with live WS appends of newer blocks; a single
+    /// out-of-order append makes the local tree diverge from the chain and
+    /// every root it produces afterwards fails `isValidAnchor` (BadAnchor).
+    ingest_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Rebuild the commitment tree from chain via `eth_getLogs`, in on-chain order.
@@ -1896,6 +1909,7 @@ struct PollContext {
 /// (Relayer `/notify_tx` covers any tx landing in the brief gap before the
 /// subscription is active; the next restart's backfill reconciles regardless.)
 async fn backfill_from_chain(ctx: &PollContext) {
+    let _ingest = ctx.ingest_lock.lock().await;
     let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
     let head = match ctx.rpc.block_number().await {
         Ok(h) => h,
@@ -1926,6 +1940,7 @@ async fn backfill_from_chain(ctx: &PollContext) {
         s.cmx_ordered.clear();
         s.seen_event_ids.clear();
         s.confirm_seen_ids.clear();
+        s.shield_seen_ids.clear();
         s.batches.clear();
         s.latest_seq = 0;
         s.pending_notes.clear();
@@ -2029,11 +2044,39 @@ async fn catchup_from_chain(ctx: &PollContext) {
         Ok(h) => h,
         Err(_) => return, // transient RPC error — retry next tick from the same cursor
     };
+    // Hold the ingest lock for the WHOLE pass so live WS appends of newer
+    // blocks cannot interleave with this ordered replay of older ones.
+    let _ingest = ctx.ingest_lock.lock().await;
     let from = { ctx.shared.read().await.next_block };
     if from > head {
         return; // already caught up
     }
 
+    let total = match replay_range(ctx, from, head).await {
+        Ok(n) => n,
+        Err(()) => return, // getLogs failed mid-range; next tick retries from the same cursor
+    };
+
+    // Advance the cursor past the reconciled head (never move it backwards).
+    let mut s = ctx.shared.write().await;
+    s.next_block = advance_cursor(s.next_block, head);
+    ctx.persist.notify(&s);
+    drop(s);
+    if total > 0 {
+        println!(
+            "[indexer][{label}] catchup: reconciled {total} log(s) up to block {head}, next_block={}",
+            head + 1
+        );
+    }
+}
+
+/// Fetch every watched log in the inclusive block range `[from, to]` and replay
+/// them through `process_single_log` in strict (block, log_index) order.
+///
+/// The caller MUST hold `ctx.ingest_lock`. Returns the number of logs processed,
+/// or `Err(())` if a getLogs window failed (the cursor must not advance then).
+async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()> {
+    let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
     let mut topic0s: Vec<String> = note_added_topic0_alternatives()
         .iter()
         .map(|t| normalize_hex_0x(t))
@@ -2043,7 +2086,7 @@ async fn catchup_from_chain(ctx: &PollContext) {
 
     const CHUNK: u64 = 5_000;
     let mut total = 0usize;
-    for (lo, hi) in catchup_ranges(from, head, CHUNK) {
+    for (lo, hi) in catchup_ranges(from, to, CHUNK) {
         match ctx
             .rpc
             .fetch_logs_topic0_or(lo, hi, &ctx.contract_address, &topic0s)
@@ -2063,31 +2106,78 @@ async fn catchup_from_chain(ctx: &PollContext) {
                 });
                 for log in logs {
                     if let Err(e) = process_single_log(ctx, log).await {
-                        eprintln!("[indexer][{label}] catchup log error: {e:#}");
+                        eprintln!("[indexer][{label}] replay log error: {e:#}");
                     } else {
                         total += 1;
                     }
                 }
             }
             Err(e) => {
-                // Leave `next_block` where it is so the next tick retries this range.
-                eprintln!("[indexer][{label}] catchup getLogs [{lo},{hi}] failed: {e:#}");
-                return;
+                eprintln!("[indexer][{label}] replay getLogs [{lo},{hi}] failed: {e:#}");
+                return Err(());
             }
         }
     }
+    Ok(total)
+}
 
-    // Advance the cursor past the reconciled head (never move it backwards).
-    let mut s = ctx.shared.write().await;
-    s.next_block = advance_cursor(s.next_block, head);
-    ctx.persist.notify(&s);
-    drop(s);
-    if total > 0 {
-        println!(
-            "[indexer][{label}] catchup: reconciled {total} log(s) up to block {head}, next_block={}",
-            head + 1
-        );
+/// Ingest a live WS log while preserving strict on-chain ordering.
+///
+/// The pushed log is used ONLY as a wake-up signal + coverage marker — it is
+/// never processed directly. All appends flow through `replay_range`, which
+/// fetches `eth_getLogs` and processes strictly in (block, log_index) order.
+///
+/// Two provider behaviours make direct processing unsafe:
+/// - the WS can silently drop logs, so a pushed log for block B may have
+///   dropped predecessors in `[next_block, B]` that must be ingested first;
+/// - the provider's getLogs view can LAG its own WS push (observed on anvil
+///   under load): a replay right after the push may come back empty. If we
+///   then appended the pushed log directly, a later replay would insert the
+///   siblings BEHIND it — out of order — permanently corrupting the tree.
+///
+/// So: replay the window, check whether this log's event id got ingested, and
+/// if not, sleep briefly and retry until the getLogs view catches up. If it
+/// never does, leave the cursor untouched and let the periodic catchup replay
+/// the window in order later.
+async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
+    let _ingest = ctx.ingest_lock.lock().await;
+    let block_number = parse_hex_u64(&log.block_number)
+        .with_context(|| format!("invalid blockNumber: {}", log.block_number))?;
+    let event_id = format!("{}:{}", log.transaction_hash, log.log_index);
+
+    let covered = |s: &SharedState| {
+        s.seen_event_ids.contains(&event_id)
+            || s.confirm_seen_ids.contains(&event_id)
+            || s.shield_seen_ids.contains(&event_id)
+    };
+
+    for attempt in 0u64..6 {
+        {
+            let s = ctx.shared.read().await;
+            if covered(&s) {
+                return Ok(());
+            }
+        }
+        let cursor = { ctx.shared.read().await.next_block };
+        let from = cursor.min(block_number);
+        if replay_range(ctx, from, block_number).await.is_ok() {
+            let mut s = ctx.shared.write().await;
+            if covered(&s) {
+                // Cursor moves to B (not past it): later same-block pushes
+                // trigger a cheap dedup-only replay of B, never a skip.
+                s.next_block = s.next_block.max(block_number);
+                ctx.persist.notify(&s);
+                return Ok(());
+            }
+        }
+        // getLogs has not caught up with the WS push yet.
+        tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
     }
+    eprintln!(
+        "[indexer] WS log {event_id} (block {block_number}) still not visible via eth_getLogs; \
+         deferring to the periodic catchup"
+    );
+    Ok(())
 }
 
 /// WebSocket event-driven loop.
@@ -2159,7 +2249,9 @@ async fn recover_pending_txs(ctx: &PollContext) {
                 if success {
                     println!("[indexer] recovering tx {tx_hash}: {} log(s)", logs.len());
                     for log in logs {
-                        if let Err(e) = process_single_log(ctx, log).await {
+                        // Ordered ingest: gap-fills any earlier dropped logs first,
+                        // so recovered logs cannot be appended out of order.
+                        if let Err(e) = ingest_ws_log(ctx, log).await {
                             eprintln!("[indexer] recover log error for {tx_hash}: {e:#}");
                         }
                     }
@@ -2260,8 +2352,8 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
                 if v["params"]["subscription"].as_str() != Some(&sub_id) { continue; }
                 let log_val = &v["params"]["result"];
                 if let Ok(log) = serde_json::from_value::<EthLog>(log_val.clone()) {
-                    if let Err(e) = process_single_log(ctx, log).await {
-                        eprintln!("[indexer] process_single_log error: {e:#}");
+                    if let Err(e) = ingest_ws_log(ctx, log).await {
+                        eprintln!("[indexer] ingest_ws_log error: {e:#}");
                     }
                 }
             }
@@ -2468,6 +2560,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         // ── ShieldCompleted ──────────────────────────────────────────────────
         // NoteAdded was already processed; update shield_amount_sats on the
         // existing batch entry and re-emit.
+        if !state.shield_seen_ids.insert(event_id) { return Ok(()); }
         if let Ok((cmx, amt)) =
             decode_shield_completed_log(log.topics.as_deref().unwrap_or(&[]), &log.data)
         {
