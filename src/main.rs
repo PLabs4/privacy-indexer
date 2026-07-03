@@ -223,6 +223,13 @@ struct SharedState {
     /// Public aggregate totals for backed shield pools. Values are event-derived:
     /// `current = total_shielded - total_unshielded`.
     shield_accounting: ShieldAccounting,
+    /// (block, log_index) of the most recently appended leaf. Appends MUST be
+    /// monotonic in this key — the tree is append-only and must match on-chain
+    /// insertion order exactly, or every root it produces is invalid.
+    last_leaf_key: Option<(u64, u64)>,
+    /// Set when an out-of-order append was rejected: the tree is missing a
+    /// leaf in the middle and must be rebuilt from chain (see catchup task).
+    tree_out_of_order: bool,
     batches: VecDeque<BatchEnvelope>,
     max_batches: usize,
     /// Orchard note commitment tree (all cmx, pending + confirmed).
@@ -284,6 +291,9 @@ struct AppContext {
     batch_tx: broadcast::Sender<BatchEnvelope>,
     /// Triggered by post_notify_tx to wake the event loop for immediate recovery.
     recover_trigger: Arc<tokio::sync::Notify>,
+    /// Persistent backend, used by `/batches` to serve history evicted from the
+    /// in-memory ring (the ring is a hot cache, NOT the source of truth).
+    backend: StateBackend,
 }
 
 /// Everything required to construct a per-pool `AppContext` and spawn its WS
@@ -338,10 +348,15 @@ impl PoolBuilder {
             None => StateBackend::Json(self.state_file_for(contract_address)),
         };
         let ck = backend.load(contract_address, start_block).await;
+        // A fresh checkpoint restarts sequence numbers from 0; a leftover batch
+        // archive from an earlier run would collide with re-issued seqs.
+        if ck.latest_seq == 0 {
+            backend.reset_archive();
+        }
         let (persist_tx, persist_rx) = tokio::sync::watch::channel(std::sync::Arc::new(
             CheckpointSnapshot::from_checkpoint_data(&ck),
         ));
-        tokio::spawn(persist_task(backend, contract_address.to_string(), persist_rx));
+        tokio::spawn(persist_task(backend.clone(), contract_address.to_string(), persist_rx));
         let persist = Persist { tx: persist_tx };
 
         // Rebuild Poseidon tree from checkpoint.
@@ -376,6 +391,8 @@ impl PoolBuilder {
             shield_seen_ids: HashSet::new(),
             accounting_seen_ids: HashSet::new(),
             shield_accounting: ck.shield_accounting,
+            last_leaf_key: None,
+            tree_out_of_order: false,
             batches: ck.batches,
             max_batches: self.max_batches,
             tree: restored_tree,
@@ -406,6 +423,7 @@ impl PoolBuilder {
             recover_trigger: Arc::clone(&recover_trigger),
             start_block,
             ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
+            backend: backend.clone(),
         };
         let addr_label = contract_address.to_string();
         tokio::spawn(async move {
@@ -422,6 +440,7 @@ impl PoolBuilder {
             persist,
             batch_tx,
             recover_trigger,
+            backend,
         }
     }
 }
@@ -1177,14 +1196,34 @@ async fn get_batches(
 ) -> Result<Json<Vec<BatchEnvelope>>, (StatusCode, String)> {
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let after = q.after_seq.unwrap_or(0);
-    let s = ctx.state.read().await;
-    let out = s
-        .batches
-        .iter()
-        .filter(|b| b.seq > after)
-        .cloned()
-        .collect::<Vec<_>>();
+    let out = collect_batches_since(&ctx, after).await;
     Ok(Json(out))
+}
+
+/// All batch envelopes with `seq > after`, oldest first. Recent envelopes come
+/// from the in-memory ring; anything older than the ring's front (evicted) is
+/// loaded from the persistent backend, so full-history scans never silently
+/// miss notes regardless of `--max-batches-in-memory`.
+async fn collect_batches_since(ctx: &AppContext, after: u64) -> Vec<BatchEnvelope> {
+    let (ring, ring_front, latest_seq) = {
+        let s = ctx.state.read().await;
+        let ring: Vec<BatchEnvelope> =
+            s.batches.iter().filter(|b| b.seq > after).cloned().collect();
+        (ring, s.batches.front().map(|b| b.seq), s.latest_seq)
+    };
+    // The ring covers (front..=latest); anything in (after..front) was evicted.
+    let missing_before = match ring_front {
+        Some(front) if front > after.saturating_add(1) => Some(front),
+        None if latest_seq > after => Some(u64::MAX),
+        _ => None,
+    };
+    let Some(before) = missing_before else { return ring };
+    let mut out = ctx
+        .backend
+        .load_archived_batches(&ctx.contract_address, after, before)
+        .await;
+    out.extend(ring);
+    out
 }
 
 /// SSE endpoint: streams BatchEnvelopes to the client as they arrive.
@@ -1213,11 +1252,9 @@ async fn get_batches_stream(
     // Subscribe FIRST so no live batch is missed while we read history.
     let live_rx = ctx.batch_tx.subscribe();
 
-    // Collect historical batches (seq > after_seq).
-    let historical: Vec<BatchEnvelope> = {
-        let s = ctx.state.read().await;
-        s.batches.iter().filter(|b| b.seq > after_seq).cloned().collect()
-    };
+    // Collect historical batches (seq > after_seq), including archived ones the
+    // in-memory ring has already evicted.
+    let historical: Vec<BatchEnvelope> = collect_batches_since(&ctx, after_seq).await;
     let max_hist_seq = historical.last().map(|b| b.seq).unwrap_or(after_seq);
 
     // Build SSE event from a BatchEnvelope.
@@ -1739,6 +1776,138 @@ enum StateBackend {
 }
 
 impl StateBackend {
+    /// Sidecar JSONL file holding every batch envelope ever emitted (JSON mode).
+    /// The in-memory ring only caches the most recent `max_batches`; this archive
+    /// is what lets `/batches?after_seq=0` serve full history after eviction.
+    fn json_archive_path(state_path: &str) -> String {
+        format!("{state_path}.batches.jsonl")
+    }
+
+    /// Durably record one freshly emitted batch envelope.
+    ///
+    /// PG mode is a no-op here: `pg_save` already upserts every note row into the
+    /// `notes` table (keyed by cmx, never deleted on ring eviction), which is the
+    /// source `load_archived_batches` reconstructs envelopes from.
+    fn archive_batch(&self, env: &BatchEnvelope) {
+        if let StateBackend::Json(Some(path)) = self {
+            if let Ok(line) = serde_json::to_string(env) {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(Self::json_archive_path(path))
+                {
+                    let _ = writeln!(f, "{line}");
+                }
+            }
+        }
+    }
+
+    /// Drop the archive. Called when the batch history restarts from seq 0
+    /// (full rebuild via `backfill_from_chain`, or a fresh checkpoint), so stale
+    /// lines can never collide with re-issued sequence numbers.
+    fn reset_archive(&self) {
+        if let StateBackend::Json(Some(path)) = self {
+            let _ = std::fs::remove_file(Self::json_archive_path(path));
+        }
+    }
+
+    /// Load archived envelopes with `after_seq < seq < before_seq`, oldest first.
+    /// Complements the in-memory ring when a client asks for history that has
+    /// already been evicted from it.
+    async fn load_archived_batches(
+        &self,
+        pool_address: &str,
+        after_seq: u64,
+        before_seq: u64,
+    ) -> Vec<BatchEnvelope> {
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let raw = match std::fs::read_to_string(Self::json_archive_path(path)) {
+                    Ok(r) => r,
+                    Err(_) => return Vec::new(),
+                };
+                let mut out: Vec<BatchEnvelope> = Vec::new();
+                let mut seen: HashSet<u64> = HashSet::new();
+                for line in raw.lines() {
+                    // Tolerate a torn final line from a crash mid-append.
+                    let Ok(env) = serde_json::from_str::<BatchEnvelope>(line) else { continue };
+                    if env.seq > after_seq && env.seq < before_seq && seen.insert(env.seq) {
+                        out.push(env);
+                    }
+                }
+                out.sort_by_key(|e| e.seq);
+                out
+            }
+            StateBackend::Json(None) => Vec::new(),
+            StateBackend::Pgsql(pool) => {
+                type NoteRow = (
+                    String,          // cmx_hex
+                    i64,             // seq
+                    i64,             // block_number
+                    String,          // tx_hash
+                    i64,             // log_index
+                    Option<i64>,     // position
+                    String,          // enc_ciphertext_hex
+                    String,          // epk_hex
+                    String,          // out_ciphertext_hex
+                    Option<String>,  // cv_net_x_hex
+                    String,          // nf_old_hex
+                    String,          // ack_hash_hex
+                    Option<i64>,     // shield_amount_sats
+                    bool,            // is_confirmed
+                );
+                let rows: Vec<NoteRow> = sqlx::query_as(
+                    "SELECT cmx_hex, seq, block_number, tx_hash, log_index, position, \
+                       enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, \
+                       nf_old_hex, ack_hash_hex, shield_amount_sats, is_confirmed \
+                     FROM notes WHERE pool_address=$1 AND seq > $2 AND seq < $3 ORDER BY seq",
+                )
+                .bind(pool_address)
+                .bind(after_seq as i64)
+                .bind(before_seq as i64)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+
+                rows.into_iter()
+                    .filter_map(|r| {
+                        let (
+                            cmx_hex, seq, block_number, tx_hash, log_index, position,
+                            enc_hex, epk_hex, out_hex, cv_hex, nf_hex, ack_hex, shield, confirmed,
+                        ) = r;
+                        let note = OrchardIndexedAbiNote {
+                            block_number: block_number as u64,
+                            tx_hash,
+                            log_index: log_index as u64,
+                            cmx: parse_hex32(&cmx_hex)?,
+                            enc_ciphertext: hex::decode(strip_0x(&enc_hex)).ok()?,
+                            epk: parse_hex32(&epk_hex)?,
+                            out_ciphertext: hex::decode(strip_0x(&out_hex)).unwrap_or_default(),
+                            cv_net_x: cv_hex.as_deref().and_then(parse_hex32),
+                            nf_old: parse_hex32(&nf_hex)?,
+                            ack_hash: parse_hex32(&ack_hex)?,
+                            cmx_position: position.map(|p| p as u64),
+                            shield_amount_sats: shield.map(|v| v as u64),
+                            is_confirmed: confirmed,
+                        };
+                        Some(BatchEnvelope {
+                            seq: seq as u64,
+                            pool_address: Some(pool_address.to_string()),
+                            batch: OrchardIndexBatch {
+                                from_block: note.block_number,
+                                to_block: note.block_number,
+                                abi_notes: vec![note],
+                                bundles: vec![],
+                                latest_root: None,
+                            },
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+
     async fn load(&self, pool_address: &str, start_block: u64) -> CheckpointData {
         match self {
             StateBackend::Json(Some(path)) => load_checkpoint(path, start_block),
@@ -2029,6 +2198,9 @@ struct PollContext {
     /// out-of-order append makes the local tree diverge from the chain and
     /// every root it produces afterwards fails `isValidAnchor` (BadAnchor).
     ingest_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Persistent backend: batch envelopes are archived here as they are emitted
+    /// so `/batches` can serve history after in-memory ring eviction.
+    backend: StateBackend,
 }
 
 /// Rebuild the commitment tree from chain via `eth_getLogs`, in on-chain order.
@@ -2076,12 +2248,17 @@ async fn backfill_from_chain(ctx: &PollContext) {
         s.shield_seen_ids.clear();
         s.accounting_seen_ids.clear();
         s.shield_accounting = ShieldAccounting::default();
+        s.last_leaf_key = None;
+        s.tree_out_of_order = false;
         s.batches.clear();
         s.latest_seq = 0;
         s.pending_notes.clear();
         s.confirmed_cmx.clear();
         s.active_root = None;
     }
+    // Sequence numbers restart from 0; drop the old archive so it cannot serve
+    // stale envelopes under re-issued seqs.
+    ctx.backend.reset_archive();
 
     const CHUNK: u64 = 5_000;
     println!("[indexer][{label}] backfill: scanning logs [{}, {head}]…", ctx.start_block);
@@ -2121,15 +2298,16 @@ async fn backfill_from_chain(ctx: &PollContext) {
         from = to + 1;
     }
 
-    // Persist the rebuilt tree and advance next_block past the scanned head.
+    // Persist the rebuilt tree. The cursor advances only TO the scanned head
+    // (not past it) so the head block stays inside the next replay window in
+    // case its logs were not yet fully visible to getLogs.
     let mut s = ctx.shared.write().await;
-    s.next_block = head + 1;
+    s.next_block = s.next_block.max(head);
     let tree_size = s.cmx_ordered.len();
     ctx.persist.notify(&s);
     drop(s);
     println!(
-        "[indexer][{label}] backfill complete: {total} log(s), tree_size={tree_size}, next_block={}",
-        head + 1
+        "[indexer][{label}] backfill complete: {total} log(s), tree_size={tree_size}, next_block={head}"
     );
 }
 
@@ -2192,15 +2370,17 @@ async fn catchup_from_chain(ctx: &PollContext) {
         Err(()) => return, // getLogs failed mid-range; next tick retries from the same cursor
     };
 
-    // Advance the cursor past the reconciled head (never move it backwards).
+    // Advance the cursor only TO the head, not past it: the head block's logs
+    // may not have been fully visible to getLogs yet, so it stays in the next
+    // window (dedup makes the overlap a no-op).
     let mut s = ctx.shared.write().await;
-    s.next_block = advance_cursor(s.next_block, head);
+    s.next_block = s.next_block.max(head);
     ctx.persist.notify(&s);
     drop(s);
     if total > 0 {
         println!(
             "[indexer][{label}] catchup: reconciled {total} log(s) up to block {head}, next_block={}",
-            head + 1
+            head
         );
     }
 }
@@ -2342,7 +2522,16 @@ async fn run_event_loop(ctx: PollContext) -> Result<()> {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                catchup_from_chain(&ctx_catchup).await;
+                // Disaster recovery: if an out-of-order append was rejected the
+                // tree is missing a middle leaf — rebuild it from chain (ordered
+                // getLogs replay) instead of running the incremental catchup.
+                let dirty = { ctx_catchup.shared.read().await.tree_out_of_order };
+                if dirty {
+                    eprintln!("[indexer] commitment tree flagged out-of-order — rebuilding from chain");
+                    backfill_from_chain(&ctx_catchup).await;
+                } else {
+                    catchup_from_chain(&ctx_catchup).await;
+                }
             }
         });
     }
@@ -2561,12 +2750,31 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             Ok(d) => d,
             Err(e) => { eprintln!("[indexer] NoteAdded decode FAILED: {e}"); return Ok(()); }
         };
+        // Monotonicity guard: an append-only tree must receive leaves in exact
+        // (block, log_index) order. If this leaf is OLDER than the newest one
+        // appended, some path raced ahead of it — appending now would put it at
+        // the wrong position and permanently desync every future root from the
+        // chain. Reject the append and flag a full rebuild instead; do NOT mark
+        // the event seen, so the rebuild replays it at the right position.
+        let key = (block_number, log_index);
+        if !state.cmx_to_position.contains_key(&d.cmx) {
+            if let Some(last) = state.last_leaf_key {
+                if key <= last {
+                    eprintln!(
+                        "[indexer] OUT-OF-ORDER leaf rejected: event {event_id} key={key:?} <= last appended {last:?}; scheduling tree rebuild"
+                    );
+                    state.tree_out_of_order = true;
+                    return Ok(());
+                }
+            }
+        }
         let cmx_position = if let Some(&existing_pos) = state.cmx_to_position.get(&d.cmx) {
             Some(existing_pos)
         } else {
             state.tree.append(d.cmx).map(|pos| {
                 state.cmx_to_position.insert(d.cmx, pos);
                 state.cmx_ordered.push(d.cmx);
+                state.last_leaf_key = Some(key);
                 pos
             })
         };
@@ -2611,7 +2819,11 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         let envelope = BatchEnvelope { seq, pool_address: Some(ctx.contract_address.clone()), batch };
         state.batches.push_back(envelope.clone());
         while state.batches.len() > state.max_batches { state.batches.pop_front(); }
-        let next_block = block_number.saturating_add(1).max(state.next_block);
+        // Advance the cursor only TO this block, never past it: this log alone
+        // does not prove the rest of the block's logs were ingested (getLogs
+        // can lag the WS push), so the block must stay inside the replay
+        // window until a full ordered window pass moves the cursor beyond it.
+        let next_block = block_number.max(state.next_block);
         state.next_block = next_block;
         let cmx_snap = state.cmx_ordered.clone();
         let root_snap = state.active_root;
@@ -2622,6 +2834,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             state.frozen.frozen_values().into_iter().map(fr_to_be_bytes).collect();
         let accounting_snap = state.shield_accounting;
         drop(state);
+        ctx.backend.archive_batch(&envelope);
         ctx.batch_tx.send(envelope).ok();
         ctx.persist.notify_owned(CheckpointSnapshot {
             next_block,
@@ -2687,6 +2900,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                     state.frozen.frozen_values().into_iter().map(fr_to_be_bytes).collect();
                 let accounting_snap = state.shield_accounting;
                 drop(state);
+                ctx.backend.archive_batch(&envelope);
                 ctx.batch_tx.send(envelope).ok();
                 ctx.persist.notify_owned(CheckpointSnapshot {
                     next_block,
@@ -2729,6 +2943,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 state.batches.push_back(envelope.clone());
                 while state.batches.len() > state.max_batches { state.batches.pop_front(); }
                 drop(state);
+                ctx.backend.archive_batch(&envelope);
                 ctx.batch_tx.send(envelope).ok();
                 return Ok(());
             }
