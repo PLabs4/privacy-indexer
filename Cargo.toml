@@ -10,7 +10,7 @@ name = "privacy-indexer"
 path = "src/main.rs"
 
 [dependencies]
-privacy-core = "0.1.3"
+privacy-core = "0.1.4"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
@@ -28,10 +28,3 @@ tower-http = { version = "0.6", features = ["cors"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ethabi = "18"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "migrate"] }
-
-# TODO: drop once privacy-core 0.1.4 (Merkle node cache + memoized Poseidon
-# constants — fixes O(n) per-query tree hashing under airdrop load) is
-# published to crates.io by the crate owner.
-[patch.crates-io]
-privacy-core = { git = "ssh://git@github.com/PLabs4/privacy-core.git", tag = "v0.1.4" }
-
