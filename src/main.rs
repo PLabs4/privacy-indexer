@@ -31,7 +31,8 @@ use privacy_core::types::{
 };
 use privacy_core::ethereum::{
     bundle_actions_by_cmx, decode_note_added_log, decode_note_confirmed_log,
-    decode_shield_completed_log, BundleActionCiphertexts,
+    decode_shield_completed_log, decode_shielded_log, decode_unshielded_log,
+    shielded_topic0_hex, unshielded_topic0_hex, BundleActionCiphertexts,
     note_added_topic0_alternatives, note_confirmed_topic0_hex, shield_completed_topic0_hex,
     // WS-6: ERC20Shield pool discovery/verification + metadata (privacy-core 0.1.3).
     decode_shield_pool_created_log, shield_pool_created_topic0_hex, DecodedShieldPoolCreated,
@@ -177,6 +178,24 @@ struct PendingNote {
     submitted_block: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+struct ShieldAccounting {
+    total_shielded_units: u128,
+    total_shielded_wei: u128,
+    total_unshielded_units: u128,
+    total_unshielded_wei: u128,
+}
+
+impl ShieldAccounting {
+    fn current_shielded_units(self) -> u128 {
+        self.total_shielded_units.saturating_sub(self.total_unshielded_units)
+    }
+
+    fn current_shielded_wei(self) -> u128 {
+        self.total_shielded_wei.saturating_sub(self.total_unshielded_wei)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BatchEnvelope {
     seq: u64,
@@ -199,6 +218,11 @@ struct SharedState {
     /// Dedup set for ShieldCompleted events (they re-emit a batch envelope, so
     /// WS/catchup overlap must not process them twice).
     shield_seen_ids: HashSet<String>,
+    /// Dedup set for ERC20Shield accounting events (`Shielded` / `Unshielded`).
+    accounting_seen_ids: HashSet<String>,
+    /// Public aggregate totals for backed shield pools. Values are event-derived:
+    /// `current = total_shielded - total_unshielded`.
+    shield_accounting: ShieldAccounting,
     batches: VecDeque<BatchEnvelope>,
     max_batches: usize,
     /// Orchard note commitment tree (all cmx, pending + confirmed).
@@ -350,6 +374,8 @@ impl PoolBuilder {
             seen_event_ids: HashSet::new(),
             confirm_seen_ids: HashSet::new(),
             shield_seen_ids: HashSet::new(),
+            accounting_seen_ids: HashSet::new(),
+            shield_accounting: ck.shield_accounting,
             batches: ck.batches,
             max_batches: self.max_batches,
             tree: restored_tree,
@@ -718,6 +744,24 @@ struct StatusResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ShieldStatsResponse {
+    pools: Vec<ShieldPoolStats>,
+}
+
+#[derive(Debug, Serialize)]
+struct ShieldPoolStats {
+    pool_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<PoolMeta>,
+    total_shielded_units: String,
+    total_shielded_wei: String,
+    total_unshielded_units: String,
+    total_unshielded_wei: String,
+    current_shielded_units: String,
+    current_shielded_wei: String,
+}
+
+#[derive(Debug, Serialize)]
 struct RootResponse {
     root_hex: Option<String>,
     tree_size: u64,
@@ -862,6 +906,7 @@ async fn main() -> Result<()> {
         .route("/notify_tx", post(post_notify_tx))
         .route("/pools", get(list_pools).post(register_pool))
         .route("/pool_meta", get(get_pool_meta))
+        .route("/shield/stats", get(get_shield_stats))
         .route("/frozen_root", get(get_frozen_root))
         .route("/frozen_witness", get(get_frozen_witness))
         .route("/frozen", post(post_frozen))
@@ -1000,6 +1045,45 @@ async fn get_pool_meta(
         .await
         .map(Json)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no metadata for pool {}", q.pool)))
+}
+
+/// `GET /shield/stats[?pool=0x...]` — event-derived ERC20Shield accounting.
+async fn get_shield_stats(
+    State(reg): State<PoolRegistry>,
+    Query(q): Query<SimplePoolQuery>,
+) -> Result<Json<ShieldStatsResponse>, (StatusCode, String)> {
+    let targets: Vec<(String, AppContext)> = match q.pool.as_deref() {
+        Some(pool) => {
+            let ctx = reg.resolve(Some(pool)).await?;
+            vec![(ctx.contract_address.clone(), ctx)]
+        }
+        None => reg
+            .pools
+            .read()
+            .await
+            .iter()
+            .map(|(pool, ctx)| (pool.clone(), ctx.clone()))
+            .collect(),
+    };
+
+    let mut pools = Vec::with_capacity(targets.len());
+    for (pool, ctx) in targets {
+        let stats = { ctx.state.read().await.shield_accounting };
+        let metadata = reg.ensure_metadata(&pool).await;
+        pools.push(ShieldPoolStats {
+            pool_address: pool,
+            metadata,
+            total_shielded_units: stats.total_shielded_units.to_string(),
+            total_shielded_wei: stats.total_shielded_wei.to_string(),
+            total_unshielded_units: stats.total_unshielded_units.to_string(),
+            total_unshielded_wei: stats.total_unshielded_wei.to_string(),
+            current_shielded_units: stats.current_shielded_units().to_string(),
+            current_shielded_wei: stats.current_shielded_wei().to_string(),
+        });
+    }
+
+    pools.sort_by(|a, b| a.pool_address.cmp(&b.pool_address));
+    Ok(Json(ShieldStatsResponse { pools }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1479,6 +1563,9 @@ struct IndexerCheckpoint {
     /// Frozen `cmx` (BE hex) in insertion order — replayed to rebuild the frozen IMT.
     #[serde(default)]
     frozen_cmx_hex: Vec<String>,
+    /// Event-derived ERC20Shield aggregate accounting.
+    #[serde(default)]
+    shield_accounting: ShieldAccounting,
 }
 
 /// Loaded result from a checkpoint file.
@@ -1490,6 +1577,7 @@ struct CheckpointData {
     batches: VecDeque<BatchEnvelope>,
     pending_tx_hashes: VecDeque<String>,
     frozen_cmx: Vec<[u8; 32]>,
+    shield_accounting: ShieldAccounting,
 }
 
 fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
@@ -1539,7 +1627,7 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                         Some(arr)
                     })
                     .collect();
-                CheckpointData { next_block: resumed, cmx_ordered, active_root, latest_seq: ck.latest_seq, batches, pending_tx_hashes, frozen_cmx }
+                CheckpointData { next_block: resumed, cmx_ordered, active_root, latest_seq: ck.latest_seq, batches, pending_tx_hashes, frozen_cmx, shield_accounting: ck.shield_accounting }
             }
             Err(e) => {
                 eprintln!(
@@ -1553,6 +1641,7 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                     batches: VecDeque::new(),
                     pending_tx_hashes: VecDeque::new(),
                     frozen_cmx: vec![],
+                    shield_accounting: ShieldAccounting::default(),
                 }
             }
         },
@@ -1564,6 +1653,7 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
             batches: VecDeque::new(),
             pending_tx_hashes: VecDeque::new(),
             frozen_cmx: vec![],
+            shield_accounting: ShieldAccounting::default(),
         },
     }
 }
@@ -1577,6 +1667,7 @@ fn save_checkpoint(
     batches: &[BatchEnvelope],
     pending_tx_hashes: &[String],
     frozen_cmx: &[[u8; 32]],
+    shield_accounting: ShieldAccounting,
 ) {
     let ck = IndexerCheckpoint {
         next_block,
@@ -1586,6 +1677,7 @@ fn save_checkpoint(
         batches: batches.to_vec(),
         pending_tx_hashes: pending_tx_hashes.to_vec(),
         frozen_cmx_hex: frozen_cmx.iter().map(hex::encode).collect(),
+        shield_accounting,
     };
     if let Ok(json) = serde_json::to_string(&ck) {
         let tmp = format!("{path}.tmp");
@@ -1608,6 +1700,7 @@ struct CheckpointSnapshot {
     batches: Vec<BatchEnvelope>,
     pending_tx_hashes: Vec<String>,
     frozen_cmx: Vec<[u8; 32]>,
+    shield_accounting: ShieldAccounting,
 }
 
 impl CheckpointSnapshot {
@@ -1620,6 +1713,7 @@ impl CheckpointSnapshot {
             batches: s.batches.iter().cloned().collect(),
             pending_tx_hashes: s.pending_tx_hashes.iter().cloned().collect(),
             frozen_cmx: s.frozen.frozen_values().into_iter().map(fr_to_be_bytes).collect(),
+            shield_accounting: s.shield_accounting,
         }
     }
     fn from_checkpoint_data(ck: &CheckpointData) -> Self {
@@ -1631,6 +1725,7 @@ impl CheckpointSnapshot {
             batches: ck.batches.iter().cloned().collect(),
             pending_tx_hashes: ck.pending_tx_hashes.iter().cloned().collect(),
             frozen_cmx: ck.frozen_cmx.clone(),
+            shield_accounting: ck.shield_accounting,
         }
     }
 }
@@ -1657,6 +1752,7 @@ impl StateBackend {
                 save_checkpoint(
                     path, snap.next_block, &snap.cmx_ordered, snap.active_root,
                     snap.latest_seq, &snap.batches, &snap.pending_tx_hashes, &snap.frozen_cmx,
+                    snap.shield_accounting,
                 );
                 Ok(())
             }
@@ -1675,6 +1771,7 @@ fn empty_checkpoint(start_block: u64) -> CheckpointData {
         batches: VecDeque::new(),
         pending_tx_hashes: VecDeque::new(),
         frozen_cmx: vec![],
+        shield_accounting: ShieldAccounting::default(),
     }
 }
 
@@ -1797,6 +1894,20 @@ async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnaps
             .bind(pool_address).bind(h).execute(&mut *tx).await.context("insert pending_tx")?;
     }
 
+    sqlx::query(
+        "INSERT INTO shield_pool_stats \
+          (pool_address, total_shielded_units, total_shielded_wei, total_unshielded_units, total_unshielded_wei, updated_at) \
+         VALUES ($1,$2,$3,$4,$5, now()) \
+         ON CONFLICT (pool_address) DO UPDATE SET \
+          total_shielded_units=$2, total_shielded_wei=$3, total_unshielded_units=$4, total_unshielded_wei=$5, updated_at=now()",
+    )
+    .bind(pool_address)
+    .bind(snap.shield_accounting.total_shielded_units.to_string())
+    .bind(snap.shield_accounting.total_shielded_wei.to_string())
+    .bind(snap.shield_accounting.total_unshielded_units.to_string())
+    .bind(snap.shield_accounting.total_unshielded_wei.to_string())
+    .execute(&mut *tx).await.context("upsert shield_pool_stats")?;
+
     tx.commit().await.context("pg commit")?;
     Ok(())
 }
@@ -1829,11 +1940,31 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
             .bind(pool_address).fetch_all(pool).await.unwrap_or_default();
     let frozen_cmx: Vec<[u8; 32]> = frozen_rows.iter().filter_map(|(h,)| parse_hex32(h)).collect();
 
+    let stats_row: Option<(String, String, String, String)> =
+        sqlx::query_as(
+            "SELECT total_shielded_units, total_shielded_wei, total_unshielded_units, total_unshielded_wei \
+             FROM shield_pool_stats WHERE pool_address=$1",
+        )
+        .bind(pool_address)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    let shield_accounting = stats_row
+        .map(|(tsu, tsw, tuu, tuw)| ShieldAccounting {
+            total_shielded_units: tsu.parse::<u128>().unwrap_or(0),
+            total_shielded_wei: tsw.parse::<u128>().unwrap_or(0),
+            total_unshielded_units: tuu.parse::<u128>().unwrap_or(0),
+            total_unshielded_wei: tuw.parse::<u128>().unwrap_or(0),
+        })
+        .unwrap_or_default();
+
     println!(
-        "[indexer] pg load: pool={} next_block={next_block} leaves={} pending={} frozen={}",
-        &pool_address[..10.min(pool_address.len())], cmx_ordered.len(), pending_tx_hashes.len(), frozen_cmx.len()
+        "[indexer] pg load: pool={} next_block={next_block} leaves={} pending={} frozen={} shielded={} unshielded={}",
+        &pool_address[..10.min(pool_address.len())], cmx_ordered.len(), pending_tx_hashes.len(), frozen_cmx.len(),
+        shield_accounting.total_shielded_units, shield_accounting.total_unshielded_units
     );
-    CheckpointData { next_block, cmx_ordered, active_root, latest_seq, batches: VecDeque::new(), pending_tx_hashes, frozen_cmx }
+    CheckpointData { next_block, cmx_ordered, active_root, latest_seq, batches: VecDeque::new(), pending_tx_hashes, frozen_cmx, shield_accounting }
 }
 
 /// Load `out_ciphertext` + `cv_net_x` for one action from the tx `bundle()` calldata.
@@ -1930,6 +2061,8 @@ async fn backfill_from_chain(ctx: &PollContext) {
         .collect();
     topic0s.push(normalize_hex_0x(&shield_completed_topic0_hex()));
     topic0s.push(normalize_hex_0x(&ctx.note_confirmed_topic0));
+    topic0s.push(normalize_hex_0x(&shielded_topic0_hex()));
+    topic0s.push(normalize_hex_0x(&unshielded_topic0_hex()));
 
     // Reset tree state for a clean rebuild so positions match on-chain order even
     // if the restored checkpoint was partial/corrupt. (pending_tx_hashes kept.)
@@ -1941,6 +2074,8 @@ async fn backfill_from_chain(ctx: &PollContext) {
         s.seen_event_ids.clear();
         s.confirm_seen_ids.clear();
         s.shield_seen_ids.clear();
+        s.accounting_seen_ids.clear();
+        s.shield_accounting = ShieldAccounting::default();
         s.batches.clear();
         s.latest_seq = 0;
         s.pending_notes.clear();
@@ -2083,6 +2218,8 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
         .collect();
     topic0s.push(normalize_hex_0x(&shield_completed_topic0_hex()));
     topic0s.push(normalize_hex_0x(&ctx.note_confirmed_topic0));
+    topic0s.push(normalize_hex_0x(&shielded_topic0_hex()));
+    topic0s.push(normalize_hex_0x(&unshielded_topic0_hex()));
 
     const CHUNK: u64 = 5_000;
     let mut total = 0usize;
@@ -2149,6 +2286,7 @@ async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         s.seen_event_ids.contains(&event_id)
             || s.confirm_seen_ids.contains(&event_id)
             || s.shield_seen_ids.contains(&event_id)
+            || s.accounting_seen_ids.contains(&event_id)
     };
 
     for attempt in 0u64..6 {
@@ -2296,6 +2434,8 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
         }
         topics.push(norm_topic(&shield_completed_topic0_hex()));
         topics.push(norm_topic(&ctx.note_confirmed_topic0));
+        topics.push(norm_topic(&shielded_topic0_hex()));
+        topics.push(norm_topic(&unshielded_topic0_hex()));
     }
     if let Some(ref leg) = ctx.legacy_bundle_topic0 {
         topics.push(norm_topic(leg));
@@ -2396,6 +2536,8 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         .collect();
     let sc = norm_topic(&shield_completed_topic0_hex());
     let nc = norm_topic(&ctx.note_confirmed_topic0);
+    let shielded_topic = norm_topic(&shielded_topic0_hex());
+    let unshielded_topic = norm_topic(&unshielded_topic0_hex());
 
     let event_id = format!("{}:{}", log.transaction_hash, log.log_index);
     let block_number = parse_hex_u64(&log.block_number)
@@ -2478,6 +2620,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         let pending_snap: Vec<String> = state.pending_tx_hashes.iter().cloned().collect();
         let frozen_snap: Vec<[u8; 32]> =
             state.frozen.frozen_values().into_iter().map(fr_to_be_bytes).collect();
+        let accounting_snap = state.shield_accounting;
         drop(state);
         ctx.batch_tx.send(envelope).ok();
         ctx.persist.notify_owned(CheckpointSnapshot {
@@ -2488,6 +2631,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             batches: batches_snap,
             pending_tx_hashes: pending_snap,
             frozen_cmx: frozen_snap,
+            shield_accounting: accounting_snap,
         });
 
     } else if t0.as_deref() == Some(nc.as_str()) {
@@ -2541,6 +2685,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 let pending_snap: Vec<String> = state.pending_tx_hashes.iter().cloned().collect();
                 let frozen_snap: Vec<[u8; 32]> =
                     state.frozen.frozen_values().into_iter().map(fr_to_be_bytes).collect();
+                let accounting_snap = state.shield_accounting;
                 drop(state);
                 ctx.batch_tx.send(envelope).ok();
                 ctx.persist.notify_owned(CheckpointSnapshot {
@@ -2551,6 +2696,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                     batches: batches_snap,
                     pending_tx_hashes: pending_snap,
                     frozen_cmx: frozen_snap,
+                    shield_accounting: accounting_snap,
                 });
                 return Ok(());
             }
@@ -2586,6 +2732,36 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 ctx.batch_tx.send(envelope).ok();
                 return Ok(());
             }
+        }
+    } else if t0.as_deref() == Some(shielded_topic.as_str()) {
+        // ── Shielded accounting ───────────────────────────────────────────────
+        if state.accounting_seen_ids.contains(&event_id) { return Ok(()); }
+        match decode_shielded_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
+            Ok(d) => {
+                state.accounting_seen_ids.insert(event_id);
+                state.shield_accounting.total_shielded_units =
+                    state.shield_accounting.total_shielded_units.saturating_add(d.amount_units);
+                state.shield_accounting.total_shielded_wei =
+                    state.shield_accounting.total_shielded_wei.saturating_add(d.wei_amount);
+                state.next_block = block_number.saturating_add(1).max(state.next_block);
+                ctx.persist.notify(&state);
+            }
+            Err(e) => eprintln!("[indexer] Shielded decode FAILED: {e}"),
+        }
+    } else if t0.as_deref() == Some(unshielded_topic.as_str()) {
+        // ── Unshielded accounting ─────────────────────────────────────────────
+        if state.accounting_seen_ids.contains(&event_id) { return Ok(()); }
+        match decode_unshielded_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
+            Ok(d) => {
+                state.accounting_seen_ids.insert(event_id);
+                state.shield_accounting.total_unshielded_units =
+                    state.shield_accounting.total_unshielded_units.saturating_add(d.amount_units);
+                state.shield_accounting.total_unshielded_wei =
+                    state.shield_accounting.total_unshielded_wei.saturating_add(d.wei_amount);
+                state.next_block = block_number.saturating_add(1).max(state.next_block);
+                ctx.persist.notify(&state);
+            }
+            Err(e) => eprintln!("[indexer] Unshielded decode FAILED: {e}"),
         }
     }
 

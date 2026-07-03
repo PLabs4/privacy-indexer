@@ -34,6 +34,7 @@ DELETE FROM pending_tx   WHERE lower(pool_address) = :'pool';
 DELETE FROM notes        WHERE lower(pool_address) = :'pool';
 DELETE FROM frozen_cmx   WHERE lower(pool_address) = :'pool';
 DELETE FROM cmx_leaves   WHERE lower(pool_address) = :'pool';
+DELETE FROM shield_pool_stats WHERE lower(pool_address) = :'pool';
 DELETE FROM indexer_meta WHERE lower(pool_address) = :'pool';
 COMMIT;
 SQL
