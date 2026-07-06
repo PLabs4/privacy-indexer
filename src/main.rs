@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     sync::Arc,
     time::Duration,
 };
@@ -975,13 +976,12 @@ async fn pool_discovery_task(
     start_block: u64,
     poll_secs: u64,
 ) {
-    const CHUNK: u64 = 50_000;
     let mut from = start_block;
     loop {
         if let Ok(head) = rpc.block_number().await {
             let mut lo = from;
             while lo <= head {
-                let hi = (lo + CHUNK - 1).min(head);
+                let hi = getlogs_window_end(lo, head, rpc.getlogs_span());
                 match rpc.fetch_created_pools(lo, hi, &topic0, &issuer_topics).await {
                     Ok(found) => {
                         for (pool, block) in found {
@@ -995,13 +995,18 @@ async fn pool_discovery_task(
                                 }
                             }
                         }
+                        lo = hi + 1;
+                    }
+                    Err(e) if hi > lo && is_getlogs_range_error(&e) => {
+                        // Window too large for this provider: shrink and retry
+                        // the same offset within this tick.
+                        rpc.shrink_getlogs_span(hi - lo + 1);
                     }
                     Err(e) => {
                         eprintln!("[indexer] discovery getLogs [{lo},{hi}] failed: {e:#}");
                         break; // leave `lo` here so we retry this range next tick
                     }
                 }
-                lo = hi + 1;
             }
             from = lo;
         }
@@ -2260,12 +2265,11 @@ async fn backfill_from_chain(ctx: &PollContext) {
     // stale envelopes under re-issued seqs.
     ctx.backend.reset_archive();
 
-    const CHUNK: u64 = 5_000;
     println!("[indexer][{label}] backfill: scanning logs [{}, {head}]…", ctx.start_block);
     let mut from = ctx.start_block;
     let mut total = 0usize;
     while from <= head {
-        let to = (from + CHUNK - 1).min(head);
+        let to = getlogs_window_end(from, head, ctx.rpc.getlogs_span());
         match ctx
             .rpc
             .fetch_logs_topic0_or(from, to, &ctx.contract_address, &topic0s)
@@ -2291,6 +2295,12 @@ async fn backfill_from_chain(ctx: &PollContext) {
                     }
                 }
             }
+            Err(e) if to > from && is_getlogs_range_error(&e) => {
+                // Provider rejected the window size: shrink and retry the same
+                // offset so the rebuilt tree cannot silently skip a range.
+                ctx.rpc.shrink_getlogs_span(to - from + 1);
+                continue;
+            }
             Err(e) => {
                 eprintln!("[indexer][{label}] backfill getLogs [{from},{to}] failed: {e:#}");
             }
@@ -2314,26 +2324,6 @@ async fn backfill_from_chain(ctx: &PollContext) {
 /// How often the incremental gap-filler polls the chain to reconcile logs the WebSocket
 /// subscription may have silently dropped.
 const CATCHUP_INTERVAL_SECS: u64 = 20;
-
-/// Split the inclusive block range `[from, head]` into `eth_getLogs` windows of at most
-/// `chunk` blocks each. Returns an empty vec when already caught up (`from > head`) or when
-/// `chunk == 0` (guards against an infinite loop). Windows are contiguous and non-overlapping.
-fn catchup_ranges(from: u64, head: u64, chunk: u64) -> Vec<(u64, u64)> {
-    let mut ranges = Vec::new();
-    if from > head || chunk == 0 {
-        return ranges;
-    }
-    let mut cur = from;
-    while cur <= head {
-        let to = (cur + chunk - 1).min(head);
-        ranges.push((cur, to));
-        if to == u64::MAX {
-            break; // avoid overflow on `to + 1`
-        }
-        cur = to + 1;
-    }
-    ranges
-}
 
 /// Monotonic cursor advance: move `next_block` to just past the reconciled `head`, but never
 /// backwards (a concurrent WS log or a later backfill may have already advanced it further).
@@ -2401,9 +2391,10 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
     topic0s.push(normalize_hex_0x(&shielded_topic0_hex()));
     topic0s.push(normalize_hex_0x(&unshielded_topic0_hex()));
 
-    const CHUNK: u64 = 5_000;
     let mut total = 0usize;
-    for (lo, hi) in catchup_ranges(from, to, CHUNK) {
+    let mut lo = from;
+    while lo <= to {
+        let hi = getlogs_window_end(lo, to, ctx.rpc.getlogs_span());
         match ctx
             .rpc
             .fetch_logs_topic0_or(lo, hi, &ctx.contract_address, &topic0s)
@@ -2428,6 +2419,16 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
                         total += 1;
                     }
                 }
+                if hi == u64::MAX {
+                    break;
+                }
+                lo = hi + 1;
+            }
+            Err(e) if hi > lo && is_getlogs_range_error(&e) => {
+                // Window too large for this provider: shrink and retry the same
+                // offset instead of failing the whole replay (which would freeze
+                // the cursor and wedge the indexer permanently).
+                ctx.rpc.shrink_getlogs_span(hi - lo + 1);
             }
             Err(e) => {
                 eprintln!("[indexer][{label}] replay getLogs [{lo},{hi}] failed: {e:#}");
@@ -2990,10 +2991,42 @@ fn norm_topic(s: &str) -> String {
 
 // ─── RPC client ───────────────────────────────────────────────────────────────
 
+/// Default (and maximum) block span for a single `eth_getLogs` request. Providers
+/// enforce widely different caps (Alchemy Monad: 1000, Infura: 10k results, …);
+/// the client learns the real cap at runtime by halving on range errors.
+const GETLOGS_DEFAULT_SPAN: u64 = 5_000;
+
+/// True when an RPC error indicates the `eth_getLogs` block range/result window
+/// was too large for the provider (as opposed to a transport or logic error).
+/// Matched loosely on provider messages: Alchemy ("up to a 1000 block range"),
+/// Infura ("query returned more than 10000 results"), BSC/others ("exceed
+/// maximum block range", "block range is too large").
+fn is_getlogs_range_error(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_lowercase();
+    s.contains("block range")
+        || s.contains("range is too large")
+        || s.contains("range too large")
+        || s.contains("too many blocks")
+        || s.contains("query returned more than")
+        || s.contains("response size exceeded")
+}
+
+/// Inclusive upper bound of the next `eth_getLogs` window starting at `lo`,
+/// never past `to`. `span == 0` is treated as 1 (guards against a stuck loop).
+fn getlogs_window_end(lo: u64, to: u64, span: u64) -> u64 {
+    lo.saturating_add(span.max(1) - 1).min(to)
+}
+
 #[derive(Clone)]
 struct RpcClient {
     http: Client,
     urls: Vec<String>,
+    /// Largest `eth_getLogs` block span the provider is known to accept.
+    /// Starts at `GETLOGS_DEFAULT_SPAN` (or `PRIVACYBTC_INDEXER_GETLOGS_MAX_SPAN`)
+    /// and only ever shrinks — halved each time the provider rejects a window,
+    /// so a range-capped provider (e.g. Alchemy Monad testnet: 1000 blocks) can
+    /// no longer wedge catchup/backfill in a permanent retry loop.
+    getlogs_span: Arc<AtomicU64>,
 }
 
 impl RpcClient {
@@ -3041,7 +3074,32 @@ impl RpcClient {
         }
 
         let http = builder.build().expect("reqwest client");
-        Self { http, urls }
+        let initial_span = std::env::var("PRIVACYBTC_INDEXER_GETLOGS_MAX_SPAN")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(GETLOGS_DEFAULT_SPAN);
+        Self { http, urls, getlogs_span: Arc::new(AtomicU64::new(initial_span)) }
+    }
+
+    /// Current learned `eth_getLogs` window span.
+    fn getlogs_span(&self) -> u64 {
+        self.getlogs_span.load(AtomicOrdering::Relaxed).max(1)
+    }
+
+    /// Record that the provider rejected `failed_span` blocks in one `eth_getLogs`:
+    /// halve the learned span (floor 1) so every future window fits. Returns the
+    /// new span. Shared across clones, so all ingest paths learn together.
+    fn shrink_getlogs_span(&self, failed_span: u64) -> u64 {
+        let new_span = (failed_span / 2).max(1);
+        // Only ever shrink (another task may have already learned a smaller cap).
+        self.getlogs_span.fetch_min(new_span, AtomicOrdering::Relaxed);
+        let effective = self.getlogs_span();
+        eprintln!(
+            "[indexer] provider rejected eth_getLogs span of {failed_span} blocks; \
+             shrinking window to {effective}"
+        );
+        effective
     }
 
     async fn block_number(&self) -> Result<u64> {
@@ -3543,8 +3601,9 @@ fn strip_0x(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_cursor, catchup_ranges, decode_orchard_bundle_from_log_data,
-        encode_confirm_receipt_calldata, normalize_hex_0x, rlp_bytes, rlp_list, rlp_uint,
+        advance_cursor, decode_orchard_bundle_from_log_data, encode_confirm_receipt_calldata,
+        getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, rlp_bytes, rlp_list,
+        rlp_uint, RpcClient,
     };
     use privacy_core::types::OrchardStoredBundle;
     use sha3::{Digest, Keccak256};
@@ -3696,34 +3755,51 @@ mod tests {
     // gap-filler must chunk `[next_block, head]` correctly and advance the cursor
     // monotonically so a flaky WS can no longer freeze `next_block`.
 
+    // Regression for "indexer wedged by provider getLogs range cap" (Alchemy Monad
+    // testnet allows at most 1000 blocks per eth_getLogs): the window math must
+    // stay within bounds and the client must learn a smaller span from provider
+    // rejections instead of retrying the same oversized window forever.
+
     #[test]
-    fn catchup_ranges_already_caught_up_is_empty() {
-        assert!(catchup_ranges(101, 100, 5_000).is_empty());
-        assert!(catchup_ranges(1, 0, 5_000).is_empty());
+    fn getlogs_window_end_clamps_to_range_and_survives_zero_span() {
+        assert_eq!(getlogs_window_end(1, 12_000, 5_000), 5_000);
+        assert_eq!(getlogs_window_end(5_001, 12_000, 5_000), 10_000);
+        assert_eq!(getlogs_window_end(10_001, 12_000, 5_000), 12_000);
+        // Single block and degenerate span values never exceed `to`.
+        assert_eq!(getlogs_window_end(42, 42, 5_000), 42);
+        assert_eq!(getlogs_window_end(7, 100, 0), 7); // span 0 treated as 1
+        // No overflow at the top of the u64 range.
+        assert_eq!(getlogs_window_end(u64::MAX - 1, u64::MAX, 5_000), u64::MAX);
     }
 
     #[test]
-    fn catchup_ranges_single_block() {
-        assert_eq!(catchup_ranges(0, 0, 5_000), vec![(0, 0)]);
-        assert_eq!(catchup_ranges(42, 42, 5_000), vec![(42, 42)]);
+    fn getlogs_range_error_detection_matches_provider_messages() {
+        let alchemy = anyhow::anyhow!(
+            "eth_eth_getLogs failed for https://example: rpc error -32600: \
+             You can make eth_getLogs requests with up to a 1000 block range."
+        );
+        assert!(is_getlogs_range_error(&alchemy));
+        let infura = anyhow::anyhow!("query returned more than 10000 results");
+        assert!(is_getlogs_range_error(&infura));
+        let transport = anyhow::anyhow!("eth_getLogs send failed: connection refused");
+        assert!(!is_getlogs_range_error(&transport));
     }
 
     #[test]
-    fn catchup_ranges_chunks_are_contiguous_and_cover_everything() {
-        let ranges = catchup_ranges(1, 12_000, 5_000);
-        assert_eq!(ranges, vec![(1, 5_000), (5_001, 10_000), (10_001, 12_000)]);
-        // Contiguous, non-overlapping, and fully covering [1, 12_000].
-        assert_eq!(ranges.first().unwrap().0, 1);
-        assert_eq!(ranges.last().unwrap().1, 12_000);
-        for w in ranges.windows(2) {
-            assert_eq!(w[0].1 + 1, w[1].0, "windows must be contiguous with no gap/overlap");
-        }
-    }
-
-    #[test]
-    fn catchup_ranges_zero_chunk_does_not_loop_forever() {
-        // Guard: a misconfigured chunk of 0 returns empty instead of hanging.
-        assert!(catchup_ranges(1, 100, 0).is_empty());
+    fn shrink_getlogs_span_halves_monotonically_with_floor_of_one() {
+        let rpc = RpcClient::new("http://127.0.0.1:1".to_string());
+        let initial = rpc.getlogs_span();
+        assert!(initial >= 1);
+        // Provider rejected a 5000-block window: learn 2500.
+        assert_eq!(rpc.shrink_getlogs_span(5_000), initial.min(2_500));
+        // A stale larger failure cannot grow the learned span back.
+        rpc.shrink_getlogs_span(1_000); // -> 500
+        assert_eq!(rpc.getlogs_span(), 500);
+        rpc.shrink_getlogs_span(10_000); // half is 5000, but fetch_min keeps 500
+        assert_eq!(rpc.getlogs_span(), 500);
+        // Floor at 1 so the loop always makes progress.
+        rpc.shrink_getlogs_span(1);
+        assert_eq!(rpc.getlogs_span(), 1);
     }
 
     #[test]
