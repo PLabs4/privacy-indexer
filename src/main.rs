@@ -37,6 +37,12 @@ use privacy_core::ethereum::{
     note_added_topic0_alternatives, note_confirmed_topic0_hex, shield_completed_topic0_hex,
     // WS-6: ERC20Shield pool discovery/verification + metadata (privacy-core 0.1.3).
     decode_shield_pool_created_log, shield_pool_created_topic0_hex, DecodedShieldPoolCreated,
+    // Swap plan A (call-on-chain): initiate/join tx calldata is the canonical DA source for
+    // swap legs; the indexer decodes it so wallets can trial-decrypt BEFORE joining.
+    decode_swap_initiate_calldata, decode_swap_initiated_log, decode_swap_join_calldata,
+    decode_swap_joined_log, swap_cancelled_topic0_hex, swap_initiate_selector,
+    swap_initiated_topic0_hex, swap_join_selector, swap_joined_topic0_hex,
+    swap_settled_topic0_hex, PrivacyCallArgs,
 };
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -922,6 +928,8 @@ async fn main() -> Result<()> {
         .route("/merkle_path", get(get_merkle_path))
         .route("/note", get(get_note))
         .route("/tx", get(get_tx))
+        .route("/swap", get(get_swap))
+        .route("/swap/leg", get(get_swap_leg))
         .route("/confirm", post(post_confirm))
         .route("/notify_tx", post(post_notify_tx))
         .route("/pools", get(list_pools).post(register_pool))
@@ -1354,6 +1362,281 @@ async fn get_tx(
             for note in &batch.batch.abi_notes {
                 if normalize_hex_0x(&note.tx_hash).to_lowercase() == want && seen.insert(note.cmx) {
                     out.push(note.clone());
+                }
+            }
+        }
+    }
+    Ok(Json(out))
+}
+
+// ─── Swap plan A: on-chain leg lookup (calldata is the canonical DA source) ───
+//
+// With plan A the FULL `PrivacyCall` of each swap leg rides in the SwapCoordinator
+// initiate/join tx calldata. These endpoints let a wallet fetch and trial-decrypt the
+// counterparty leg from chain BEFORE signing the join challenge (and let the LP bot
+// cross-check the joiner leg before settle):
+//
+//   GET /swap/leg?tx_hash=0x…                 — decode one initiate/join tx (stateless)
+//   GET /swap?swap_id=0x…&coordinator=0x…     — event-driven summary + both decoded legs
+//
+// Both are stateless (straight RPC reads), so they survive indexer restarts with no
+// backfill and work for any coordinator address.
+
+/// Hex-encoded JSON form of a `PrivacyCall` (mirrors `IPERC20.PrivacyCall`).
+#[derive(Serialize)]
+struct SwapCallActionJson {
+    cmx: String,
+    enc_ciphertext: String,
+    out_ciphertext: String,
+    epk: String,
+    nf_old: String,
+    anchor: String,
+    proof: String,
+    /// 8 BN254 pub fields: [anchor, cv_x, cv_y, nf, rk_x, rk_y, cmx, rt_frozen].
+    pub_fields: Vec<String>,
+    spend_auth_sig: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SwapCallJson {
+    actions: Vec<SwapCallActionJson>,
+    binding_sig: Vec<String>,
+}
+
+fn swap_call_json(call: &PrivacyCallArgs) -> SwapCallJson {
+    fn hx(b: &[u8]) -> String {
+        format!("0x{}", hex::encode(b))
+    }
+    SwapCallJson {
+        actions: call
+            .actions
+            .iter()
+            .map(|a| SwapCallActionJson {
+                cmx: hx(&a.cmx),
+                enc_ciphertext: hx(&a.enc_ciphertext),
+                out_ciphertext: hx(&a.out_ciphertext),
+                epk: hx(&a.epk),
+                nf_old: hx(&a.nf_old),
+                anchor: hx(&a.anchor),
+                proof: hx(&a.proof),
+                pub_fields: a.pub_fields.iter().map(|f| hx(f)).collect(),
+                spend_auth_sig: a.spend_auth_sig.iter().map(|f| hx(f)).collect(),
+            })
+            .collect(),
+        binding_sig: call.binding_sig.iter().map(|f| hx(f)).collect(),
+    }
+}
+
+fn hex32_0x(b: &[u8; 32]) -> String {
+    format!("0x{}", hex::encode(b))
+}
+
+fn hex20_0x(b: &[u8; 20]) -> String {
+    format!("0x{}", hex::encode(b))
+}
+
+#[derive(Debug, Deserialize)]
+struct SwapLegQuery {
+    /// initiate/join transaction hash (with or without 0x prefix).
+    tx_hash: String,
+}
+
+/// Decode a SwapCoordinator initiate/join tx: full leg from calldata + swap id / mining
+/// status from the receipt. The wallet MUST check `mined && tx_success` and that `swap_id`
+/// matches the swap it intends to join before trusting the decoded leg.
+async fn get_swap_leg(
+    State(reg): State<PoolRegistry>,
+    Query(q): Query<SwapLegQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let rpc = reg.builder.rpc.clone();
+    let tx_hash = normalize_hex_0x(&q.tx_hash).to_lowercase();
+    let input = rpc
+        .get_transaction_input(&tx_hash)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("eth_getTransactionByHash: {e:#}")))?
+        .ok_or((StatusCode::NOT_FOUND, "transaction not found".to_owned()))?;
+    if input.len() < 4 {
+        return Err((StatusCode::BAD_REQUEST, "tx input too short".to_owned()));
+    }
+
+    let mut out = serde_json::json!({ "tx_hash": tx_hash });
+    if input[..4] == swap_initiate_selector() {
+        let d = decode_swap_initiate_calldata(&input)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("initiate calldata decode: {e}")))?;
+        out["kind"] = "initiate".into();
+        out["pool_a"] = hex20_0x(&d.pool_a).into();
+        out["pool_b"] = hex20_0x(&d.pool_b).into();
+        out["htlc_hash"] = hex32_0x(&d.htlc_hash).into();
+        out["rk_bx"] = hex32_0x(&d.rk_bx).into();
+        out["rk_by"] = hex32_0x(&d.rk_by).into();
+        out["deadline"] = d.deadline.into();
+        out["commit_a"] = hex32_0x(&d.commit_a()).into();
+        out["call_a"] = serde_json::to_value(swap_call_json(&d.call_a)).unwrap_or_default();
+    } else if input[..4] == swap_join_selector() {
+        let d = decode_swap_join_calldata(&input)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("join calldata decode: {e}")))?;
+        out["kind"] = "join".into();
+        out["swap_id_calldata"] = hex32_0x(&d.swap_id).into();
+        out["commit_b"] = hex32_0x(&d.commit_b()).into();
+        out["call_b"] = serde_json::to_value(swap_call_json(&d.call_b)).unwrap_or_default();
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "not a SwapCoordinator initiateSwap/joinSwap transaction".to_owned(),
+        ));
+    }
+
+    // Receipt: mining status + the authoritative swap id from the coordinator's event.
+    let receipt = rpc
+        .get_transaction_receipt_logs(&tx_hash)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("eth_getTransactionReceipt: {e:#}")))?;
+    match receipt {
+        Some((success, logs)) => {
+            out["mined"] = true.into();
+            out["tx_success"] = success.into();
+            let want_init = swap_initiated_topic0_hex().to_lowercase();
+            let want_join = swap_joined_topic0_hex().to_lowercase();
+            for log in &logs {
+                let Some(topics) = &log.topics else { continue };
+                let Some(t0) = topics.first() else { continue };
+                let t0 = t0.to_lowercase();
+                if t0 == want_init || t0 == want_join {
+                    if let Some(sid) = topics.get(1) {
+                        out["swap_id"] = normalize_hex_0x(sid).to_lowercase().into();
+                    }
+                    out["coordinator"] = normalize_hex_0x(&log.address).to_lowercase().into();
+                }
+            }
+        }
+        None => {
+            out["mined"] = false.into();
+            out["tx_success"] = serde_json::Value::Null;
+        }
+    }
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize)]
+struct SwapLookupQuery {
+    /// Swap id (bytes32 hex).
+    swap_id: String,
+    /// SwapCoordinator contract address.
+    coordinator: String,
+    /// First block of the `eth_getLogs` scan. Defaults to 0; pass the coordinator's
+    /// deploy block (or a recent lower bound) on providers that reject wide ranges.
+    from_block: Option<u64>,
+    /// When false, skip fetching/decoding the initiate/join tx calldata (summary only).
+    include_calls: Option<bool>,
+}
+
+/// Event-driven view of one swap: lifecycle status, both commits, and (by default) both
+/// decoded legs pulled from the initiate/join tx calldata.
+async fn get_swap(
+    State(reg): State<PoolRegistry>,
+    Query(q): Query<SwapLookupQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let rpc = reg.builder.rpc.clone();
+    let swap_id = parse_hex32(&q.swap_id)
+        .ok_or((StatusCode::BAD_REQUEST, "invalid swap_id hex".to_owned()))?;
+    let coordinator = normalize_hex_0x(&q.coordinator).to_lowercase();
+    let latest = rpc
+        .block_number()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("eth_blockNumber: {e:#}")))?;
+    let topic0s = vec![
+        swap_initiated_topic0_hex(),
+        swap_joined_topic0_hex(),
+        swap_settled_topic0_hex(),
+        swap_cancelled_topic0_hex(),
+    ];
+    let mut logs = rpc
+        .fetch_logs_topic0_or_with_topic1(
+            q.from_block.unwrap_or(0),
+            latest,
+            &coordinator,
+            &topic0s,
+            &hex32_0x(&swap_id),
+        )
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("eth_getLogs: {e:#}")))?;
+    if logs.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "no events for this swap id".to_owned()));
+    }
+    logs.sort_by_key(|l| {
+        (
+            parse_hex_u64(&l.block_number).unwrap_or(u64::MAX),
+            parse_hex_u64(&l.log_index).unwrap_or(u64::MAX),
+        )
+    });
+
+    let t_init = swap_initiated_topic0_hex().to_lowercase();
+    let t_join = swap_joined_topic0_hex().to_lowercase();
+    let t_settle = swap_settled_topic0_hex().to_lowercase();
+    let t_cancel = swap_cancelled_topic0_hex().to_lowercase();
+
+    let mut out = serde_json::json!({
+        "swap_id": hex32_0x(&swap_id),
+        "coordinator": coordinator,
+        "status": "unknown",
+    });
+    let mut initiate_tx: Option<String> = None;
+    let mut join_tx: Option<String> = None;
+    for log in &logs {
+        let Some(t0) = log.topics.as_ref().and_then(|t| t.first()) else { continue };
+        let t0 = t0.to_lowercase();
+        let tx = normalize_hex_0x(&log.transaction_hash).to_lowercase();
+        let data = &log.data;
+        let topics = log.topics.clone().unwrap_or_default();
+        if t0 == t_init {
+            if let Ok(d) = decode_swap_initiated_log(&topics, data) {
+                out["initiator"] = hex20_0x(&d.initiator).into();
+                out["pool_a"] = hex20_0x(&d.pool_a).into();
+                out["pool_b"] = hex20_0x(&d.pool_b).into();
+                out["htlc_hash"] = hex32_0x(&d.htlc_hash).into();
+                out["deadline"] = d.deadline.into();
+                out["commit_a"] = hex32_0x(&d.commit_a).into();
+                out["rk_bx"] = hex32_0x(&d.rk_bx).into();
+                out["rk_by"] = hex32_0x(&d.rk_by).into();
+            }
+            out["initiate_tx"] = tx.clone().into();
+            out["status"] = "initiated".into();
+            initiate_tx = Some(tx);
+        } else if t0 == t_join {
+            if let Ok(d) = decode_swap_joined_log(&topics, data) {
+                out["joiner"] = hex20_0x(&d.joiner).into();
+                out["commit_b"] = hex32_0x(&d.commit_b).into();
+            }
+            out["join_tx"] = tx.clone().into();
+            out["status"] = "joined".into();
+            join_tx = Some(tx);
+        } else if t0 == t_settle {
+            out["settle_tx"] = tx.into();
+            out["status"] = "settled".into();
+        } else if t0 == t_cancel {
+            out["cancel_tx"] = tx.into();
+            out["status"] = "cancelled".into();
+        }
+    }
+
+    // Pull the full legs out of the initiate/join tx calldata (plan A DA path) and
+    // re-derive each commitment so the caller can see it matches the event commit.
+    if q.include_calls.unwrap_or(true) {
+        if let Some(tx) = initiate_tx {
+            if let Ok(Some(input)) = rpc.get_transaction_input(&tx).await {
+                if let Ok(d) = decode_swap_initiate_calldata(&input) {
+                    out["call_a"] =
+                        serde_json::to_value(swap_call_json(&d.call_a)).unwrap_or_default();
+                    out["commit_a_from_calldata"] = hex32_0x(&d.commit_a()).into();
+                }
+            }
+        }
+        if let Some(tx) = join_tx {
+            if let Ok(Some(input)) = rpc.get_transaction_input(&tx).await {
+                if let Ok(d) = decode_swap_join_calldata(&input) {
+                    out["call_b"] =
+                        serde_json::to_value(swap_call_json(&d.call_b)).unwrap_or_default();
+                    out["commit_b_from_calldata"] = hex32_0x(&d.commit_b()).into();
                 }
             }
         }
@@ -3209,6 +3492,28 @@ impl RpcClient {
         self.rpc_call("eth_getLogs", serde_json::json!([filter]))
             .await
             .with_context(|| format!("eth_getLogs failed for [{from_block}, {to_block}]"))
+    }
+
+    /// `eth_getLogs` with topic0 alternatives AND a fixed indexed topic1 (e.g. a swap id).
+    /// The topic1 pin makes even wide block ranges cheap on providers with topic indexes.
+    async fn fetch_logs_topic0_or_with_topic1(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        contract_address: &str,
+        topic0_alternatives: &[String],
+        topic1: &str,
+    ) -> Result<Vec<EthLog>> {
+        let alt: Vec<serde_json::Value> = topic0_alternatives.iter().cloned().map(Into::into).collect();
+        let filter = serde_json::json!({
+            "fromBlock": format!("0x{:x}", from_block),
+            "toBlock":   format!("0x{:x}", to_block),
+            "address":   contract_address,
+            "topics":    [ alt, topic1 ],
+        });
+        self.rpc_call("eth_getLogs", serde_json::json!([filter]))
+            .await
+            .with_context(|| format!("eth_getLogs (swap) failed for [{from_block}, {to_block}]"))
     }
 
     /// True if `pool` (0x-prefixed) emitted `Perc20Created(pool,…)` at construction
