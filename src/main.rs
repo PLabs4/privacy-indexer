@@ -462,6 +462,14 @@ struct PoolRegistry {
     /// Cache of per-pool metadata (type/scale/underlying/name/symbol/decimals),
     /// keyed by lowercase 0x address. Populated lazily from the pool's genesis event.
     metadata: Arc<RwLock<HashMap<String, PoolMeta>>>,
+    /// Chain-global cache of block number → unix timestamp (seconds). Block
+    /// timestamps are immutable, so entries never expire. Populated lazily when
+    /// `/txs` ages a transaction; shared across all pools (one chain per indexer).
+    block_time: Arc<RwLock<HashMap<u64, u64>>>,
+    /// Cache of tx hash (lowercase 0x) → public tx facts (op type + shield/unshield
+    /// amount + unshield recipient), derived from immutable calldata. Cached forever;
+    /// populated lazily when `/txs` classifies a page.
+    tx_meta: Arc<RwLock<HashMap<String, TxMeta>>>,
 }
 
 /// Public pool metadata surfaced by the API. `Issuer` pools are PERC20 assets minted by an
@@ -634,6 +642,92 @@ impl PoolRegistry {
                 None
             }
         }
+    }
+
+    /// Resolve unix timestamps (seconds) for a set of block numbers, using the
+    /// immutable block-time cache and fetching any misses from the chain once.
+    /// Missing/unfetchable blocks are simply absent from the returned map, so the
+    /// explorer degrades to showing the block number rather than failing.
+    async fn block_times(&self, blocks: &[u64]) -> HashMap<u64, u64> {
+        // Which blocks aren't cached yet?
+        let missing: Vec<u64> = {
+            let cache = self.block_time.read().await;
+            blocks.iter().copied().filter(|b| !cache.contains_key(b)).collect()
+        };
+        if !missing.is_empty() {
+            // Fetch misses concurrently (bounded), so a cold page doesn't serialize
+            // one round-trip per block. Failures are left uncached to retry later
+            // (a block's timestamp is transient-fetchable, not a permanent "no").
+            let fetched: Vec<(u64, u64)> = stream::iter(missing.into_iter().map(|b| async move {
+                self.builder.rpc.get_block_timestamp(b).await.ok().map(|ts| (b, ts))
+            }))
+            .buffer_unordered(8)
+            .filter_map(|x| async move { x })
+            .collect()
+            .await;
+            if !fetched.is_empty() {
+                let mut cache = self.block_time.write().await;
+                for (b, ts) in fetched {
+                    cache.insert(b, ts);
+                }
+                // Build this page's result BEFORE bounding, so eviction can't drop a
+                // block we just fetched. Bound after: the servable window is the batch
+                // ring, but this cache would otherwise keep every block ever served;
+                // values are immutable so evicting is free — a re-served block re-fetches.
+                let result = blocks.iter().filter_map(|b| cache.get(b).map(|ts| (*b, *ts))).collect();
+                bound_cache(&mut cache, BLOCK_TIME_CACHE_CAP);
+                return result;
+            }
+        }
+        let cache = self.block_time.read().await;
+        blocks.iter().filter_map(|b| cache.get(b).map(|ts| (*b, *ts))).collect()
+    }
+
+    /// Classify tx op types by function selector, using the immutable per-tx cache
+    /// and fetching any misses once. Unrecognized/unfetchable txs are absent from
+    /// the map, so the explorer shows "unknown" rather than a wrong label.
+    async fn tx_metas(&self, hashes: &[String]) -> HashMap<String, TxMeta> {
+        let missing: Vec<String> = {
+            let cache = self.tx_meta.read().await;
+            hashes.iter().filter(|h| !cache.contains_key(*h)).cloned().collect()
+        };
+        if !missing.is_empty() {
+            // Fetch inputs concurrently (bounded) and parse public facts from calldata.
+            // A mined tx's calldata is immutable, so cache the result — INCLUDING an
+            // unrecognized default (op=None) — so it's never re-fetched. Un-mined
+            // (`Ok(None)`) and transient RPC errors are left uncached, so only they retry.
+            let fetched: Vec<(String, TxMeta)> = stream::iter(missing.into_iter().map(|h| async move {
+                match self.builder.rpc.get_transaction_input_from(&h).await {
+                    Ok(Some((input, from))) => {
+                        let mut m = parse_tx_meta(&input);
+                        // The depositor/issuer is public for shield & mint (they add
+                        // value from a public balance); a hidden note funds the others.
+                        if matches!(m.op, Some("shield") | Some("mint")) {
+                            m.sender = Some(from);
+                        }
+                        Some((h, m))
+                    }
+                    _ => None,
+                }
+            }))
+            .buffer_unordered(8)
+            .filter_map(|x| async move { x })
+            .collect()
+            .await;
+            if !fetched.is_empty() {
+                let mut cache = self.tx_meta.write().await;
+                for (h, m) in fetched {
+                    cache.insert(h, m);
+                }
+                // Build the result BEFORE bounding so a just-fetched key can't be
+                // evicted out of this page's response.
+                let result = hashes.iter().filter_map(|h| cache.get(h).map(|m| (h.clone(), m.clone()))).collect();
+                bound_cache(&mut cache, TX_META_CACHE_CAP);
+                return result;
+            }
+        }
+        let cache = self.tx_meta.read().await;
+        hashes.iter().filter_map(|h| cache.get(h).map(|m| (h.clone(), m.clone()))).collect()
     }
 
     /// Resolve the target pool from a `?pool=0x...` query param. When `pool` is
@@ -862,6 +956,8 @@ async fn main() -> Result<()> {
         registry_file: cli.pools_registry.clone(),
         verified_pools: Arc::new(RwLock::new(HashSet::new())),
         metadata: Arc::new(RwLock::new(HashMap::new())),
+        block_time: Arc::new(RwLock::new(HashMap::new())),
+        tx_meta: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // 1) CLI pools (the first one becomes primary and owns the confirm signer).
@@ -922,6 +1018,7 @@ async fn main() -> Result<()> {
         .route("/merkle_path", get(get_merkle_path))
         .route("/note", get(get_note))
         .route("/tx", get(get_tx))
+        .route("/txs", get(get_txs))
         .route("/confirm", post(post_confirm))
         .route("/notify_tx", post(post_notify_tx))
         .route("/pools", get(list_pools).post(register_pool))
@@ -1359,6 +1456,317 @@ async fn get_tx(
         }
     }
     Ok(Json(out))
+}
+
+/// Upper bound on the lazily-filled `/txs` enrichment caches. Far exceeds the
+/// servable batch ring, so hot entries are never thrashed, while capping lifetime
+/// memory. ~50k tx metas ≈ 20MB; ~100k block times ≈ 5MB.
+const TX_META_CACHE_CAP: usize = 50_000;
+const BLOCK_TIME_CACHE_CAP: usize = 100_000;
+
+/// Cap a lazily-filled immutable cache: when it exceeds `cap`, drop entries down to
+/// ~90% of `cap`. Eviction is arbitrary (values are immutable, so a re-served key
+/// just re-fetches) — no per-entry LRU bookkeeping needed on the request path.
+fn bound_cache<K: Clone + std::hash::Hash + Eq, V>(cache: &mut HashMap<K, V>, cap: usize) {
+    if cache.len() <= cap {
+        return;
+    }
+    let target = cap * 9 / 10;
+    let drop_keys: Vec<K> = cache.keys().take(cache.len() - target).cloned().collect();
+    for k in drop_keys {
+        cache.remove(&k);
+    }
+}
+
+/// Map a tx's 4-byte function selector to an explorer op type. Public info (the
+/// selector is on-chain), so this is safe to expose pre-decrypt. Mirrors the pool
+/// entrypoints; unknown selectors return None (shown as "unknown", never mislabeled).
+fn classify_selector(input: &[u8]) -> Option<&'static str> {
+    if input.len() < 4 {
+        return None;
+    }
+    match &input[0..4] {
+        // Wrapped ERC20Shield pools: deposit/withdraw a public ERC20 balance.
+        [0x04, 0x11, 0xcb, 0xab] => Some("shield"),
+        [0x53, 0x64, 0x4c, 0x61] => Some("unshield"), // has a public `recipient`
+        // Issuer pERC20 pools: create/destroy supply (no public recipient).
+        [0x12, 0x92, 0x3a, 0x62] => Some("mint"),     // mint(uint256,(bytes,uint256[3]))
+        [0xe7, 0x66, 0x0f, 0xf5] => Some("burn"),     // burn(uint256,(bytes,uint256[3]))
+        [0xed, 0xa1, 0xa0, 0xac] => Some("transfer"),
+        [0xc7, 0xb9, 0x21, 0xd3] => Some("transfer"),
+        [0x6d, 0xb7, 0x97, 0x4d] => Some("swap"),     // initiateSwap
+        [0x8b, 0xbe, 0x82, 0x1a] => Some("swap"),     // joinSwap
+        [0xc7, 0xec, 0xe1, 0x5f] => Some("swap"),     // settle
+        _ => None,
+    }
+}
+
+/// Public (pre-decrypt) facts about a tx, derived from its calldata. Shield/Unshield
+/// move funds between the pool and a PUBLIC ERC20 balance, so their amount — and an
+/// unshield's recipient — are on-chain public, not part of the encrypted note.
+#[derive(Clone, Default)]
+struct TxMeta {
+    /// Op type ("shield"/"transfer"/"unshield"/"swap"), None if unrecognized.
+    op: Option<&'static str>,
+    /// Public amount as a 0x 32-byte hex word (client formats with pool decimals).
+    /// Present for shield/mint/unshield/burn (arg0 `uint256`); None otherwise.
+    amount_hex: Option<String>,
+    /// Public recipient (0x address) — unshield only (its arg1 `address`).
+    recipient: Option<String>,
+    /// Public sender (0x address = tx `from`) — the depositor/issuer for shield/mint.
+    /// None for private-source ops (unshield/burn/transfer/swap spend a hidden note).
+    sender: Option<String>,
+}
+
+/// Parse the public tx facts from raw calldata. `shield`/`mint`/`unshield`/`burn`
+/// all take the amount as arg0 (`uint256` at calldata[4..36]); `unshield` also takes
+/// a public `recipient` as arg1 (`address` at calldata[36..68], low 20 bytes).
+fn parse_tx_meta(input: &[u8]) -> TxMeta {
+    let op = classify_selector(input);
+    // shield/mint/unshield/burn all take the public amount as arg0 (`uint256`).
+    let amount_hex = match op {
+        Some("shield") | Some("unshield") | Some("mint") | Some("burn") if input.len() >= 36 => {
+            Some(format!("0x{}", hex::encode(&input[4..36])))
+        }
+        _ => None,
+    };
+    // Recipient is public ONLY for unshield (0x53644c61) — burn shares the "unshield"
+    // op label but has no recipient arg, so match the exact selector here.
+    let recipient = if input.len() >= 68 && input[0..4] == [0x53, 0x64, 0x4c, 0x61] {
+        Some(format!("0x{}", hex::encode(&input[48..68])))
+    } else {
+        None
+    };
+    // `sender` is filled by the resolver (it needs the tx's `from`, not the calldata).
+    TxMeta { op, amount_hex, recipient, sender: None }
+}
+
+#[derive(Debug, Deserialize)]
+struct TxsListQuery {
+    /// Max transactions per page (default 25, capped at 100).
+    limit: Option<usize>,
+    /// Cursor: return only transactions in a block strictly below this number.
+    /// Omit for the newest page; pass the previous response's `next_before_block`
+    /// to page backwards in time. Block number is the global chronological order
+    /// across all pools (per-pool `seq` is not comparable between pools).
+    before_block: Option<u64>,
+    /// Optional pool filter; omit to span every registered pool.
+    pool: Option<String>,
+}
+
+/// One transaction, aggregating every ciphertext note it produced. A single tx can
+/// carry several notes (a transfer's recipient + change, a swap settle's two legs).
+#[derive(Serialize)]
+struct TxSummary {
+    tx_hash: String,
+    block_number: u64,
+    /// Block header unix timestamp (seconds); `null` if not yet resolvable. The
+    /// client renders relative age from this and falls back to the block number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_time: Option<u64>,
+    /// Op type from the tx's function selector ("shield"/"transfer"/"unshield"/
+    /// "swap"); omitted when unrecognized (client shows "unknown"). Public info.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_type: Option<String>,
+    /// Public shield/unshield amount as a 0x 32-byte hex word — visible pre-decrypt
+    /// (funds move to/from a public ERC20 balance). Omitted for private ops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_amount: Option<String>,
+    /// Public unshield recipient (0x address); omitted for other ops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_recipient: Option<String>,
+    /// Public sender (0x address) — shield/mint depositor; omitted for private ops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_sender: Option<String>,
+    /// Symbol of the pool this tx's notes belong to (for the amount's unit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol: Option<String>,
+    /// Decimals of that pool — the client scales `public_amount` (and the decrypted
+    /// note value) by this instead of assuming the active asset's decimals.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decimals: Option<u8>,
+    /// Pool address (lowercase 0x) the tx's first note came from — the metadata key.
+    #[serde(skip)]
+    pool_address: String,
+    /// Highest batch `seq` among this tx's notes (kept for debugging; not the sort
+    /// key — ordering is by `block_number`, which is comparable across pools).
+    seq: u64,
+    /// Max `log_index` of this tx's notes — used to order txs within a block.
+    #[serde(skip)]
+    max_log_index: u64,
+    notes: Vec<OrchardIndexedAbiNote>,
+}
+
+#[derive(Serialize)]
+struct TxsListResponse {
+    items: Vec<TxSummary>,
+    /// Pass as `before_block` for the next (older) page; `null` when none remain.
+    next_before_block: Option<u64>,
+}
+
+/// List ciphertext transactions newest-first with cursor pagination — powers the
+/// explorer's default "show everything" view (search is only quick-locate). Groups
+/// notes by tx hash and orders by `block_number` descending (the global chronological
+/// order across pools — per-pool `seq` is NOT comparable between pools). The newest
+/// page reads the in-memory ring (cheap, hot poll path); older pages (cursor set)
+/// read FULL history (ring + persisted archive) so deep pagination doesn't dead-end
+/// at the ring's edge. The cursor never splits a block across pages, so callers can't
+/// skip or double-count boundary txs.
+async fn get_txs(
+    State(reg): State<PoolRegistry>,
+    Query(q): Query<TxsListQuery>,
+) -> Result<Json<TxsListResponse>, (StatusCode, String)> {
+    let limit = q.limit.unwrap_or(25).clamp(1, 100);
+    let before = q.before_block.unwrap_or(u64::MAX);
+    let contexts: Vec<AppContext> = match q.pool.as_deref() {
+        Some(addr) => vec![reg.resolve(Some(addr)).await?],
+        None => reg.pools.read().await.values().cloned().collect(),
+    };
+
+    // Aggregate notes into per-tx buckets. A tx can appear across pools (a swap
+    // settle emits a note in each leg's pool), so key by hash and merge.
+    // Newest page (no cursor) reads only the in-memory ring — cheap, and it's the
+    // hot path the live poll hits every few seconds. Any older page (cursor set)
+    // pulls FULL history (ring + persisted archive) via collect_batches_since, so
+    // deep pagination reaches beyond the ring instead of dead-ending at its edge.
+    let full_history = q.before_block.is_some();
+    let mut by_tx: HashMap<String, TxSummary> = HashMap::new();
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    // On the newest (ring-only) page, track the safe cutoff for excluding blocks
+    // that might be split across the ring/archive boundary. Notes are stored one
+    // per batch and evicted per-note, so each evicted pool's OLDEST retained block
+    // can be half-evicted. A block is guaranteed complete across all pools only if
+    // it sits ABOVE every evicted pool's floor — so the cutoff is the MAX of those
+    // floors. Blocks at/below it are deferred to the next (full-history) page.
+    let mut ring_has_older = false;
+    let mut ring_cutoff: Option<u64> = None;
+    for ctx in &contexts {
+        let pool_lc = ctx.contract_address.to_lowercase();
+        let batches: Vec<BatchEnvelope> = if full_history {
+            collect_batches_since(ctx, 0).await
+        } else {
+            let s = ctx.state.read().await;
+            // seq starts at 1; a ring front seq > 1 means this pool evicted batches.
+            if s.batches.front().map(|b| b.seq).unwrap_or(1) > 1 {
+                ring_has_older = true;
+                // This pool's ring-floor block = its oldest retained note's block.
+                if let Some(fb) = s.batches.front().and_then(|b| b.batch.abi_notes.first()).map(|n| n.block_number) {
+                    ring_cutoff = Some(ring_cutoff.map_or(fb, |c| c.max(fb)));
+                }
+            }
+            s.batches.iter().cloned().collect()
+        };
+        for batch in &batches {
+            for note in &batch.batch.abi_notes {
+                if !seen.insert(note.cmx) {
+                    continue;
+                }
+                let key = normalize_hex_0x(&note.tx_hash).to_lowercase();
+                let entry = by_tx.entry(key.clone()).or_insert_with(|| TxSummary {
+                    tx_hash: key,
+                    block_number: note.block_number,
+                    block_time: None,
+                    tx_type: None,
+                    public_amount: None,
+                    public_recipient: None,
+                    public_sender: None,
+                    symbol: None,
+                    decimals: None,
+                    // The pool of the tx's FIRST note. shield/unshield (the ops with a
+                    // public amount) touch a single pool, so this is unambiguous there.
+                    pool_address: pool_lc.clone(),
+                    seq: 0,
+                    max_log_index: 0,
+                    notes: Vec::new(),
+                });
+                entry.seq = entry.seq.max(batch.seq);
+                entry.block_number = entry.block_number.max(note.block_number);
+                entry.max_log_index = entry.max_log_index.max(note.log_index);
+                entry.notes.push(note.clone());
+            }
+        }
+    }
+
+    // Keep notes within a tx ordered by log_index — that ordering is the "action
+    // index" the explorer shows to tell apart a tx's individual note details.
+    let mut txs: Vec<TxSummary> = by_tx.into_values().collect();
+    for tx in &mut txs {
+        tx.notes.sort_by_key(|n| n.log_index);
+    }
+
+    // Newest first by BLOCK (the only clock comparable across pools; per-pool `seq`
+    // is not). Within a block, order by log_index; tx_hash breaks any final tie.
+    txs.sort_by(|a, b| {
+        b.block_number
+            .cmp(&a.block_number)
+            .then_with(|| b.max_log_index.cmp(&a.max_log_index))
+            .then_with(|| b.tx_hash.cmp(&a.tx_hash))
+    });
+
+    // Newest (ring) page: drop any block at/below the safe cutoff — it may be split
+    // across the ring/archive boundary. It's re-served complete by the next
+    // full-history page, preserving "a block is never split across a cursor boundary".
+    let mut items: Vec<TxSummary> = Vec::new();
+    let mut last_block: Option<u64> = None;
+    let mut truncated = false;
+    for tx in txs
+        .into_iter()
+        .filter(|t| t.block_number < before && ring_cutoff.is_none_or(|c| t.block_number > c))
+    {
+        // Fill the page, then keep going while the block matches the last included
+        // one so a block's txs are never split across a cursor boundary.
+        if items.len() >= limit && Some(tx.block_number) != last_block {
+            truncated = true;
+            break;
+        }
+        last_block = Some(tx.block_number);
+        items.push(tx);
+    }
+    // Advertise a cursor when older txs remain. `last_block` (min block shown, always
+    // above the cutoff) is a clean boundary: paging below it loads full history
+    // (archive included), which re-serves the cutoff block and everything under it,
+    // complete. If the cutoff emptied the page, page into it via `cutoff + 1`.
+    // None only when the ring holds everything.
+    let next_before_block = match last_block {
+        Some(lb) if truncated || (!full_history && ring_has_older) => Some(lb),
+        Some(_) => None,
+        None => ring_cutoff.map(|c| c + 1),
+    };
+
+    // Enrich this page (cost bounded by `limit`, both caches immutable):
+    //  • age  — resolve each distinct block's header timestamp
+    //  • type — classify each tx by its function selector (public info)
+    let blocks: Vec<u64> = {
+        let mut b: Vec<u64> = items.iter().map(|t| t.block_number).collect();
+        b.sort_unstable();
+        b.dedup();
+        b
+    };
+    let hashes: Vec<String> = items.iter().map(|t| t.tx_hash.clone()).collect();
+    // Resolve ages and tx facts concurrently — they hit disjoint RPC methods.
+    let (times, metas) = tokio::join!(reg.block_times(&blocks), reg.tx_metas(&hashes));
+    // Per-pool symbol/decimals so amounts render in each pool's own unit (cached).
+    let mut pool_meta: HashMap<String, PoolMeta> = HashMap::new();
+    for pool in items.iter().map(|t| t.pool_address.clone()).collect::<HashSet<_>>() {
+        if let Some(meta) = reg.ensure_metadata(&pool).await {
+            pool_meta.insert(pool, meta);
+        }
+    }
+    for tx in &mut items {
+        tx.block_time = times.get(&tx.block_number).copied();
+        if let Some(m) = metas.get(&tx.tx_hash) {
+            tx.tx_type = m.op.map(|s| s.to_string());
+            tx.public_amount = m.amount_hex.clone();
+            tx.public_recipient = m.recipient.clone();
+            tx.public_sender = m.sender.clone();
+        }
+        if let Some(meta) = pool_meta.get(&tx.pool_address) {
+            tx.symbol = meta.symbol.clone();
+            tx.decimals = meta.decimals;
+        }
+    }
+
+    Ok(Json(TxsListResponse { items, next_before_block }))
 }
 
 async fn get_merkle_path(
@@ -3114,6 +3522,21 @@ impl RpcClient {
         parse_hex_u64(&hex_num).context("invalid eth_getTransactionCount")
     }
 
+    /// Unix timestamp (seconds) of a block's header. Used to age transactions in
+    /// the explorer; block timestamps are immutable so callers cache the result.
+    async fn get_block_timestamp(&self, block: u64) -> Result<u64> {
+        let tag = format!("0x{block:x}");
+        // `false` → header only (no full tx bodies), so this stays cheap.
+        let hdr: serde_json::Value = self
+            .rpc_call("eth_getBlockByNumber", serde_json::json!([tag, false]))
+            .await?;
+        let ts = hdr
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("block {block} has no timestamp"))?;
+        parse_hex_u64(ts).context("invalid block timestamp")
+    }
+
     async fn send_raw_transaction(&self, raw_tx: &[u8]) -> Result<String> {
         let hex_tx = format!("0x{}", hex::encode(raw_tx));
         self.rpc_call("eth_sendRawTransaction", serde_json::json!([hex_tx])).await
@@ -3147,6 +3570,27 @@ impl RpcClient {
         Ok(tx.map(|t| {
             hex::decode(t.input.strip_prefix("0x").unwrap_or(&t.input))
                 .unwrap_or_default()
+        }))
+    }
+
+    /// Like `get_transaction_input`, but also returns the tx `from` (lowercase 0x) —
+    /// the public depositor/issuer the explorer shows as the sender of a shield/mint.
+    async fn get_transaction_input_from(&self, tx_hash: &str) -> Result<Option<(Vec<u8>, String)>> {
+        #[derive(Deserialize)]
+        struct Tx {
+            input: String,
+            // Tolerate a node that omits/nulls `from` on a mined tx: parse succeeds
+            // (sender simply absent) instead of erroring into a permanent re-fetch.
+            #[serde(default)]
+            from: String,
+        }
+        let hash = normalize_hex_0x(tx_hash);
+        let tx: Option<Tx> = self
+            .rpc_call("eth_getTransactionByHash", serde_json::json!([hash]))
+            .await?;
+        Ok(tx.map(|t| {
+            let input = hex::decode(t.input.strip_prefix("0x").unwrap_or(&t.input)).unwrap_or_default();
+            (input, t.from.to_lowercase())
         }))
     }
 
