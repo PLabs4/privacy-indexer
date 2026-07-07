@@ -1444,22 +1444,39 @@ struct TxLookupQuery {
 async fn get_tx(
     State(reg): State<PoolRegistry>,
     Query(q): Query<TxLookupQuery>,
-) -> Result<Json<Vec<OrchardIndexedAbiNote>>, (StatusCode, String)> {
+) -> Result<Json<Vec<TxNote>>, (StatusCode, String)> {
     let want = normalize_hex_0x(&q.hash).to_lowercase();
     let contexts: Vec<AppContext> = match q.pool.as_deref() {
         Some(addr) => vec![reg.resolve(Some(addr)).await?],
         None => reg.pools.read().await.values().cloned().collect(),
     };
 
-    let mut out: Vec<OrchardIndexedAbiNote> = Vec::new();
+    // Per-note pool attribution (address + unit): a swap settle's two legs live in
+    // different pools and the explorer renders each in its own symbol/decimals.
+    let mut out: Vec<TxNote> = Vec::new();
     let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     for ctx in contexts {
+        let pool_lc = ctx.contract_address.to_lowercase();
         let s = ctx.state.read().await;
         for batch in s.batches.iter() {
             for note in &batch.batch.abi_notes {
                 if normalize_hex_0x(&note.tx_hash).to_lowercase() == want && seen.insert(note.cmx) {
-                    out.push(note.clone());
+                    out.push(TxNote {
+                        note: note.clone(),
+                        pool: pool_lc.clone(),
+                        symbol: None,
+                        decimals: None,
+                    });
                 }
+            }
+        }
+    }
+    let pools: std::collections::HashSet<String> = out.iter().map(|n| n.pool.clone()).collect();
+    for pool in pools {
+        if let Some(meta) = reg.ensure_metadata(&pool).await {
+            for n in out.iter_mut().filter(|n| n.pool == pool) {
+                n.symbol = meta.symbol.clone();
+                n.decimals = meta.decimals;
             }
         }
     }
@@ -1502,8 +1519,10 @@ fn classify_selector(input: &[u8]) -> Option<&'static str> {
         [0xe7, 0x66, 0x0f, 0xf5] => Some("burn"),     // burn(uint256,(bytes,uint256[3]))
         [0xed, 0xa1, 0xa0, 0xac] => Some("transfer"),
         [0xc7, 0xb9, 0x21, 0xd3] => Some("transfer"),
-        [0x6d, 0xb7, 0x97, 0x4d] => Some("swap"),     // initiateSwap
-        [0x8b, 0xbe, 0x82, 0x1a] => Some("swap"),     // joinSwap
+        [0xe3, 0xb9, 0x2d, 0xfd] => Some("swap"),     // initiateSwap (plan A: full callA in calldata)
+        [0x43, 0xfa, 0x07, 0x47] => Some("swap"),     // joinSwap (plan A: full callB in calldata)
+        [0x6d, 0xb7, 0x97, 0x4d] => Some("swap"),     // initiateSwap (legacy commit-only)
+        [0x8b, 0xbe, 0x82, 0x1a] => Some("swap"),     // joinSwap (legacy commit-only)
         [0xc7, 0xec, 0xe1, 0x5f] => Some("swap"),     // settle
         _ => None,
     }
@@ -1562,6 +1581,23 @@ struct TxsListQuery {
     pool: Option<String>,
 }
 
+/// A note plus its POOL attribution. A swap settle's two legs land in DIFFERENT
+/// pools, so per-note pool/symbol/decimals are required for the explorer to render
+/// each leg in its own unit (the tx-level symbol only reflects the first note's
+/// pool). Additive: the note's own fields are flattened, so consumers parsing a
+/// plain `OrchardIndexedAbiNote` keep working and just ignore the extras.
+#[derive(Clone, Serialize)]
+struct TxNote {
+    #[serde(flatten)]
+    note: OrchardIndexedAbiNote,
+    /// Pool address (lowercase 0x) that emitted this note's `NoteAdded`.
+    pool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decimals: Option<u8>,
+}
+
 /// One transaction, aggregating every ciphertext note it produced. A single tx can
 /// carry several notes (a transfer's recipient + change, a swap settle's two legs).
 #[derive(Serialize)]
@@ -1602,7 +1638,7 @@ struct TxSummary {
     /// Max `log_index` of this tx's notes — used to order txs within a block.
     #[serde(skip)]
     max_log_index: u64,
-    notes: Vec<OrchardIndexedAbiNote>,
+    notes: Vec<TxNote>,
 }
 
 #[derive(Serialize)]
@@ -1690,7 +1726,12 @@ async fn get_txs(
                 entry.seq = entry.seq.max(batch.seq);
                 entry.block_number = entry.block_number.max(note.block_number);
                 entry.max_log_index = entry.max_log_index.max(note.log_index);
-                entry.notes.push(note.clone());
+                entry.notes.push(TxNote {
+                    note: note.clone(),
+                    pool: pool_lc.clone(),
+                    symbol: None,
+                    decimals: None,
+                });
             }
         }
     }
@@ -1699,7 +1740,7 @@ async fn get_txs(
     // index" the explorer shows to tell apart a tx's individual note details.
     let mut txs: Vec<TxSummary> = by_tx.into_values().collect();
     for tx in &mut txs {
-        tx.notes.sort_by_key(|n| n.log_index);
+        tx.notes.sort_by_key(|n| n.note.log_index);
     }
 
     // Newest first by BLOCK (the only clock comparable across pools; per-pool `seq`
@@ -1754,8 +1795,14 @@ async fn get_txs(
     // Resolve ages and tx facts concurrently — they hit disjoint RPC methods.
     let (times, metas) = tokio::join!(reg.block_times(&blocks), reg.tx_metas(&hashes));
     // Per-pool symbol/decimals so amounts render in each pool's own unit (cached).
+    // Covers every NOTE's pool, not just each tx's first pool — a swap settle's two
+    // legs sit in different pools and each must carry its own unit.
     let mut pool_meta: HashMap<String, PoolMeta> = HashMap::new();
-    for pool in items.iter().map(|t| t.pool_address.clone()).collect::<HashSet<_>>() {
+    let all_pools: HashSet<String> = items
+        .iter()
+        .flat_map(|t| t.notes.iter().map(|n| n.pool.clone()).chain([t.pool_address.clone()]))
+        .collect();
+    for pool in all_pools {
         if let Some(meta) = reg.ensure_metadata(&pool).await {
             pool_meta.insert(pool, meta);
         }
@@ -1771,6 +1818,12 @@ async fn get_txs(
         if let Some(meta) = pool_meta.get(&tx.pool_address) {
             tx.symbol = meta.symbol.clone();
             tx.decimals = meta.decimals;
+        }
+        for n in &mut tx.notes {
+            if let Some(meta) = pool_meta.get(&n.pool) {
+                n.symbol = meta.symbol.clone();
+                n.decimals = meta.decimals;
+            }
         }
     }
 
