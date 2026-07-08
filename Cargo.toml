@@ -10,7 +10,7 @@ name = "privacy-indexer"
 path = "src/main.rs"
 
 [dependencies]
-privacy-core = "0.1.5"
+privacy-core = "0.1.6"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
@@ -28,3 +28,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ethabi = "18"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "migrate"] }
+
+# TEMPORARY: pin privacy-core to the v0.1.6 git tag until 0.1.6 is published to
+# crates.io (publish currently blocked on crate ownership). Drop this section
+# once `cargo publish` of privacy-core 0.1.6 succeeds.
+[patch.crates-io]
+privacy-core = { git = "https://github.com/PLabs4/privacy-core", tag = "v0.1.6" }

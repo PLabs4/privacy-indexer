@@ -24,6 +24,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use clap::Parser;
 use k256::ecdsa::{RecoveryId, SigningKey};
 use privacy_core::commitment_tree::OrchardCommitmentTree;
+use privacy_core::commitment_tree::frontier::{FrontierTree, CMX_CONFIRM_MAX_BATCH};
 use privacy_core::commitment_tree::frozen::{
     fr_from_be_bytes, fr_to_be_bytes, fr_to_le_hex, FrozenImt,
 };
@@ -35,6 +36,8 @@ use privacy_core::ethereum::{
     decode_shield_completed_log, decode_shielded_log, decode_unshielded_log,
     shielded_topic0_hex, unshielded_topic0_hex, BundleActionCiphertexts,
     note_added_topic0_alternatives, note_confirmed_topic0_hex, shield_completed_topic0_hex,
+    // Batch-update model (off-chain tree): RootUpdated watermark + updateRoot crank calldata.
+    decode_root_updated_log, encode_update_root_calldata, root_updated_topic0_hex,
     // WS-6: ERC20Shield pool discovery/verification + metadata (privacy-core 0.1.3).
     decode_shield_pool_created_log, shield_pool_created_topic0_hex, DecodedShieldPoolCreated,
     // Swap plan A (call-on-chain): initiate/join tx calldata is the canonical DA source for
@@ -61,20 +64,24 @@ const EVM_EMPTY_IMT_ROOT: [u8; 32] = [
 /// Returns the Poseidon BN254 Merkle root as a LE hex string, suitable for
 /// `parse_fr_le()` in the prover witness builder.
 ///
-/// Returns the local Poseidon tree root (LE hex), which is always kept in sync
-/// with the on-chain `_tree.root` as notes are appended.  This is what the prover
-/// uses as the anchor, and it must match the source of Merkle paths (`/merkle_path`).
+/// Batch-update model (off-chain tree): the pool's `bundle()` only ENQUEUES new cmx;
+/// a permissionless `updateRoot` crank folds them into the on-chain `confirmedRoot`
+/// later. Anchors are Strategy A (`anchor == confirmedRoot`), so the root served to
+/// provers MUST be the root of the CONFIRMED prefix of the local tree — leaves at
+/// positions `>= confirmed_count` are still pending on-chain and must not be folded
+/// into anchors or witness paths yet.
 ///
-/// NOTE: `active_root` (from `NoteConfirmed` events) is intentionally NOT used here
-/// because it can become stale when the indexer misses confirmation events across
-/// restarts.  The local tree is the single source of truth for both `/root` and
-/// `/merkle_path`, ensuring the two are always consistent.
+/// The watermark `confirmed_count` is event-derived (`NoteConfirmed` / `RootUpdated`,
+/// replayed by the startup backfill), and the prefix root is computed from the SAME
+/// local tree that serves `/merkle_path`, so the two stay mutually consistent.
 fn http_root_hex(state: &SharedState) -> Option<String> {
-    // Use local Poseidon tree root (LE bytes) — always consistent with /merkle_path.
-    if let Some(r) = state.tree.latest_root() {
-        return Some(hex::encode(r));
+    if state.confirmed_count > 0 {
+        // Prefix root at the confirmed watermark (LE bytes, consistent with /merkle_path).
+        // `None` here means the local tree has fewer leaves than the chain has confirmed
+        // (mid-backfill or out-of-order): serve nothing rather than a wrong anchor.
+        return state.tree.root_at(state.confirmed_count).map(hex::encode);
     }
-    // Empty tree — convert hardcoded on-chain BE root to LE for prover compatibility.
+    // Nothing confirmed — the on-chain confirmedRoot is the empty-tree root.
     let mut le = EVM_EMPTY_IMT_ROOT;
     le.reverse();
     Some(hex::encode(le))
@@ -132,9 +139,24 @@ struct Cli {
     #[arg(long, env = "PRIVACYBTC_START_BLOCK", default_value_t = 0)]
     start_block: u64,
     /// Hex-encoded secp256k1 private key for the indexer's signing account.
-    /// Required to relay Phase 2 confirmations on-chain.
+    /// Required to relay Phase 2 confirmations on-chain and for the --crank task.
     #[arg(long, env = "PRIVACYBTC_INDEXER_SIGNER_KEY")]
     signer_key: Option<String>,
+    /// Run the permissionless `updateRoot` crank: watch every pool's pending cmx
+    /// queue, generate `cmxconfirm_evm` batch proofs via the prover service, and
+    /// submit `updateRoot` transactions. Requires --signer-key.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_CRANK", default_value_t = false, value_parser = parse_bool_flag)]
+    crank: bool,
+    /// Base URL of the privacy-prover service exposing POST /cmxconfirm/prove.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_CRANK_PROVER_URL", default_value = "http://127.0.0.1:8791")]
+    crank_prover_url: String,
+    /// Seconds between crank passes over the pools.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_CRANK_INTERVAL_SECS", default_value_t = 15)]
+    crank_interval_secs: u64,
+    /// Gas limit for `updateRoot` (Groth16 verify + up to 8 confirms) and
+    /// `syncBatchModel` (32 Poseidon folds) transactions.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_CRANK_GAS_LIMIT", default_value_t = 2_000_000u64)]
+    gas_limit_update_root: u64,
     #[arg(long, env = "PRIVACYBTC_CHAIN_ID", default_value_t = 1u64)]
     chain_id: u64,
     /// Gas price in wei for confirm transactions. Default: 1 Gwei.
@@ -251,6 +273,12 @@ struct SharedState {
     pending_notes: HashMap<[u8; 32], PendingNote>,
     /// Confirmed cmx set (Phase 2 complete).
     confirmed_cmx: HashSet<[u8; 32]>,
+    /// Batch-update watermark: number of leaves folded into the on-chain
+    /// `confirmedRoot` (event-derived from `NoteConfirmed` positions and
+    /// `RootUpdated.to_count`; rebuilt by the startup backfill replay).
+    /// Leaves at positions `>= confirmed_count` are pending — excluded from
+    /// `/root` anchors and `/merkle_path` witnesses.
+    confirmed_count: u64,
     /// Latest confirmed Orchard commitment tree root.
     /// Updated only when a NoteConfirmed event is processed (Phase 2).
     active_root: Option<[u8; 32]>,
@@ -407,6 +435,7 @@ impl PoolBuilder {
             cmx_ordered: ck.cmx_ordered,
             pending_notes: HashMap::new(),
             confirmed_cmx: HashSet::new(),
+            confirmed_count: 0, // rebuilt by the startup backfill event replay
             active_root: ck.active_root,
             pending_timeout_blocks: self.pending_timeout_blocks,
             pending_tx_hashes: ck.pending_tx_hashes,
@@ -853,11 +882,16 @@ struct StatusResponse {
     cached_batches: usize,
     pending_notes: usize,
     confirmed_notes: usize,
-    /// active_root from on-chain NoteConfirmed events (LE hex). This is what /root returns.
+    /// Confirmed root (LE hex) at the batch-update watermark. This is what /root returns.
     active_root_hex: Option<String>,
-    /// Local Poseidon tree root (LE hex). Should equal active_root if tree is complete.
+    /// Local Poseidon tree root over ALL ingested leaves, pending included (LE hex).
+    /// Equals active_root only when nothing is pending.
     local_tree_root_hex: Option<String>,
     tree_size: u64,
+    /// Leaves folded into the on-chain `confirmedRoot` (batch-update watermark).
+    confirmed_count: u64,
+    /// Leaves ingested locally but not yet confirmed on-chain (`tree_size - confirmed_count`).
+    pending_cmx: u64,
     /// Pool contract address this indexer instance is watching (0x-prefixed lowercase).
     /// Allows clients querying multiple indexer instances to identify which pool each serves.
     pool_address: String,
@@ -883,8 +917,12 @@ struct ShieldPoolStats {
 
 #[derive(Debug, Serialize)]
 struct RootResponse {
+    /// CONFIRMED root (LE hex) — the only valid Strategy A anchor.
     root_hex: Option<String>,
+    /// Total ingested leaves (confirmed + pending).
     tree_size: u64,
+    /// Leaves folded into the on-chain `confirmedRoot`; `root_hex` covers exactly these.
+    confirmed_count: u64,
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -1015,6 +1053,25 @@ async fn main() -> Result<()> {
         );
     }
 
+    // 4) updateRoot crank: batch-confirm pending cmx for every pool (batch model).
+    if cli.crank {
+        match &signer {
+            Some(s) => {
+                tokio::spawn(crank_task(
+                    registry.clone(),
+                    rpc.clone(),
+                    CrankConfig {
+                        signer: Arc::clone(s),
+                        prover_url: cli.crank_prover_url.clone(),
+                        interval_secs: cli.crank_interval_secs,
+                        gas_limit: cli.gas_limit_update_root,
+                    },
+                ));
+            }
+            None => eprintln!("[indexer] --crank requires --signer-key; crank disabled"),
+        }
+    }
+
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/status", get(status))
@@ -1117,6 +1174,265 @@ async fn pool_discovery_task(
         }
         tokio::time::sleep(std::time::Duration::from_secs(poll_secs.max(1))).await;
     }
+}
+
+// ─── updateRoot crank ─────────────────────────────────────────────────────────
+
+/// First 4 bytes of `keccak256(sig)` — Solidity function selector.
+fn eth_selector(sig: &[u8]) -> [u8; 4] {
+    let d = Keccak256::digest(sig);
+    [d[0], d[1], d[2], d[3]]
+}
+
+/// Last 8 bytes of a 32-byte ABI word as u64 (values here are small counters).
+fn word_to_u64(w: &[u8; 32]) -> u64 {
+    u64::from_be_bytes(w[24..32].try_into().unwrap())
+}
+
+struct CrankConfig {
+    signer: Arc<SignerConfig>,
+    prover_url: String,
+    interval_secs: u64,
+    gas_limit: u64,
+}
+
+/// Permissionless batch-confirm crank. Every tick, for every pool:
+///
+///   1. Read the on-chain batch state (`confirmedRoot` / `confirmedCount` /
+///      `pendingCmxCount`). Pools on the pre-batch implementation are skipped.
+///   2. If the pool is a freshly-upgraded legacy pool (`confirmedRoot == 0`),
+///      submit the one-time `syncBatchModel()` migration.
+///   3. Otherwise, take the next `j <= CMX_CONFIRM_MAX_BATCH` locally-indexed
+///      leaves at the chain watermark, plan the batch with the shared
+///      `FrontierTree` (byte-identical to the on-chain IMT), request a
+///      `cmxconfirm_evm` proof from the prover service, and submit `updateRoot`.
+///
+/// The chain is the source of truth for the watermark: local state is only used
+/// for the leaf values (which the contract itself cross-checks — the queue
+/// segment is part of the proof's public inputs, read from contract storage).
+/// A failed/raced tx therefore burns a little gas at worst; it can never
+/// corrupt the tree.
+async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
+    let sel_confirmed_root = eth_selector(b"confirmedRoot()");
+    let sel_confirmed_count = eth_selector(b"confirmedCount()");
+    let sel_pending_count = eth_selector(b"pendingCmxCount()");
+    let sel_sync = eth_selector(b"syncBatchModel()");
+    // Proofs take tens of seconds; a dedicated client with a generous timeout.
+    let prover_http = Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .expect("reqwest client");
+    // Confirmed-state frontier per pool (advanced only after an on-chain success).
+    let mut frontiers: HashMap<String, FrontierTree> = HashMap::new();
+
+    println!(
+        "[crank] updateRoot crank ON (prover={}, interval={}s, account=0x{})",
+        cfg.prover_url,
+        cfg.interval_secs,
+        hex::encode(cfg.signer.address)
+    );
+
+    loop {
+        let pools: Vec<AppContext> = {
+            reg.pools.read().await.values().cloned().collect()
+        };
+        for ctx in pools {
+            let pool = ctx.contract_address.clone();
+            let label = pool[..10.min(pool.len())].to_string();
+
+            // 1. On-chain batch state. A revert/empty result ⇒ pre-batch
+            //    implementation (or RPC hiccup) — skip quietly.
+            let chain_root = match rpc.eth_call_word(&pool, sel_confirmed_root).await {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+
+            // 2. Legacy pool freshly upgraded to the batch implementation: its new
+            //    storage fields are zero until the one-time migration runs.
+            if chain_root == [0u8; 32] {
+                println!("[crank][{label}] legacy pool detected — submitting syncBatchModel()");
+                match submit_crank_tx(&rpc, &cfg, &pool, &sel_sync, "syncBatchModel").await {
+                    Ok(true) => {}
+                    Ok(false) => eprintln!("[crank][{label}] syncBatchModel reverted"),
+                    Err(e) => eprintln!("[crank][{label}] syncBatchModel failed: {e:#}"),
+                }
+                continue; // watermark reads are meaningless until the sync lands
+            }
+
+            let chain_count = match rpc.eth_call_word(&pool, sel_confirmed_count).await {
+                Ok(w) => word_to_u64(&w),
+                Err(_) => continue,
+            };
+            let chain_pending = match rpc.eth_call_word(&pool, sel_pending_count).await {
+                Ok(w) => word_to_u64(&w),
+                Err(_) => continue,
+            };
+            if chain_pending == 0 {
+                continue;
+            }
+
+            // 3. Local leaves at the chain watermark.
+            let (leaves, local_len) = {
+                let s = ctx.state.read().await;
+                let take = (chain_pending as usize).min(CMX_CONFIRM_MAX_BATCH);
+                let end = ((chain_count as usize) + take).min(s.cmx_ordered.len());
+                let leaves: Vec<[u8; 32]> = s
+                    .cmx_ordered
+                    .get(chain_count as usize..end)
+                    .map(|x| x.to_vec())
+                    .unwrap_or_default();
+                (leaves, s.cmx_ordered.len() as u64)
+            };
+            if leaves.is_empty() {
+                // Indexer has not ingested the pending NoteAdded events yet.
+                println!(
+                    "[crank][{label}] chain has {chain_pending} pending at count {chain_count}, \
+                     local tree only {local_len} leaves — waiting for ingest"
+                );
+                continue;
+            }
+
+            // Advance (or rebuild) the confirmed-state frontier up to chain_count.
+            let frontier = frontiers.entry(pool.clone()).or_default();
+            if frontier.next_index() > chain_count {
+                *frontier = FrontierTree::new(); // chain went backwards?? rebuild from scratch
+            }
+            if frontier.next_index() < chain_count {
+                let (from, to) = (frontier.next_index() as usize, chain_count as usize);
+                let confirmed: Option<Vec<[u8; 32]>> = {
+                    let s = ctx.state.read().await;
+                    s.cmx_ordered.get(from..to).map(|x| x.to_vec())
+                };
+                match confirmed {
+                    Some(cs) => {
+                        for c in cs {
+                            frontier.insert_be(c);
+                        }
+                    }
+                    None => {
+                        println!("[crank][{label}] local tree behind chain watermark — waiting");
+                        continue;
+                    }
+                }
+            }
+            // Byte-identity guard: local frontier must reproduce the chain root.
+            let local_root = fr_to_be_bytes(frontier.root());
+            if local_root != chain_root {
+                eprintln!(
+                    "[crank][{label}] DESYNC: local confirmed root {} != chain {} at count {chain_count} — resetting frontier",
+                    hex::encode(local_root),
+                    hex::encode(chain_root)
+                );
+                frontiers.remove(&pool);
+                continue;
+            }
+
+            // 4. Plan the batch (on a clone — commit only after on-chain success),
+            //    prove, and submit.
+            let mut planned = frontier.clone();
+            let input = planned.plan_batch(&leaves);
+            let j = input.batch_size();
+            println!(
+                "[crank][{label}] confirming batch j={j} at count {chain_count} (chain pending {chain_pending})"
+            );
+
+            let proof = match prove_cmxconfirm(&prover_http, &cfg.prover_url, &input).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[crank][{label}] proof generation failed: {e:#}");
+                    continue;
+                }
+            };
+            let calldata = encode_update_root_calldata(
+                &input.new_root_be(),
+                &input.new_frontier_commit_be(),
+                j,
+                &proof,
+            );
+            match submit_crank_tx(&rpc, &cfg, &pool, &calldata, "updateRoot").await {
+                Ok(true) => {
+                    println!(
+                        "[crank][{label}] updateRoot confirmed: count {chain_count} → {} root={}",
+                        chain_count + j,
+                        hex::encode(input.new_root_be())
+                    );
+                    *frontier = planned;
+                }
+                Ok(false) => {
+                    // Raced by another cranker or state changed under us — the next
+                    // tick re-reads chain state and replans.
+                    eprintln!("[crank][{label}] updateRoot reverted (raced?); will replan");
+                }
+                Err(e) => eprintln!("[crank][{label}] updateRoot submit failed: {e:#}"),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(cfg.interval_secs.max(1))).await;
+    }
+}
+
+/// POST the circom witness input to the prover's `/cmxconfirm/prove`; returns the
+/// ABI-encoded Groth16 proof bytes (`updateRoot`'s `proof` argument).
+async fn prove_cmxconfirm(
+    http: &Client,
+    prover_url: &str,
+    input: &privacy_core::commitment_tree::frontier::CmxConfirmWitnessInput,
+) -> Result<Vec<u8>> {
+    let url = format!("{}/cmxconfirm/prove", prover_url.trim_end_matches('/'));
+    let resp = http.post(&url).json(input).send().await.context("prover request")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow!("prover {status}: {body}"));
+    }
+    #[derive(Deserialize)]
+    struct ProveResponse {
+        proof_hex: String,
+    }
+    let out: ProveResponse = serde_json::from_str(&body).context("prover response JSON")?;
+    hex::decode(out.proof_hex.trim_start_matches("0x")).context("proof hex")
+}
+
+/// Simulate (eth_call) then submit one crank transaction and wait for its receipt.
+/// `Ok(true)` = mined successfully, `Ok(false)` = reverted (simulation or on-chain).
+async fn submit_crank_tx(
+    rpc: &RpcClient,
+    cfg: &CrankConfig,
+    pool: &str,
+    calldata: &[u8],
+    what: &str,
+) -> Result<bool> {
+    let from_hex = format!("0x{}", hex::encode(cfg.signer.address));
+
+    // Dry-run first: a revert here costs nothing (vs. burning gas on-chain).
+    if let Err(e) = rpc.eth_call(pool, calldata, Some(&from_hex)).await {
+        eprintln!("[crank] {what} simulation reverted: {e:#}");
+        return Ok(false);
+    }
+
+    let nonce = rpc.get_transaction_count(&from_hex).await?;
+    let raw = build_and_sign_raw_tx(
+        nonce,
+        cfg.signer.gas_price,
+        cfg.gas_limit,
+        pool,
+        0u64,
+        calldata,
+        cfg.signer.chain_id,
+        &cfg.signer.signing_key,
+    )?;
+    let tx_hash = rpc.send_raw_transaction(&raw).await?;
+    println!("[crank] {what} submitted: {tx_hash}");
+
+    // Wait for the receipt so ticks never pipeline conflicting txs.
+    for _ in 0..45 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        match rpc.get_transaction_receipt_status(&tx_hash).await {
+            Ok(Some(ok)) => return Ok(ok),
+            Ok(None) => continue,
+            Err(_) => continue,
+        }
+    }
+    Err(anyhow!("{what} tx {tx_hash} not mined within 90s"))
 }
 
 /// Same env as relayer: comma-separated origins in `PRIVACYBTC_CORS_ORIGINS`.
@@ -1296,6 +1612,8 @@ async fn status(
         active_root_hex: http_root_hex(&s),
         local_tree_root_hex,
         tree_size: s.tree.size(),
+        confirmed_count: s.confirmed_count,
+        pending_cmx: s.tree.size().saturating_sub(s.confirmed_count),
         pool_address: ctx.contract_address.clone(),
     }))
 }
@@ -1394,6 +1712,7 @@ async fn get_root(
     Ok(Json(RootResponse {
         root_hex: http_root_hex(&s),
         tree_size: s.tree.size(),
+        confirmed_count: s.confirmed_count,
     }))
 }
 
@@ -2112,6 +2431,8 @@ async fn get_merkle_path(
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let cmx = parse_hex32(&q.cmx)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx hex".to_owned()))?;
+    // Legacy param: witnesses are now always at the confirmed watermark.
+    let _ = q.checkpoint;
 
     let s = ctx.state.read().await;
     let &position = s
@@ -2119,17 +2440,22 @@ async fn get_merkle_path(
         .get(&cmx)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "cmx not found in tree".to_owned()))?;
 
-    let checkpoint = match q.checkpoint {
-        Some(c) => c,
-        None => s
-            .tree
-            .latest_checkpoint_id()
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "no checkpoint available".to_owned()))?,
-    };
+    // Batch-update model: witnesses must open to the CONFIRMED root (`/root`), so they
+    // are computed over the confirmed prefix only. A pending note (position >= watermark)
+    // has no anchor that includes it yet — it becomes spendable after the next updateRoot.
+    if position >= s.confirmed_count {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "note is pending batch confirmation (position {position}, confirmed {}); retry after the next updateRoot",
+                s.confirmed_count
+            ),
+        ));
+    }
 
     s.tree
-        .merkle_path(position, checkpoint)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "merkle path not available for this position/checkpoint".to_owned()))
+        .merkle_path_at(position, s.confirmed_count)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "merkle path not available for this position".to_owned()))
         .map(Json)
 }
 
@@ -2982,6 +3308,7 @@ async fn backfill_from_chain(ctx: &PollContext) {
         .collect();
     topic0s.push(normalize_hex_0x(&shield_completed_topic0_hex()));
     topic0s.push(normalize_hex_0x(&ctx.note_confirmed_topic0));
+    topic0s.push(normalize_hex_0x(&root_updated_topic0_hex()));
     topic0s.push(normalize_hex_0x(&shielded_topic0_hex()));
     topic0s.push(normalize_hex_0x(&unshielded_topic0_hex()));
 
@@ -3003,6 +3330,7 @@ async fn backfill_from_chain(ctx: &PollContext) {
         s.latest_seq = 0;
         s.pending_notes.clear();
         s.confirmed_cmx.clear();
+        s.confirmed_count = 0;
         s.active_root = None;
     }
     // Sequence numbers restart from 0; drop the old archive so it cannot serve
@@ -3132,6 +3460,7 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
         .collect();
     topic0s.push(normalize_hex_0x(&shield_completed_topic0_hex()));
     topic0s.push(normalize_hex_0x(&ctx.note_confirmed_topic0));
+    topic0s.push(normalize_hex_0x(&root_updated_topic0_hex()));
     topic0s.push(normalize_hex_0x(&shielded_topic0_hex()));
     topic0s.push(normalize_hex_0x(&unshielded_topic0_hex()));
 
@@ -3368,6 +3697,7 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
         }
         topics.push(norm_topic(&shield_completed_topic0_hex()));
         topics.push(norm_topic(&ctx.note_confirmed_topic0));
+        topics.push(norm_topic(&root_updated_topic0_hex()));
         topics.push(norm_topic(&shielded_topic0_hex()));
         topics.push(norm_topic(&unshielded_topic0_hex()));
     }
@@ -3470,6 +3800,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         .collect();
     let sc = norm_topic(&shield_completed_topic0_hex());
     let nc = norm_topic(&ctx.note_confirmed_topic0);
+    let ru = norm_topic(&root_updated_topic0_hex());
     let shielded_topic = norm_topic(&shielded_topic0_hex());
     let unshielded_topic = norm_topic(&unshielded_topic0_hex());
 
@@ -3601,6 +3932,8 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             state.pending_notes.remove(&cmx);
             state.confirmed_cmx.insert(cmx);
             state.active_root = Some(new_root);
+            // Batch-update watermark: this leaf is now folded into confirmedRoot.
+            state.confirmed_count = state.confirmed_count.max(position.saturating_add(1));
 
             // Find the shield/transfer note in batches history and mark it confirmed.
             let maybe_note: Option<OrchardIndexedAbiNote> = {
@@ -3659,6 +3992,25 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 });
                 return Ok(());
             }
+        }
+
+    } else if t0.as_deref() == Some(ru.as_str()) {
+        // ── RootUpdated (batch confirm) ──────────────────────────────────────
+        // One verified `updateRoot` batch: authoritative watermark advance. The
+        // per-note NoteConfirmed events of the same tx also advance it; this
+        // branch makes the watermark robust if any of them fails to decode.
+        if !state.confirm_seen_ids.insert(event_id) { return Ok(()); }
+        match decode_root_updated_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
+            Ok(d) => {
+                state.confirmed_count = state.confirmed_count.max(d.to_count);
+                state.active_root = Some(d.new_root);
+                println!(
+                    "[indexer] root updated: confirmed [{}, {}) root={} batch={}",
+                    d.from_count, d.to_count, hex::encode(d.new_root), d.batch_size
+                );
+                ctx.persist.notify(&state);
+            }
+            Err(e) => eprintln!("[indexer] RootUpdated decode FAILED: {e}"),
         }
 
     } else if t0.as_deref() == Some(sc.as_str()) {
@@ -3876,6 +4228,27 @@ impl RpcClient {
     async fn send_raw_transaction(&self, raw_tx: &[u8]) -> Result<String> {
         let hex_tx = format!("0x{}", hex::encode(raw_tx));
         self.rpc_call("eth_sendRawTransaction", serde_json::json!([hex_tx])).await
+    }
+
+    /// `eth_call` against `latest` — read-only contract query (and crank tx simulation).
+    async fn eth_call(&self, to: &str, data: &[u8], from: Option<&str>) -> Result<Vec<u8>> {
+        let mut call = serde_json::json!({
+            "to": normalize_hex_0x(to),
+            "data": format!("0x{}", hex::encode(data)),
+        });
+        if let Some(f) = from {
+            call["from"] = serde_json::json!(normalize_hex_0x(f));
+        }
+        let out: String = self.rpc_call("eth_call", serde_json::json!([call, "latest"])).await?;
+        hex::decode(out.trim_start_matches("0x")).context("invalid eth_call result hex")
+    }
+
+    /// `eth_call` a no-arg view returning one 32-byte word (uint256 / bytes32).
+    async fn eth_call_word(&self, to: &str, selector: [u8; 4]) -> Result<[u8; 32]> {
+        let out = self.eth_call(to, &selector, None).await?;
+        out.get(..32)
+            .and_then(|s| <[u8; 32]>::try_from(s).ok())
+            .ok_or_else(|| anyhow!("eth_call returned {} bytes, expected 32", out.len()))
     }
 
     /// Returns `None` if tx not yet mined, `Some(true)` if success, `Some(false)` if reverted.
