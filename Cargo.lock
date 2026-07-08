@@ -1532,7 +1532,8 @@ dependencies = [
 [[package]]
 name = "privacy-core"
 version = "0.1.6"
-source = "git+https://github.com/PLabs4/privacy-core?tag=v0.1.6#dbe0114a6cbe1c9852be36f5aba701ab4991d062"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3926a15d7141137e2a45fb55284fcfa16d14e32762738f8c218ac4326e7bd084"
 dependencies = [
  "anyhow",
  "bitvec",
