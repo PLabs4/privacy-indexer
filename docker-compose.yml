@@ -17,14 +17,16 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      # Bind on all interfaces inside the container (host maps the port below).
+      # Bind on all interfaces inside the container; the host mapping below is
+      # loopback-only by default so production traffic must enter via a reverse
+      # proxy that exposes read paths and protects write/admin paths.
       PRIVACYBTC_INDEXER_BIND: 0.0.0.0:8787
       # PostgreSQL state backend (checkpoints + leaves + notes).
       PRIVACYBTC_INDEXER_DATABASE_URL: postgres://privacybtc:${POSTGRES_PASSWORD:-privacybtc}@postgres:5432/privacybtc
       # Runtime-registered pools list (small JSON; survives restarts on the volume).
       PRIVACYBTC_INDEXER_POOLS_REGISTRY: /data/pools.json
     ports:
-      - "${INDEXER_HOST_PORT:-8787}:8787"
+      - "${INDEXER_HOST_BIND:-127.0.0.1}:${INDEXER_HOST_PORT:-8787}:8787"
     volumes:
       - indexer-data:/data
     depends_on:

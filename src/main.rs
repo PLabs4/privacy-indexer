@@ -505,6 +505,8 @@ struct PoolRegistry {
     /// amount + unshield recipient), derived from immutable calldata. Cached forever;
     /// populated lazily when `/txs` classifies a page.
     tx_meta: Arc<RwLock<HashMap<String, TxMeta>>>,
+    /// Bearer token required by admin-only write endpoints such as POST /frozen.
+    admin_token: Option<Arc<str>>,
 }
 
 /// Public pool metadata surfaced by the API. `Issuer` pools are PERC20 assets minted by an
@@ -1002,6 +1004,11 @@ async fn main() -> Result<()> {
         metadata: Arc::new(RwLock::new(HashMap::new())),
         block_time: Arc::new(RwLock::new(HashMap::new())),
         tx_meta: Arc::new(RwLock::new(HashMap::new())),
+        admin_token: std::env::var("PRIVACYBTC_INDEXER_ADMIN_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .map(Arc::<str>::from),
     };
 
     // 1) CLI pools (the first one becomes primary and owns the confirm signer).
@@ -1449,6 +1456,24 @@ fn build_cors_layer() -> CorsLayer {
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(tower_http::cors::Any)
+}
+
+fn require_admin(headers: &HeaderMap, token: Option<&Arc<str>>) -> Result<(), (StatusCode, String)> {
+    let Some(expected) = token else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin writes are disabled; set PRIVACYBTC_INDEXER_ADMIN_TOKEN".to_owned(),
+        ));
+    };
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let supplied = auth.strip_prefix("Bearer ").unwrap_or_default();
+    if supplied.is_empty() || supplied != expected.as_ref() {
+        return Err((StatusCode::UNAUTHORIZED, "invalid admin token".to_owned()));
+    }
+    Ok(())
 }
 
 // ─── HTTP handlers ────────────────────────────────────────────────────────────
@@ -2532,6 +2557,7 @@ async fn post_frozen(
     Query(q): Query<SimplePoolQuery>,
     Json(req): Json<FreezeRequest>,
 ) -> Result<Json<FrozenRootResponse>, (StatusCode, String)> {
+    require_admin(&headers, reg.admin_token.as_ref())?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let cmx_be = parse_hex32(&req.cmx_hex)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx_hex".to_owned()))?;
@@ -4777,11 +4803,13 @@ fn strip_0x(s: &str) -> &str {
 mod tests {
     use super::{
         advance_cursor, decode_orchard_bundle_from_log_data, encode_confirm_receipt_calldata,
-        getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, rlp_bytes, rlp_list,
-        rlp_uint, RpcClient,
+        getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, require_admin, rlp_bytes,
+        rlp_list, rlp_uint, RpcClient,
     };
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use privacy_core::types::OrchardStoredBundle;
     use sha3::{Digest, Keccak256};
+    use std::sync::Arc;
 
     /// The indexer's empty frozen tree must publish the same `rt_frozen` the PERC20
     /// circuit/prover expect, and a freeze must change the root while the witness for
@@ -4847,6 +4875,30 @@ mod tests {
     fn normalize_hex_keeps_or_adds_prefix() {
         assert_eq!(normalize_hex_0x("abcd"), "0xabcd");
         assert_eq!(normalize_hex_0x("0xabcd"), "0xabcd");
+    }
+
+    #[test]
+    fn frozen_admin_auth_requires_configured_bearer_token() {
+        let mut headers = HeaderMap::new();
+        let token = Arc::<str>::from("secret");
+
+        assert_eq!(
+            require_admin(&headers, None).unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            require_admin(&headers, Some(&token)).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        headers.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer wrong"));
+        assert_eq!(
+            require_admin(&headers, Some(&token)).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+
+        headers.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+        assert!(require_admin(&headers, Some(&token)).is_ok());
     }
 
     #[test]
