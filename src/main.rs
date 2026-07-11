@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -15,41 +15,60 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::stream::{self, StreamExt};
-use tokio::sync::{broadcast, RwLock};
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_tungstenite::tungstenite::Message;
-use futures_util::SinkExt;
-use tower_http::cors::{AllowOrigin, CorsLayer};
 use clap::Parser;
+use futures_util::stream::{self, StreamExt};
+use futures_util::SinkExt;
 use k256::ecdsa::{RecoveryId, SigningKey};
-use privacy_core::commitment_tree::OrchardCommitmentTree;
 use privacy_core::commitment_tree::frontier::{FrontierTree, CMX_CONFIRM_MAX_BATCH};
 use privacy_core::commitment_tree::frozen::{
     fr_from_be_bytes, fr_to_be_bytes, fr_to_le_hex, FrozenImt,
 };
-use privacy_core::types::{
-    OrchardIndexBatch, OrchardIndexedAbiNote, OrchardIndexedBundle, OrchardStoredBundle,
-};
+use privacy_core::commitment_tree::OrchardCommitmentTree;
 use privacy_core::ethereum::{
-    bundle_actions_by_cmx, decode_note_added_log, decode_note_confirmed_log,
-    decode_shield_completed_log, decode_shielded_log, decode_unshielded_log,
-    shielded_topic0_hex, unshielded_topic0_hex, BundleActionCiphertexts,
-    note_added_topic0_alternatives, note_confirmed_topic0_hex, shield_completed_topic0_hex,
+    bundle_actions_by_cmx,
+    decode_note_added_log,
+    decode_note_confirmed_log,
     // Batch-update model (off-chain tree): RootUpdated watermark + updateRoot crank calldata.
-    decode_root_updated_log, encode_update_root_calldata, root_updated_topic0_hex,
+    decode_root_updated_log,
+    decode_shield_completed_log,
     // WS-6: ERC20Shield pool discovery/verification + metadata (privacy-core 0.1.3).
-    decode_shield_pool_created_log, shield_pool_created_topic0_hex, DecodedShieldPoolCreated,
+    decode_shield_pool_created_log,
+    decode_shielded_log,
     // Swap plan A (call-on-chain): initiate/join tx calldata is the canonical DA source for
     // swap legs; the indexer decodes it so wallets can trial-decrypt BEFORE joining.
-    decode_swap_initiate_calldata, decode_swap_initiated_log, decode_swap_join_calldata,
-    decode_swap_joined_log, swap_cancelled_topic0_hex, swap_initiate_selector,
-    swap_initiated_topic0_hex, swap_join_selector, swap_joined_topic0_hex,
-    swap_settled_topic0_hex, PrivacyCallArgs,
+    decode_swap_initiate_calldata,
+    decode_swap_initiated_log,
+    decode_swap_join_calldata,
+    decode_swap_joined_log,
+    decode_unshielded_log,
+    encode_update_root_calldata,
+    note_added_topic0_alternatives,
+    note_confirmed_topic0_hex,
+    root_updated_topic0_hex,
+    shield_completed_topic0_hex,
+    shield_pool_created_topic0_hex,
+    shielded_topic0_hex,
+    swap_cancelled_topic0_hex,
+    swap_initiate_selector,
+    swap_initiated_topic0_hex,
+    swap_join_selector,
+    swap_joined_topic0_hex,
+    swap_settled_topic0_hex,
+    unshielded_topic0_hex,
+    BundleActionCiphertexts,
+    DecodedShieldPoolCreated,
+    PrivacyCallArgs,
+};
+use privacy_core::types::{
+    OrchardIndexBatch, OrchardIndexedAbiNote, OrchardIndexedBundle, OrchardStoredBundle,
 };
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
+use tokio::sync::{broadcast, RwLock};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_tungstenite::tungstenite::Message;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 /// BN254 Poseidon incremental tree (depth 32) with **zero leaves**, matching
 /// `IncrementalMerkleTree.init()` / `PrivacyBTC` constructor (`_tree.root` on-chain).
@@ -57,8 +76,8 @@ use sha3::{Digest, Keccak256};
 ///
 /// Stored here in EVM/on-chain byte order (big-endian as returned by `activeRoot()`).
 const EVM_EMPTY_IMT_ROOT: [u8; 32] = [
-    0x2c, 0xbe, 0x96, 0x7b, 0x6b, 0xa6, 0xd0, 0xfa, 0xa4, 0xe8, 0x4e, 0xa6, 0x23, 0xd1, 0x1d, 0xc7, 0x47, 0x85, 0x4f,
-    0xd3, 0x2e, 0xca, 0xa4, 0x8c, 0x72, 0x16, 0x35, 0x24, 0x3d, 0x37, 0xd7, 0x9f,
+    0x2c, 0xbe, 0x96, 0x7b, 0x6b, 0xa6, 0xd0, 0xfa, 0xa4, 0xe8, 0x4e, 0xa6, 0x23, 0xd1, 0x1d, 0xc7,
+    0x47, 0x85, 0x4f, 0xd3, 0x2e, 0xca, 0xa4, 0x8c, 0x72, 0x16, 0x35, 0x24, 0x3d, 0x37, 0xd7, 0x9f,
 ];
 
 /// Returns the Poseidon BN254 Merkle root as a LE hex string, suitable for
@@ -90,7 +109,10 @@ fn http_root_hex(state: &SharedState) -> Option<String> {
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
-#[command(name = "privacybtc-indexer", about = "Orchard bundle indexer for Ethereum logs")]
+#[command(
+    name = "privacybtc-indexer",
+    about = "Orchard bundle indexer for Ethereum logs"
+)]
 struct Cli {
     /// HTTP(S) JSON-RPC URL. Used for receipt fetches; the WebSocket URL is derived
     /// from it (https→wss) unless --ws-url is given.
@@ -123,7 +145,11 @@ struct Cli {
     /// Legacy_TOPIC0: log `data` = single ABI `bytes` UTF-8 JSON [`OrchardStoredBundle`].
     #[arg(long)]
     legacy_bundle_topic0: Option<String>,
-    #[arg(long, env = "PRIVACYBTC_INDEXER_BIND", default_value = "127.0.0.1:8787")]
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_BIND",
+        default_value = "127.0.0.1:8787"
+    )]
     bind: String,
     #[arg(long, default_value_t = 512)]
     max_batches_in_memory: usize,
@@ -148,15 +174,44 @@ struct Cli {
     #[arg(long, env = "PRIVACYBTC_INDEXER_CRANK", default_value_t = false, value_parser = parse_bool_flag)]
     crank: bool,
     /// Base URL of the privacy-prover service exposing POST /cmxconfirm/prove.
-    #[arg(long, env = "PRIVACYBTC_INDEXER_CRANK_PROVER_URL", default_value = "http://127.0.0.1:8791")]
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_PROVER_URL",
+        default_value = "http://127.0.0.1:8791"
+    )]
     crank_prover_url: String,
+    /// Bearer token for the shared generic prover's /cmxconfirm/prove endpoint.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_CRANK_PROVER_API_TOKEN")]
+    crank_prover_api_token: Option<String>,
     /// Seconds between crank passes over the pools.
-    #[arg(long, env = "PRIVACYBTC_INDEXER_CRANK_INTERVAL_SECS", default_value_t = 15)]
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_INTERVAL_SECS",
+        default_value_t = 15
+    )]
     crank_interval_secs: u64,
     /// Gas limit for `updateRoot` (Groth16 verify + up to 8 confirms) and
     /// `syncBatchModel` (32 Poseidon folds) transactions.
-    #[arg(long, env = "PRIVACYBTC_INDEXER_CRANK_GAS_LIMIT", default_value_t = 2_000_000u64)]
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_GAS_LIMIT",
+        default_value_t = 2_000_000u64
+    )]
     gas_limit_update_root: u64,
+    /// Pools the signer may crank. Required and non-empty when --crank is enabled.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_ALLOWED_POOLS",
+        value_delimiter = ','
+    )]
+    crank_allowed_pool: Vec<String>,
+    /// Maximum signed crank transactions in any rolling one-hour window.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_MAX_TX_PER_HOUR",
+        default_value_t = 0u64
+    )]
+    crank_max_tx_per_hour: u64,
     #[arg(long, env = "PRIVACYBTC_CHAIN_ID", default_value_t = 1u64)]
     chain_id: u64,
     /// Gas price in wei for confirm transactions. Default: 1 Gwei.
@@ -172,6 +227,18 @@ struct Cli {
     /// Re-loaded on startup so dynamically-added pools survive restarts.
     #[arg(long, env = "PRIVACYBTC_INDEXER_POOLS_REGISTRY")]
     pools_registry: Option<String>,
+    /// Allow POST /pools. Production deployments normally disable this and rely
+    /// on trusted-factory discovery plus explicit startup pools.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_ALLOW_RUNTIME_POOL_REGISTRATION",
+        default_value_t = false,
+        value_parser = parse_bool_flag
+    )]
+    allow_runtime_pool_registration: bool,
+    /// Hard cap across startup, persisted and discovered pools.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_MAX_POOLS", default_value_t = 100usize)]
+    max_pools: usize,
     /// Auto-discover pools by scanning `Perc20Created` chain-wide (no address
     /// filter) and registering each match automatically. With this on, the
     /// frontend never needs to call `POST /pools` — the indexer self-heals.
@@ -179,10 +246,62 @@ struct Cli {
     discover_pools: bool,
     /// Restrict auto-discovery to these issuer addresses (repeatable or comma-
     /// separated). Empty ⇒ discover every pERC20 on the chain.
-    #[arg(long, env = "PRIVACYBTC_INDEXER_DISCOVER_ISSUER", value_delimiter = ',')]
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_DISCOVER_ISSUER",
+        value_delimiter = ','
+    )]
     discover_issuer: Vec<String>,
+    /// Trusted PERC20Factory addresses. Dynamic issuer-pool admission must be
+    /// proven by a Perc20Deployed log emitted by one of these factories.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_TRUSTED_PERC20_FACTORIES",
+        value_delimiter = ','
+    )]
+    trusted_perc20_factory: Vec<String>,
+    /// Trusted ERC20ShieldFactory addresses. Dynamic shield-pool admission must
+    /// be proven by a ShieldPoolDeployed log emitted by one of these factories.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_TRUSTED_SHIELD_FACTORIES",
+        value_delimiter = ','
+    )]
+    trusted_shield_factory: Vec<String>,
+    /// Explicitly trusted standalone pools that are not factory-deployed.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_TRUSTED_STATIC_POOLS",
+        value_delimiter = ','
+    )]
+    trusted_static_pool: Vec<String>,
+    /// Allowed keccak256 runtime code hashes for trusted factories.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_TRUSTED_FACTORY_CODEHASHES",
+        value_delimiter = ','
+    )]
+    trusted_factory_codehash: Vec<String>,
+    /// Allowed keccak256 runtime code hashes for admitted pools/proxies.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_TRUSTED_POOL_CODEHASHES",
+        value_delimiter = ','
+    )]
+    trusted_pool_codehash: Vec<String>,
+    /// Allowed runtime code hashes for implementations referenced by trusted beacons.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_TRUSTED_IMPLEMENTATION_CODEHASHES",
+        value_delimiter = ','
+    )]
+    trusted_implementation_codehash: Vec<String>,
     /// Poll interval (seconds) for the auto-discovery scan.
-    #[arg(long, env = "PRIVACYBTC_INDEXER_DISCOVER_POLL_SECS", default_value_t = 12)]
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_DISCOVER_POLL_SECS",
+        default_value_t = 12
+    )]
     discover_poll_secs: u64,
 }
 
@@ -192,7 +311,9 @@ fn parse_bool_flag(s: &str) -> Result<bool, String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "" | "0" | "false" | "no" | "off" => Ok(false),
-        other => Err(format!("invalid boolean '{other}' (use 1/0/true/false/yes/no)")),
+        other => Err(format!(
+            "invalid boolean '{other}' (use 1/0/true/false/yes/no)"
+        )),
     }
 }
 
@@ -217,11 +338,13 @@ struct ShieldAccounting {
 
 impl ShieldAccounting {
     fn current_shielded_units(self) -> u128 {
-        self.total_shielded_units.saturating_sub(self.total_unshielded_units)
+        self.total_shielded_units
+            .saturating_sub(self.total_unshielded_units)
     }
 
     fn current_shielded_wei(self) -> u128 {
-        self.total_shielded_wei.saturating_sub(self.total_unshielded_wei)
+        self.total_shielded_wei
+            .saturating_sub(self.total_unshielded_wei)
     }
 }
 
@@ -310,7 +433,13 @@ impl SignerConfig {
         let signing_key =
             SigningKey::from_slice(&key_bytes).map_err(|e| anyhow!("invalid signing key: {e}"))?;
         let address = eth_address_from_signing_key(&signing_key);
-        Ok(Self { signing_key, address, chain_id, gas_price, gas_limit })
+        Ok(Self {
+            signing_key,
+            address,
+            chain_id,
+            gas_price,
+            gas_limit,
+        })
     }
 }
 
@@ -391,7 +520,11 @@ impl PoolBuilder {
         let (persist_tx, persist_rx) = tokio::sync::watch::channel(std::sync::Arc::new(
             CheckpointSnapshot::from_checkpoint_data(&ck),
         ));
-        tokio::spawn(persist_task(backend.clone(), contract_address.to_string(), persist_rx));
+        tokio::spawn(persist_task(
+            backend.clone(),
+            contract_address.to_string(),
+            persist_rx,
+        ));
         let persist = Persist { tx: persist_tx };
 
         // Rebuild Poseidon tree from checkpoint.
@@ -415,7 +548,10 @@ impl PoolBuilder {
 
         // Rebuild the compliance frozen Indexed-MT by replaying frozen cmx in order.
         let restored_frozen = FrozenImt::from_frozen_values(
-            &ck.frozen_cmx.iter().filter_map(fr_from_be_bytes).collect::<Vec<_>>(),
+            &ck.frozen_cmx
+                .iter()
+                .filter_map(fr_from_be_bytes)
+                .collect::<Vec<_>>(),
         );
 
         let shared = Arc::new(RwLock::new(SharedState {
@@ -470,7 +606,11 @@ impl PoolBuilder {
 
         AppContext {
             state: shared,
-            signer: if attach_signer { self.signer.clone() } else { None },
+            signer: if attach_signer {
+                self.signer.clone()
+            } else {
+                None
+            },
             rpc: self.rpc.clone(),
             contract_address: contract_address.to_string(),
             persist,
@@ -490,10 +630,15 @@ struct PoolRegistry {
     /// First pool ever added; used as the default when `?pool=` is omitted.
     primary: Arc<RwLock<Option<String>>>,
     builder: Arc<PoolBuilder>,
+    admission: Arc<PoolAdmissionPolicy>,
+    add_lock: Arc<tokio::sync::Mutex<()>>,
+    max_pools: usize,
+    allow_runtime_pool_registration: bool,
     registry_file: Option<String>,
     /// Cache of addresses already verified as genuine pERC20 assets (lowercase
     /// 0x). Avoids a repeat `eth_getLogs` on every re-registration attempt.
     verified_pools: Arc<RwLock<HashSet<String>>>,
+    verified_pool_provenance: Arc<RwLock<HashMap<String, PoolProvenance>>>,
     /// Cache of per-pool metadata (type/scale/underlying/name/symbol/decimals),
     /// keyed by lowercase 0x address. Populated lazily from the pool's genesis event.
     metadata: Arc<RwLock<HashMap<String, PoolMeta>>>,
@@ -507,6 +652,119 @@ struct PoolRegistry {
     tx_meta: Arc<RwLock<HashMap<String, TxMeta>>>,
     /// Bearer token required by admin-only write endpoints such as POST /frozen.
     admin_token: Option<Arc<str>>,
+}
+
+#[derive(Clone, Debug)]
+struct PoolAdmissionPolicy {
+    perc20_factories: HashSet<String>,
+    shield_factories: HashSet<String>,
+    static_pools: HashSet<String>,
+    factory_codehashes: HashSet<String>,
+    pool_codehashes: HashSet<String>,
+    implementation_codehashes: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+enum PoolProvenance {
+    Static,
+    Factory(String),
+}
+
+impl PoolAdmissionPolicy {
+    fn from_cli(cli: &Cli) -> Result<Self> {
+        if !cli.discover_issuer.is_empty() {
+            return Err(anyhow!(
+                "PRIVACYBTC_INDEXER_DISCOVER_ISSUER is no longer an admission control; configure trusted factories instead"
+            ));
+        }
+        let addresses = |name: &str, values: &[String]| -> Result<HashSet<String>> {
+            values
+                .iter()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| {
+                    if parse_address20(v).is_none() {
+                        return Err(anyhow!("{name} contains invalid address: {v}"));
+                    }
+                    Ok(normalize_hex_0x(v).to_lowercase())
+                })
+                .collect()
+        };
+        let hashes = |name: &str, values: &[String]| -> Result<HashSet<String>> {
+            values
+                .iter()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| {
+                    let clean = strip_0x(v);
+                    if clean.len() != 64 || !clean.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(anyhow!("{name} contains invalid bytes32 hash: {v}"));
+                    }
+                    Ok(format!("0x{}", clean.to_ascii_lowercase()))
+                })
+                .collect()
+        };
+        let policy = Self {
+            perc20_factories: addresses(
+                "PRIVACYBTC_INDEXER_TRUSTED_PERC20_FACTORIES",
+                &cli.trusted_perc20_factory,
+            )?,
+            shield_factories: addresses(
+                "PRIVACYBTC_INDEXER_TRUSTED_SHIELD_FACTORIES",
+                &cli.trusted_shield_factory,
+            )?,
+            static_pools: addresses(
+                "PRIVACYBTC_INDEXER_TRUSTED_STATIC_POOLS",
+                &cli.trusted_static_pool,
+            )?,
+            factory_codehashes: hashes(
+                "PRIVACYBTC_INDEXER_TRUSTED_FACTORY_CODEHASHES",
+                &cli.trusted_factory_codehash,
+            )?,
+            pool_codehashes: hashes(
+                "PRIVACYBTC_INDEXER_TRUSTED_POOL_CODEHASHES",
+                &cli.trusted_pool_codehash,
+            )?,
+            implementation_codehashes: hashes(
+                "PRIVACYBTC_INDEXER_TRUSTED_IMPLEMENTATION_CODEHASHES",
+                &cli.trusted_implementation_codehash,
+            )?,
+        };
+        if (!policy.perc20_factories.is_empty() || !policy.shield_factories.is_empty())
+            && policy.factory_codehashes.is_empty()
+        {
+            return Err(anyhow!(
+                "trusted factories require PRIVACYBTC_INDEXER_TRUSTED_FACTORY_CODEHASHES"
+            ));
+        }
+        if (!policy.perc20_factories.is_empty()
+            || !policy.shield_factories.is_empty()
+            || !policy.static_pools.is_empty())
+            && policy.pool_codehashes.is_empty()
+        {
+            return Err(anyhow!(
+                "trusted pools require PRIVACYBTC_INDEXER_TRUSTED_POOL_CODEHASHES"
+            ));
+        }
+        if (!policy.perc20_factories.is_empty() || !policy.shield_factories.is_empty())
+            && policy.implementation_codehashes.is_empty()
+        {
+            return Err(anyhow!(
+                "trusted factories require PRIVACYBTC_INDEXER_TRUSTED_IMPLEMENTATION_CODEHASHES"
+            ));
+        }
+        Ok(policy)
+    }
+
+    fn discovery_sources(&self) -> Vec<(String, String)> {
+        self.perc20_factories
+            .iter()
+            .map(|f| (f.clone(), perc20_deployed_topic0()))
+            .chain(
+                self.shield_factories
+                    .iter()
+                    .map(|f| (f.clone(), shield_pool_deployed_topic0())),
+            )
+            .collect()
+    }
 }
 
 /// Public pool metadata surfaced by the API. `Issuer` pools are PERC20 assets minted by an
@@ -596,10 +854,45 @@ impl PoolMeta {
 }
 
 impl PoolRegistry {
+    async fn validate_trust_roots(&self) -> Result<()> {
+        for factory in self
+            .admission
+            .perc20_factories
+            .iter()
+            .chain(self.admission.shield_factories.iter())
+        {
+            let hash = self.builder.rpc.runtime_codehash(factory).await?;
+            if !self.admission.factory_codehashes.contains(&hash) {
+                return Err(anyhow!(
+                    "trusted factory {factory} has unapproved runtime codehash {hash}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate every admission path before constructing an AppContext. This is
+    /// deliberately separate from `add_pool`, which only mutates the registry.
+    async fn add_admitted_pool(
+        &self,
+        raw_addr: &str,
+        start_block: u64,
+        persist: bool,
+    ) -> Result<bool> {
+        let address = normalize_hex_0x(raw_addr).to_lowercase();
+        if !self.verify_pool_admitted(&address).await? {
+            return Err(anyhow!(
+                "pool {address} is not from a trusted factory or explicit static allowlist"
+            ));
+        }
+        self.add_pool(&address, start_block, persist).await
+    }
+
     /// Add a pool if not already present. Returns `Ok(true)` when newly added and
     /// `Ok(false)` when it already existed (idempotent). When `persist` is set the
     /// pool is recorded in the registry file so it is re-added on restart.
     async fn add_pool(&self, raw_addr: &str, start_block: u64, persist: bool) -> Result<bool> {
+        let _add_guard = self.add_lock.lock().await;
         // Pool keys are case-insensitive (Ethereum addresses), so normalise to lowercase.
         let address = normalize_hex_0x(raw_addr).to_lowercase();
         if self.pools.read().await.contains_key(&address) {
@@ -612,9 +905,18 @@ impl PoolRegistry {
             }
             return Ok(false);
         }
+        if self.pools.read().await.len() >= self.max_pools {
+            return Err(anyhow!(
+                "pool registry limit reached (max={})",
+                self.max_pools
+            ));
+        }
         // The first pool ever added becomes primary and owns the confirm signer.
         let attach_signer = self.primary.read().await.is_none();
-        let ctx = self.builder.build(&address, start_block, attach_signer).await;
+        let ctx = self
+            .builder
+            .build(&address, start_block, attach_signer)
+            .await;
         {
             let mut map = self.pools.write().await;
             // Re-check under the write lock to avoid a concurrent double-insert.
@@ -640,25 +942,90 @@ impl PoolRegistry {
         Ok(true)
     }
 
-    /// Confirm `pool_lc` (lowercase 0x) is a genuine pERC20 asset by checking it
-    /// emitted `Perc20Created(pool,…)` on-chain. Cached after the first success so
-    /// repeated registrations don't re-hit the RPC. Already-watched pools are
-    /// trivially genuine (we indexed their logs), so they short-circuit to true.
-    async fn verify_pool_genuine(&self, pool_lc: &str) -> Result<bool> {
+    /// Confirm pool provenance from a trusted factory event or the explicit
+    /// standalone allowlist, and pin its runtime bytecode hash. A pool's own
+    /// self-emitted genesis event is supplemental metadata, never trust evidence.
+    async fn verify_pool_admitted(&self, pool_lc: &str) -> Result<bool> {
         if self.verified_pools.read().await.contains(pool_lc) {
             return Ok(true);
         }
-        if self.pools.read().await.contains_key(pool_lc) {
+        if let Some(provenance) = self.resolve_pool_provenance(pool_lc).await? {
+            self.verified_pools
+                .write()
+                .await
+                .insert(pool_lc.to_string());
+            self.verified_pool_provenance
+                .write()
+                .await
+                .insert(pool_lc.to_string(), provenance);
             return Ok(true);
         }
-        // Genuine if it emitted either the issuer (`Perc20Created`) or the shield-pool
-        // (`ShieldPoolCreated`) genesis event for itself.
-        let genuine = self.builder.rpc.is_perc20_created(pool_lc).await?
-            || self.builder.rpc.is_shield_pool_created(pool_lc).await?;
-        if genuine {
-            self.verified_pools.write().await.insert(pool_lc.to_string());
+        Ok(false)
+    }
+
+    /// Re-evaluate mutable trust facts (especially beacon implementation) without
+    /// consulting the admission cache. The signer calls this before every crank.
+    async fn verify_pool_current(&self, pool_lc: &str) -> Result<bool> {
+        let codehash = self.builder.rpc.runtime_codehash(pool_lc).await?;
+        if !self.admission.pool_codehashes.contains(&codehash) {
+            return Ok(false);
         }
-        Ok(genuine)
+        let provenance = match self
+            .verified_pool_provenance
+            .read()
+            .await
+            .get(pool_lc)
+            .cloned()
+        {
+            Some(value) => value,
+            None => match self.resolve_pool_provenance(pool_lc).await? {
+                Some(value) => value,
+                None => return Ok(false),
+            },
+        };
+        match provenance {
+            PoolProvenance::Static => Ok(true),
+            PoolProvenance::Factory(factory) => {
+                self.builder
+                    .rpc
+                    .pool_uses_factory_beacon(
+                        &factory,
+                        pool_lc,
+                        &self.admission.implementation_codehashes,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn resolve_pool_provenance(&self, pool_lc: &str) -> Result<Option<PoolProvenance>> {
+        let codehash = self.builder.rpc.runtime_codehash(pool_lc).await?;
+        if !self.admission.pool_codehashes.contains(&codehash) {
+            return Ok(None);
+        }
+        if self.admission.static_pools.contains(pool_lc) {
+            return Ok(Some(PoolProvenance::Static));
+        }
+        for (factory, topic0) in self.admission.discovery_sources() {
+            if self
+                .builder
+                .rpc
+                .was_pool_deployed_by(&factory, pool_lc, &topic0)
+                .await?
+                && self
+                    .builder
+                    .rpc
+                    .pool_uses_factory_beacon(
+                        &factory,
+                        pool_lc,
+                        &self.admission.implementation_codehashes,
+                    )
+                    .await?
+            {
+                return Ok(Some(PoolProvenance::Factory(factory)));
+            }
+        }
+        Ok(None)
     }
 
     /// Best-effort: fetch + cache pool metadata (issuer or wrapped) from its genesis event.
@@ -670,7 +1037,10 @@ impl PoolRegistry {
         }
         match self.builder.rpc.fetch_pool_metadata(pool_lc).await {
             Ok(Some(meta)) => {
-                self.metadata.write().await.insert(pool_lc.to_string(), meta.clone());
+                self.metadata
+                    .write()
+                    .await
+                    .insert(pool_lc.to_string(), meta.clone());
                 Some(meta)
             }
             Ok(None) => None,
@@ -689,14 +1059,23 @@ impl PoolRegistry {
         // Which blocks aren't cached yet?
         let missing: Vec<u64> = {
             let cache = self.block_time.read().await;
-            blocks.iter().copied().filter(|b| !cache.contains_key(b)).collect()
+            blocks
+                .iter()
+                .copied()
+                .filter(|b| !cache.contains_key(b))
+                .collect()
         };
         if !missing.is_empty() {
             // Fetch misses concurrently (bounded), so a cold page doesn't serialize
             // one round-trip per block. Failures are left uncached to retry later
             // (a block's timestamp is transient-fetchable, not a permanent "no").
             let fetched: Vec<(u64, u64)> = stream::iter(missing.into_iter().map(|b| async move {
-                self.builder.rpc.get_block_timestamp(b).await.ok().map(|ts| (b, ts))
+                self.builder
+                    .rpc
+                    .get_block_timestamp(b)
+                    .await
+                    .ok()
+                    .map(|ts| (b, ts))
             }))
             .buffer_unordered(8)
             .filter_map(|x| async move { x })
@@ -711,13 +1090,19 @@ impl PoolRegistry {
                 // block we just fetched. Bound after: the servable window is the batch
                 // ring, but this cache would otherwise keep every block ever served;
                 // values are immutable so evicting is free — a re-served block re-fetches.
-                let result = blocks.iter().filter_map(|b| cache.get(b).map(|ts| (*b, *ts))).collect();
+                let result = blocks
+                    .iter()
+                    .filter_map(|b| cache.get(b).map(|ts| (*b, *ts)))
+                    .collect();
                 bound_cache(&mut cache, BLOCK_TIME_CACHE_CAP);
                 return result;
             }
         }
         let cache = self.block_time.read().await;
-        blocks.iter().filter_map(|b| cache.get(b).map(|ts| (*b, *ts))).collect()
+        blocks
+            .iter()
+            .filter_map(|b| cache.get(b).map(|ts| (*b, *ts)))
+            .collect()
     }
 
     /// Classify tx op types by function selector, using the immutable per-tx cache
@@ -726,31 +1111,36 @@ impl PoolRegistry {
     async fn tx_metas(&self, hashes: &[String]) -> HashMap<String, TxMeta> {
         let missing: Vec<String> = {
             let cache = self.tx_meta.read().await;
-            hashes.iter().filter(|h| !cache.contains_key(*h)).cloned().collect()
+            hashes
+                .iter()
+                .filter(|h| !cache.contains_key(*h))
+                .cloned()
+                .collect()
         };
         if !missing.is_empty() {
             // Fetch inputs concurrently (bounded) and parse public facts from calldata.
             // A mined tx's calldata is immutable, so cache the result — INCLUDING an
             // unrecognized default (op=None) — so it's never re-fetched. Un-mined
             // (`Ok(None)`) and transient RPC errors are left uncached, so only they retry.
-            let fetched: Vec<(String, TxMeta)> = stream::iter(missing.into_iter().map(|h| async move {
-                match self.builder.rpc.get_transaction_input_from(&h).await {
-                    Ok(Some((input, from))) => {
-                        let mut m = parse_tx_meta(&input);
-                        // The depositor/issuer is public for shield & mint (they add
-                        // value from a public balance); a hidden note funds the others.
-                        if matches!(m.op, Some("shield") | Some("mint")) {
-                            m.sender = Some(from);
+            let fetched: Vec<(String, TxMeta)> =
+                stream::iter(missing.into_iter().map(|h| async move {
+                    match self.builder.rpc.get_transaction_input_from(&h).await {
+                        Ok(Some((input, from))) => {
+                            let mut m = parse_tx_meta(&input);
+                            // The depositor/issuer is public for shield & mint (they add
+                            // value from a public balance); a hidden note funds the others.
+                            if matches!(m.op, Some("shield") | Some("mint")) {
+                                m.sender = Some(from);
+                            }
+                            Some((h, m))
                         }
-                        Some((h, m))
+                        _ => None,
                     }
-                    _ => None,
-                }
-            }))
-            .buffer_unordered(8)
-            .filter_map(|x| async move { x })
-            .collect()
-            .await;
+                }))
+                .buffer_unordered(8)
+                .filter_map(|x| async move { x })
+                .collect()
+                .await;
             if !fetched.is_empty() {
                 let mut cache = self.tx_meta.write().await;
                 for (h, m) in fetched {
@@ -758,13 +1148,19 @@ impl PoolRegistry {
                 }
                 // Build the result BEFORE bounding so a just-fetched key can't be
                 // evicted out of this page's response.
-                let result = hashes.iter().filter_map(|h| cache.get(h).map(|m| (h.clone(), m.clone()))).collect();
+                let result = hashes
+                    .iter()
+                    .filter_map(|h| cache.get(h).map(|m| (h.clone(), m.clone())))
+                    .collect();
                 bound_cache(&mut cache, TX_META_CACHE_CAP);
                 return result;
             }
         }
         let cache = self.tx_meta.read().await;
-        hashes.iter().filter_map(|h| cache.get(h).map(|m| (h.clone(), m.clone()))).collect()
+        hashes
+            .iter()
+            .filter_map(|h| cache.get(h).map(|m| (h.clone(), m.clone())))
+            .collect()
     }
 
     /// Resolve the target pool from a `?pool=0x...` query param. When `pool` is
@@ -785,7 +1181,10 @@ impl PoolRegistry {
                     }
                 }
                 map.values().next().cloned().ok_or_else(|| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "no pools configured".to_owned())
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "no pools configured".to_owned(),
+                    )
                 })
             }
         }
@@ -814,10 +1213,16 @@ fn load_pools_registry(path: &str) -> Vec<PoolRegistryEntry> {
 }
 
 fn append_pools_registry(path: &str, address: &str, start_block: u64) -> Result<()> {
-    let mut reg = PoolsRegistryFile { pools: load_pools_registry(path) };
+    let mut reg = PoolsRegistryFile {
+        pools: load_pools_registry(path),
+    };
     let norm = normalize_hex_0x(address);
     let mut changed = false;
-    if let Some(entry) = reg.pools.iter_mut().find(|e| normalize_hex_0x(&e.address) == norm) {
+    if let Some(entry) = reg
+        .pools
+        .iter_mut()
+        .find(|e| normalize_hex_0x(&e.address) == norm)
+    {
         if entry.address != norm {
             entry.address = norm.clone();
             changed = true;
@@ -827,7 +1232,10 @@ fn append_pools_registry(path: &str, address: &str, start_block: u64) -> Result<
             changed = true;
         }
     } else {
-        reg.pools.push(PoolRegistryEntry { address: norm, start_block });
+        reg.pools.push(PoolRegistryEntry {
+            address: norm,
+            start_block,
+        });
         changed = true;
     }
     if !changed {
@@ -939,7 +1347,12 @@ async fn main() -> Result<()> {
 
     let signer = match &cli.signer_key {
         Some(key) => {
-            let cfg = SignerConfig::from_hex_key(key, cli.chain_id, cli.gas_price, cli.gas_limit_confirm)?;
+            let cfg = SignerConfig::from_hex_key(
+                key,
+                cli.chain_id,
+                cli.gas_price,
+                cli.gas_limit_confirm,
+            )?;
             let addr_hex = hex::encode(cfg.address);
             println!("indexer signer account: 0x{addr_hex}");
             Some(Arc::new(cfg))
@@ -960,8 +1373,13 @@ async fn main() -> Result<()> {
     // ── Persistence backend: PostgreSQL (queryable) if --database-url is set, else JSON ──
     let pg_pool: Option<sqlx::PgPool> = match &cli.database_url {
         Some(url) => {
-            let pool = sqlx::PgPool::connect(url).await.context("connect PostgreSQL")?;
-            sqlx::migrate!("./migrations").run(&pool).await.context("run migrations")?;
+            let pool = sqlx::PgPool::connect(url)
+                .await
+                .context("connect PostgreSQL")?;
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .context("run migrations")?;
             println!("[indexer] state backend: PostgreSQL (migrations applied)");
             Some(pool)
         }
@@ -995,12 +1413,46 @@ async fn main() -> Result<()> {
         note_confirmed_topic0: note_confirmed.clone(),
     });
 
+    let admission = Arc::new(PoolAdmissionPolicy::from_cli(&cli)?);
+    if cli.max_pools == 0 {
+        return Err(anyhow!(
+            "PRIVACYBTC_INDEXER_MAX_POOLS must be greater than zero"
+        ));
+    }
+    if cli.crank {
+        if cli.crank_allowed_pool.is_empty() {
+            return Err(anyhow!(
+                "--crank requires PRIVACYBTC_INDEXER_CRANK_ALLOWED_POOLS"
+            ));
+        }
+        if cli.crank_max_tx_per_hour == 0 {
+            return Err(anyhow!(
+                "--crank requires PRIVACYBTC_INDEXER_CRANK_MAX_TX_PER_HOUR > 0"
+            ));
+        }
+        if cli
+            .crank_prover_api_token
+            .as_deref()
+            .map(str::len)
+            .unwrap_or(0)
+            < 32
+        {
+            return Err(anyhow!(
+                "--crank requires PRIVACYBTC_INDEXER_CRANK_PROVER_API_TOKEN with at least 32 characters"
+            ));
+        }
+    }
     let registry = PoolRegistry {
         pools: Arc::new(RwLock::new(HashMap::new())),
         primary: Arc::new(RwLock::new(None)),
         builder,
+        admission,
+        add_lock: Arc::new(tokio::sync::Mutex::new(())),
+        max_pools: cli.max_pools,
+        allow_runtime_pool_registration: cli.allow_runtime_pool_registration,
         registry_file: cli.pools_registry.clone(),
         verified_pools: Arc::new(RwLock::new(HashSet::new())),
+        verified_pool_provenance: Arc::new(RwLock::new(HashMap::new())),
         metadata: Arc::new(RwLock::new(HashMap::new())),
         block_time: Arc::new(RwLock::new(HashMap::new())),
         tx_meta: Arc::new(RwLock::new(HashMap::new())),
@@ -1010,19 +1462,30 @@ async fn main() -> Result<()> {
             .filter(|s| !s.is_empty())
             .map(Arc::<str>::from),
     };
+    registry.validate_trust_roots().await?;
 
     // 1) CLI pools (the first one becomes primary and owns the confirm signer).
     for raw_addr in &cli.contract_address {
-        if let Err(e) = registry.add_pool(raw_addr, cli.start_block, false).await {
+        if let Err(e) = registry
+            .add_admitted_pool(raw_addr, cli.start_block, false)
+            .await
+        {
             eprintln!("[indexer] add CLI pool {raw_addr} failed: {e:#}");
         }
     }
     // 2) Pools registered at runtime in a previous run.
     if let Some(path) = &cli.pools_registry {
         for entry in load_pools_registry(path) {
-            let sb = if entry.start_block == 0 { cli.start_block } else { entry.start_block };
-            if let Err(e) = registry.add_pool(&entry.address, sb, false).await {
-                eprintln!("[indexer] re-add registry pool {} failed: {e:#}", entry.address);
+            let sb = if entry.start_block == 0 {
+                cli.start_block
+            } else {
+                entry.start_block
+            };
+            if let Err(e) = registry.add_admitted_pool(&entry.address, sb, false).await {
+                eprintln!(
+                    "[indexer] re-add registry pool {} failed: {e:#}",
+                    entry.address
+                );
             }
         }
         println!("[indexer] pools registry: {path}");
@@ -1031,26 +1494,22 @@ async fn main() -> Result<()> {
     //    matching pools automatically (primary path; POST /pools stays as a manual
     //    fallback for e.g. pools created before --start-block).
     if cli.discover_pools {
-        let issuer_topics: Vec<String> = cli
-            .discover_issuer
-            .iter()
-            .filter(|a| parse_address20(a).is_some())
-            .map(|a| address_to_topic(a))
-            .collect();
-        let scope = if issuer_topics.is_empty() {
-            "all issuers".to_string()
-        } else {
-            format!("{} issuer(s)", issuer_topics.len())
-        };
+        let sources = registry.admission.discovery_sources();
+        if sources.is_empty() {
+            return Err(anyhow!(
+                "pool discovery requires at least one trusted PERC20 or shield factory"
+            ));
+        }
         println!(
-            "[indexer] pool auto-discovery ON (Perc20Created, {scope}, poll {}s, from block {})",
-            cli.discover_poll_secs, cli.start_block
+            "[indexer] trusted factory discovery ON ({} factories, poll {}s, from block {})",
+            sources.len(),
+            cli.discover_poll_secs,
+            cli.start_block
         );
         tokio::spawn(pool_discovery_task(
             registry.clone(),
             rpc.clone(),
-            perc20_created_topic0(),
-            issuer_topics,
+            sources,
             cli.start_block,
             cli.discover_poll_secs,
         ));
@@ -1070,8 +1529,14 @@ async fn main() -> Result<()> {
                     CrankConfig {
                         signer: Arc::clone(s),
                         prover_url: cli.crank_prover_url.clone(),
+                        prover_api_token: cli.crank_prover_api_token.clone().unwrap_or_default(),
                         interval_secs: cli.crank_interval_secs,
                         gas_limit: cli.gas_limit_update_root,
+                        allowed_pools: parse_address_set(
+                            "PRIVACYBTC_INDEXER_CRANK_ALLOWED_POOLS",
+                            &cli.crank_allowed_pool,
+                        )?,
+                        max_tx_per_hour: cli.crank_max_tx_per_hour,
                     },
                 ));
             }
@@ -1111,11 +1576,33 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// topic0 of `Perc20Created(address,address,string,string,uint8)` (the pERC20
-/// asset-creation event), used to verify a runtime-registered pool is genuine.
-fn perc20_created_topic0() -> String {
-    let hash = Keccak256::digest(b"Perc20Created(address,address,string,string,uint8)");
+fn event_topic0(signature: &[u8]) -> String {
+    let hash = Keccak256::digest(signature);
     format!("0x{}", hex::encode(hash))
+}
+
+fn perc20_created_topic0() -> String {
+    event_topic0(b"Perc20Created(address,address,string,string,uint8)")
+}
+
+fn perc20_deployed_topic0() -> String {
+    event_topic0(b"Perc20Deployed(address,address)")
+}
+
+fn shield_pool_deployed_topic0() -> String {
+    event_topic0(b"ShieldPoolDeployed(address,address,address,uint256)")
+}
+
+fn eip1967_beacon_slot() -> [u8; 32] {
+    let mut slot: [u8; 32] = Keccak256::digest(b"eip1967.proxy.beacon").into();
+    for byte in slot.iter_mut().rev() {
+        if *byte > 0 {
+            *byte -= 1;
+            break;
+        }
+        *byte = 0xff;
+    }
+    slot
 }
 
 /// 20-byte address → 32-byte left-padded log topic (for indexed address filters).
@@ -1133,15 +1620,28 @@ fn topic_to_address(topic: &str) -> Option<String> {
     Some(format!("0x{}", &h[h.len() - 40..].to_lowercase()))
 }
 
-/// Background task: poll `Perc20Created` chain-wide and auto-register pools.
+fn factory_log_matches(log: &EthLog, factory: &str, topic0: &str, pool: &str) -> bool {
+    let topics = match log.topics.as_ref() {
+        Some(topics) => topics,
+        None => return false,
+    };
+    normalize_hex_0x(&log.address).to_lowercase() == normalize_hex_0x(factory).to_lowercase()
+        && topics.first().map(|v| v.to_lowercase()) == Some(topic0.to_lowercase())
+        && topics.get(1).map(|v| v.to_lowercase()) == Some(address_to_topic(pool))
+}
+
+fn beacon_words_match(factory_beacon: &[u8; 32], pool_slot: &[u8; 32]) -> bool {
+    factory_beacon[12..] == pool_slot[12..] && factory_beacon[12..].iter().any(|byte| *byte != 0)
+}
+
+/// Background task: poll deployment events emitted by explicitly trusted factories.
 /// Re-scans from `start_block` on boot; `add_pool` is idempotent so already-known
 /// pools are skipped. The cursor only advances past fully-scanned ranges, so a
 /// transient RPC error is retried on the next tick.
 async fn pool_discovery_task(
     reg: PoolRegistry,
     rpc: RpcClient,
-    topic0: String,
-    issuer_topics: Vec<String>,
+    sources: Vec<(String, String)>,
     start_block: u64,
     poll_secs: u64,
 ) {
@@ -1151,27 +1651,45 @@ async fn pool_discovery_task(
             let mut lo = from;
             while lo <= head {
                 let hi = getlogs_window_end(lo, head, rpc.getlogs_span());
-                match rpc.fetch_created_pools(lo, hi, &topic0, &issuer_topics).await {
-                    Ok(found) => {
+                let mut found = Vec::new();
+                let mut failed = None;
+                for (factory, topic0) in &sources {
+                    match rpc
+                        .fetch_factory_deployed_pools(lo, hi, factory, topic0)
+                        .await
+                    {
+                        Ok(mut pools) => found.append(&mut pools),
+                        Err(e) => {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                }
+                match failed {
+                    None => {
                         for (pool, block) in found {
-                            match reg.add_pool(&pool, block, false).await {
+                            match reg.add_admitted_pool(&pool, block, false).await {
                                 Ok(true) => {
-                                    println!("[indexer] auto-discovered pool {pool} (block {block})")
+                                    println!(
+                                        "[indexer] auto-discovered pool {pool} (block {block})"
+                                    )
                                 }
                                 Ok(false) => {}
                                 Err(e) => {
-                                    eprintln!("[indexer] auto-discover add_pool {pool} failed: {e:#}")
+                                    eprintln!(
+                                        "[indexer] auto-discover add_pool {pool} failed: {e:#}"
+                                    )
                                 }
                             }
                         }
                         lo = hi + 1;
                     }
-                    Err(e) if hi > lo && is_getlogs_range_error(&e) => {
+                    Some(e) if hi > lo && is_getlogs_range_error(&e) => {
                         // Window too large for this provider: shrink and retry
                         // the same offset within this tick.
                         rpc.shrink_getlogs_span(hi - lo + 1);
                     }
-                    Err(e) => {
+                    Some(e) => {
                         eprintln!("[indexer] discovery getLogs [{lo},{hi}] failed: {e:#}");
                         break; // leave `lo` here so we retry this range next tick
                     }
@@ -1199,8 +1717,47 @@ fn word_to_u64(w: &[u8; 32]) -> u64 {
 struct CrankConfig {
     signer: Arc<SignerConfig>,
     prover_url: String,
+    prover_api_token: String,
     interval_secs: u64,
     gas_limit: u64,
+    allowed_pools: HashSet<String>,
+    max_tx_per_hour: u64,
+}
+
+struct HourlyTxBudget {
+    limit: u64,
+    submitted_at: VecDeque<u64>,
+}
+
+impl HourlyTxBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            submitted_at: VecDeque::new(),
+        }
+    }
+
+    fn try_take(&mut self, now_seconds: u64) -> bool {
+        while self
+            .submitted_at
+            .front()
+            .is_some_and(|at| now_seconds.saturating_sub(*at) >= 3600)
+        {
+            self.submitted_at.pop_front();
+        }
+        if self.submitted_at.len() as u64 >= self.limit {
+            return false;
+        }
+        self.submitted_at.push_back(now_seconds);
+        true
+    }
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Permissionless batch-confirm crank. Every tick, for every pool:
@@ -1231,6 +1788,7 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
         .expect("reqwest client");
     // Confirmed-state frontier per pool (advanced only after an on-chain success).
     let mut frontiers: HashMap<String, FrontierTree> = HashMap::new();
+    let mut tx_budget = HourlyTxBudget::new(cfg.max_tx_per_hour);
 
     println!(
         "[crank] updateRoot crank ON (prover={}, interval={}s, account=0x{})",
@@ -1240,12 +1798,26 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
     );
 
     loop {
-        let pools: Vec<AppContext> = {
-            reg.pools.read().await.values().cloned().collect()
-        };
+        let pools: Vec<AppContext> = { reg.pools.read().await.values().cloned().collect() };
         for ctx in pools {
             let pool = ctx.contract_address.clone();
             let label = pool[..10.min(pool.len())].to_string();
+            if !cfg.allowed_pools.contains(&pool.to_lowercase()) {
+                continue;
+            }
+            match reg.verify_pool_current(&pool).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!("[crank][{label}] pool trust validation failed; refusing to sign");
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[crank][{label}] pool trust validation unavailable; refusing to sign: {e:#}"
+                    );
+                    continue;
+                }
+            }
 
             // 1. On-chain batch state. A revert/empty result ⇒ pre-batch
             //    implementation (or RPC hiccup) — skip quietly.
@@ -1258,7 +1830,16 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
             //    storage fields are zero until the one-time migration runs.
             if chain_root == [0u8; 32] {
                 println!("[crank][{label}] legacy pool detected — submitting syncBatchModel()");
-                match submit_crank_tx(&rpc, &cfg, &pool, &sel_sync, "syncBatchModel").await {
+                match submit_crank_tx(
+                    &rpc,
+                    &cfg,
+                    &mut tx_budget,
+                    &pool,
+                    &sel_sync,
+                    "syncBatchModel",
+                )
+                .await
+                {
                     Ok(true) => {}
                     Ok(false) => eprintln!("[crank][{label}] syncBatchModel reverted"),
                     Err(e) => eprintln!("[crank][{label}] syncBatchModel failed: {e:#}"),
@@ -1343,7 +1924,14 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
                 "[crank][{label}] confirming batch j={j} at count {chain_count} (chain pending {chain_pending})"
             );
 
-            let proof = match prove_cmxconfirm(&prover_http, &cfg.prover_url, &input).await {
+            let proof = match prove_cmxconfirm(
+                &prover_http,
+                &cfg.prover_url,
+                &cfg.prover_api_token,
+                &input,
+            )
+            .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("[crank][{label}] proof generation failed: {e:#}");
@@ -1356,7 +1944,8 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
                 j,
                 &proof,
             );
-            match submit_crank_tx(&rpc, &cfg, &pool, &calldata, "updateRoot").await {
+            match submit_crank_tx(&rpc, &cfg, &mut tx_budget, &pool, &calldata, "updateRoot").await
+            {
                 Ok(true) => {
                     println!(
                         "[crank][{label}] updateRoot confirmed: count {chain_count} → {} root={}",
@@ -1382,10 +1971,17 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
 async fn prove_cmxconfirm(
     http: &Client,
     prover_url: &str,
+    prover_api_token: &str,
     input: &privacy_core::commitment_tree::frontier::CmxConfirmWitnessInput,
 ) -> Result<Vec<u8>> {
     let url = format!("{}/cmxconfirm/prove", prover_url.trim_end_matches('/'));
-    let resp = http.post(&url).json(input).send().await.context("prover request")?;
+    let resp = http
+        .post(&url)
+        .bearer_auth(prover_api_token)
+        .json(input)
+        .send()
+        .await
+        .context("prover request")?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -1404,6 +2000,7 @@ async fn prove_cmxconfirm(
 async fn submit_crank_tx(
     rpc: &RpcClient,
     cfg: &CrankConfig,
+    budget: &mut HourlyTxBudget,
     pool: &str,
     calldata: &[u8],
     what: &str,
@@ -1414,6 +2011,12 @@ async fn submit_crank_tx(
     if let Err(e) = rpc.eth_call(pool, calldata, Some(&from_hex)).await {
         eprintln!("[crank] {what} simulation reverted: {e:#}");
         return Ok(false);
+    }
+    if !budget.try_take(unix_seconds()) {
+        return Err(anyhow!(
+            "hourly crank transaction budget exhausted (limit={})",
+            cfg.max_tx_per_hour
+        ));
     }
 
     let nonce = rpc.get_transaction_count(&from_hex).await?;
@@ -1445,9 +2048,8 @@ async fn submit_crank_tx(
 /// Same env as relayer: comma-separated origins in `PRIVACYBTC_CORS_ORIGINS`.
 /// Defaults to Vite dev server on localhost and 127.0.0.1.
 fn build_cors_layer() -> CorsLayer {
-    let origins_str = std::env::var("PRIVACYBTC_CORS_ORIGINS").unwrap_or_else(|_| {
-        "http://localhost:5173,http://127.0.0.1:5173".to_string()
-    });
+    let origins_str = std::env::var("PRIVACYBTC_CORS_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:5173,http://127.0.0.1:5173".to_string());
     let origins: Vec<axum::http::HeaderValue> = origins_str
         .split(',')
         .filter_map(|s| s.trim().parse().ok())
@@ -1458,7 +2060,10 @@ fn build_cors_layer() -> CorsLayer {
         .allow_headers(tower_http::cors::Any)
 }
 
-fn require_admin(headers: &HeaderMap, token: Option<&Arc<str>>) -> Result<(), (StatusCode, String)> {
+fn require_admin(
+    headers: &HeaderMap,
+    token: Option<&Arc<str>>,
+) -> Result<(), (StatusCode, String)> {
     let Some(expected) = token else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1508,13 +2113,18 @@ async fn get_pool_meta(
     Query(q): Query<PoolMetaQuery>,
 ) -> Result<Json<PoolMeta>, (StatusCode, String)> {
     if parse_address20(&q.pool).is_none() {
-        return Err((StatusCode::BAD_REQUEST, "pool must be a 20-byte hex address".to_owned()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "pool must be a 20-byte hex address".to_owned(),
+        ));
     }
     let key = normalize_hex_0x(&q.pool).to_lowercase();
-    reg.ensure_metadata(&key)
-        .await
-        .map(Json)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no metadata for pool {}", q.pool)))
+    reg.ensure_metadata(&key).await.map(Json).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("no metadata for pool {}", q.pool),
+        )
+    })
 }
 
 /// `GET /shield/stats[?pool=0x...]` — event-derived ERC20Shield accounting.
@@ -1568,29 +2178,32 @@ struct RegisterPoolRequest {
 
 /// `POST /pools` — register a pool at runtime. Idempotent: returns 201 when the
 /// pool is newly added and 200 when it was already being watched. Gated by
-/// on-chain verification that the address is a genuine pERC20 (it emitted
-/// `Perc20Created`); no shared secret is required.
+/// trusted-factory provenance or the explicit standalone allowlist, plus a
+/// pinned runtime codehash; no self-emitted event can grant admission.
 async fn register_pool(
     State(reg): State<PoolRegistry>,
     Json(req): Json<RegisterPoolRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    if !reg.allow_runtime_pool_registration {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "runtime pool registration is disabled".to_owned(),
+        ));
+    }
     if parse_address20(&req.contract_address).is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             "contract_address must be a 20-byte hex address".to_owned(),
         ));
     }
-    // The only gate for runtime registration: the address must be a genuine pERC20
-    // asset — it emitted `Perc20Created(self,…)` on-chain (factory-deployed or
-    // standalone, both conformant). This needs no shared secret, so the browser
-    // can register pools directly; verified addresses are cached.
     let addr_lc = normalize_hex_0x(&req.contract_address).to_lowercase();
-    match reg.verify_pool_genuine(&addr_lc).await {
+    match reg.verify_pool_admitted(&addr_lc).await {
         Ok(true) => {}
         Ok(false) => {
             return Err((
                 StatusCode::FORBIDDEN,
-                "address is not a pERC20 asset (no Perc20Created / ShieldPoolCreated event on-chain)".to_owned(),
+                "pool is not from a trusted factory/static allowlist or has an unapproved codehash"
+                    .to_owned(),
             ))
         }
         Err(e) => {
@@ -1601,11 +2214,20 @@ async fn register_pool(
         }
     }
     let added = reg
-        .add_pool(&req.contract_address, req.start_block, true)
+        .add_admitted_pool(&req.contract_address, req.start_block, true)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("add_pool failed: {e:#}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("add_pool failed: {e:#}"),
+            )
+        })?;
     let address = normalize_hex_0x(&req.contract_address);
-    let status = if added { StatusCode::CREATED } else { StatusCode::OK };
+    let status = if added {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
     Ok((
         status,
         Json(serde_json::json!({
@@ -1660,8 +2282,12 @@ async fn get_batches(
 async fn collect_batches_since(ctx: &AppContext, after: u64) -> Vec<BatchEnvelope> {
     let (ring, ring_front, latest_seq) = {
         let s = ctx.state.read().await;
-        let ring: Vec<BatchEnvelope> =
-            s.batches.iter().filter(|b| b.seq > after).cloned().collect();
+        let ring: Vec<BatchEnvelope> = s
+            .batches
+            .iter()
+            .filter(|b| b.seq > after)
+            .cloned()
+            .collect();
         (ring, s.batches.front().map(|b| b.seq), s.latest_seq)
     };
     // The ring covers (front..=latest); anything in (after..front) was evicted.
@@ -1670,7 +2296,9 @@ async fn collect_batches_since(ctx: &AppContext, after: u64) -> Vec<BatchEnvelop
         None if latest_seq > after => Some(u64::MAX),
         _ => None,
     };
-    let Some(before) = missing_before else { return ring };
+    let Some(before) = missing_before else {
+        return ring;
+    };
     let mut out = ctx
         .backend
         .load_archived_batches(&ctx.contract_address, after, before)
@@ -1691,7 +2319,8 @@ async fn get_batches_stream(
     State(reg): State<PoolRegistry>,
     Query(q): Query<BatchesQuery>,
     headers: HeaderMap,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)>
+{
     let ctx = reg.resolve(q.pool.as_deref()).await?;
 
     // Determine after_seq: Last-Event-ID (reconnect) takes priority over query param.
@@ -1724,8 +2353,7 @@ async fn get_batches_stream(
         .filter(move |b| futures_util::future::ready(b.seq > max_hist_seq))
         .map(to_event);
 
-    Ok(Sse::new(hist_stream.chain(live_stream))
-        .keep_alive(KeepAlive::default()))
+    Ok(Sse::new(hist_stream.chain(live_stream)).keep_alive(KeepAlive::default()))
 }
 
 async fn get_root(
@@ -1767,7 +2395,10 @@ async fn get_note(
             }
         }
     }
-    Err((StatusCode::NOT_FOUND, "cmx not found in indexer batches".to_owned()))
+    Err((
+        StatusCode::NOT_FOUND,
+        "cmx not found in indexer batches".to_owned(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1859,15 +2490,15 @@ fn classify_selector(input: &[u8]) -> Option<&'static str> {
         [0x04, 0x11, 0xcb, 0xab] => Some("shield"),
         [0x53, 0x64, 0x4c, 0x61] => Some("unshield"), // has a public `recipient`
         // Issuer pERC20 pools: create/destroy supply (no public recipient).
-        [0x12, 0x92, 0x3a, 0x62] => Some("mint"),     // mint(uint256,(bytes,uint256[3]))
-        [0xe7, 0x66, 0x0f, 0xf5] => Some("burn"),     // burn(uint256,(bytes,uint256[3]))
+        [0x12, 0x92, 0x3a, 0x62] => Some("mint"), // mint(uint256,(bytes,uint256[3]))
+        [0xe7, 0x66, 0x0f, 0xf5] => Some("burn"), // burn(uint256,(bytes,uint256[3]))
         [0xed, 0xa1, 0xa0, 0xac] => Some("transfer"),
         [0xc7, 0xb9, 0x21, 0xd3] => Some("transfer"),
-        [0xe3, 0xb9, 0x2d, 0xfd] => Some("swap"),     // initiateSwap (plan A: full callA in calldata)
-        [0x43, 0xfa, 0x07, 0x47] => Some("swap"),     // joinSwap (plan A: full callB in calldata)
-        [0x6d, 0xb7, 0x97, 0x4d] => Some("swap"),     // initiateSwap (legacy commit-only)
-        [0x8b, 0xbe, 0x82, 0x1a] => Some("swap"),     // joinSwap (legacy commit-only)
-        [0xc7, 0xec, 0xe1, 0x5f] => Some("swap"),     // settle
+        [0xe3, 0xb9, 0x2d, 0xfd] => Some("swap"), // initiateSwap (plan A: full callA in calldata)
+        [0x43, 0xfa, 0x07, 0x47] => Some("swap"), // joinSwap (plan A: full callB in calldata)
+        [0x6d, 0xb7, 0x97, 0x4d] => Some("swap"), // initiateSwap (legacy commit-only)
+        [0x8b, 0xbe, 0x82, 0x1a] => Some("swap"), // joinSwap (legacy commit-only)
+        [0xc7, 0xec, 0xe1, 0x5f] => Some("swap"), // settle
         _ => None,
     }
 }
@@ -1909,7 +2540,12 @@ fn parse_tx_meta(input: &[u8]) -> TxMeta {
         None
     };
     // `sender` is filled by the resolver (it needs the tx's `from`, not the calldata).
-    TxMeta { op, amount_hex, recipient, sender: None }
+    TxMeta {
+        op,
+        amount_hex,
+        recipient,
+        sender: None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2038,7 +2674,12 @@ async fn get_txs(
             if s.batches.front().map(|b| b.seq).unwrap_or(1) > 1 {
                 ring_has_older = true;
                 // This pool's ring-floor block = its oldest retained note's block.
-                if let Some(fb) = s.batches.front().and_then(|b| b.batch.abi_notes.first()).map(|n| n.block_number) {
+                if let Some(fb) = s
+                    .batches
+                    .front()
+                    .and_then(|b| b.batch.abi_notes.first())
+                    .map(|n| n.block_number)
+                {
                     ring_cutoff = Some(ring_cutoff.map_or(fb, |c| c.max(fb)));
                 }
             }
@@ -2144,7 +2785,12 @@ async fn get_txs(
     let mut pool_meta: HashMap<String, PoolMeta> = HashMap::new();
     let all_pools: HashSet<String> = items
         .iter()
-        .flat_map(|t| t.notes.iter().map(|n| n.pool.clone()).chain([t.pool_address.clone()]))
+        .flat_map(|t| {
+            t.notes
+                .iter()
+                .map(|n| n.pool.clone())
+                .chain([t.pool_address.clone()])
+        })
         .collect();
     for pool in all_pools {
         if let Some(meta) = reg.ensure_metadata(&pool).await {
@@ -2171,7 +2817,10 @@ async fn get_txs(
         }
     }
 
-    Ok(Json(TxsListResponse { items, next_before_block }))
+    Ok(Json(TxsListResponse {
+        items,
+        next_before_block,
+    }))
 }
 
 // ─── Swap plan A: on-chain leg lookup (calldata is the canonical DA source) ───
@@ -2258,7 +2907,12 @@ async fn get_swap_leg(
     let input = rpc
         .get_transaction_input(&tx_hash)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("eth_getTransactionByHash: {e:#}")))?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("eth_getTransactionByHash: {e:#}"),
+            )
+        })?
         .ok_or((StatusCode::NOT_FOUND, "transaction not found".to_owned()))?;
     if input.len() < 4 {
         return Err((StatusCode::BAD_REQUEST, "tx input too short".to_owned()));
@@ -2266,8 +2920,12 @@ async fn get_swap_leg(
 
     let mut out = serde_json::json!({ "tx_hash": tx_hash });
     if input[..4] == swap_initiate_selector() {
-        let d = decode_swap_initiate_calldata(&input)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("initiate calldata decode: {e}")))?;
+        let d = decode_swap_initiate_calldata(&input).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("initiate calldata decode: {e}"),
+            )
+        })?;
         out["kind"] = "initiate".into();
         out["pool_a"] = hex20_0x(&d.pool_a).into();
         out["pool_b"] = hex20_0x(&d.pool_b).into();
@@ -2278,8 +2936,12 @@ async fn get_swap_leg(
         out["commit_a"] = hex32_0x(&d.commit_a()).into();
         out["call_a"] = serde_json::to_value(swap_call_json(&d.call_a)).unwrap_or_default();
     } else if input[..4] == swap_join_selector() {
-        let d = decode_swap_join_calldata(&input)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("join calldata decode: {e}")))?;
+        let d = decode_swap_join_calldata(&input).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("join calldata decode: {e}"),
+            )
+        })?;
         out["kind"] = "join".into();
         out["swap_id_calldata"] = hex32_0x(&d.swap_id).into();
         out["commit_b"] = hex32_0x(&d.commit_b()).into();
@@ -2295,7 +2957,12 @@ async fn get_swap_leg(
     let receipt = rpc
         .get_transaction_receipt_logs(&tx_hash)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("eth_getTransactionReceipt: {e:#}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("eth_getTransactionReceipt: {e:#}"),
+            )
+        })?;
     match receipt {
         Some((success, logs)) => {
             out["mined"] = true.into();
@@ -2366,7 +3033,10 @@ async fn get_swap(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("eth_getLogs: {e:#}")))?;
     if logs.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "no events for this swap id".to_owned()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no events for this swap id".to_owned(),
+        ));
     }
     logs.sort_by_key(|l| {
         (
@@ -2388,7 +3058,9 @@ async fn get_swap(
     let mut initiate_tx: Option<String> = None;
     let mut join_tx: Option<String> = None;
     for log in &logs {
-        let Some(t0) = log.topics.as_ref().and_then(|t| t.first()) else { continue };
+        let Some(t0) = log.topics.as_ref().and_then(|t| t.first()) else {
+            continue;
+        };
         let t0 = t0.to_lowercase();
         let tx = normalize_hex_0x(&log.transaction_hash).to_lowercase();
         let data = &log.data;
@@ -2480,7 +3152,12 @@ async fn get_merkle_path(
 
     s.tree
         .merkle_path_at(position, s.confirmed_count)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "merkle path not available for this position".to_owned()))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "merkle path not available for this position".to_owned(),
+            )
+        })
         .map(Json)
 }
 
@@ -2528,11 +3205,17 @@ async fn get_frozen_witness(
     let cmx_be = parse_hex32(&q.cmx)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx hex".to_owned()))?;
     let cmx = fr_from_be_bytes(&cmx_be).ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "cmx is not a canonical field element".to_owned())
+        (
+            StatusCode::BAD_REQUEST,
+            "cmx is not a canonical field element".to_owned(),
+        )
     })?;
     let s = ctx.state.read().await;
     let w = s.frozen.non_membership_witness(cmx).ok_or_else(|| {
-        (StatusCode::CONFLICT, "cmx is frozen; no non-membership witness".to_owned())
+        (
+            StatusCode::CONFLICT,
+            "cmx is frozen; no non-membership witness".to_owned(),
+        )
     })?;
     Ok(Json(FrozenWitnessResponse {
         low_val: fr_to_le_hex(w.low_val),
@@ -2562,7 +3245,10 @@ async fn post_frozen(
     let cmx_be = parse_hex32(&req.cmx_hex)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx_hex".to_owned()))?;
     let cmx = fr_from_be_bytes(&cmx_be).ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "cmx is not a canonical field element".to_owned())
+        (
+            StatusCode::BAD_REQUEST,
+            "cmx is not a canonical field element".to_owned(),
+        )
     })?;
     let resp = {
         let mut s = ctx.state.write().await;
@@ -2585,8 +3271,12 @@ async fn post_confirm(
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let cmx = parse_hex32(&req.cmx_hex)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx_hex".to_owned()))?;
-    let ack_preimage = parse_hex32(&req.ack_preimage_hex)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid ack_preimage_hex".to_owned()))?;
+    let ack_preimage = parse_hex32(&req.ack_preimage_hex).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid ack_preimage_hex".to_owned(),
+        )
+    })?;
     let new_root = parse_hex32(&req.new_root_hex)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid new_root_hex".to_owned()))?;
 
@@ -2600,7 +3290,10 @@ async fn post_confirm(
 
         let computed_hash: [u8; 32] = Keccak256::digest(ack_preimage).into();
         if computed_hash != pending.ack_hash {
-            return Err((StatusCode::FORBIDDEN, "ack_preimage does not match ack_hash".to_owned()));
+            return Err((
+                StatusCode::FORBIDDEN,
+                "ack_preimage does not match ack_hash".to_owned(),
+            ));
         }
     }
 
@@ -2610,7 +3303,8 @@ async fn post_confirm(
     let signer = ctx.signer.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "indexer has no --signer-key configured; cannot relay confirmReceipt on-chain".to_owned(),
+            "indexer has no --signer-key configured; cannot relay confirmReceipt on-chain"
+                .to_owned(),
         )
     })?;
 
@@ -2670,7 +3364,10 @@ async fn post_notify_tx(
             s.pending_tx_hashes.pop_front();
         }
     }
-    println!("[indexer] notify_tx queued: {tx_hash} (pending={} hashes)", s.pending_tx_hashes.len());
+    println!(
+        "[indexer] notify_tx queued: {tx_hash} (pending={} hashes)",
+        s.pending_tx_hashes.len()
+    );
     // Persist immediately so the queue survives a restart.
     ctx.persist.notify(&s);
     drop(s);
@@ -2736,16 +3433,15 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                         Some(arr)
                     })
                     .collect();
-                let active_root: Option<[u8; 32]> =
-                    ck.active_root_hex.as_deref().and_then(|h| {
-                        let bytes = hex::decode(h.trim_start_matches("0x")).ok()?;
-                        if bytes.len() != 32 {
-                            return None;
-                        }
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&bytes);
-                        Some(arr)
-                    });
+                let active_root: Option<[u8; 32]> = ck.active_root_hex.as_deref().and_then(|h| {
+                    let bytes = hex::decode(h.trim_start_matches("0x")).ok()?;
+                    if bytes.len() != 32 {
+                        return None;
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    Some(arr)
+                });
                 println!(
                     "[indexer] resumed from checkpoint {path}: next_block={resumed}, leaves={}",
                     cmx_ordered.len()
@@ -2765,7 +3461,16 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                         Some(arr)
                     })
                     .collect();
-                CheckpointData { next_block: resumed, cmx_ordered, active_root, latest_seq: ck.latest_seq, batches, pending_tx_hashes, frozen_cmx, shield_accounting: ck.shield_accounting }
+                CheckpointData {
+                    next_block: resumed,
+                    cmx_ordered,
+                    active_root,
+                    latest_seq: ck.latest_seq,
+                    batches,
+                    pending_tx_hashes,
+                    frozen_cmx,
+                    shield_accounting: ck.shield_accounting,
+                }
             }
             Err(e) => {
                 eprintln!(
@@ -2850,7 +3555,12 @@ impl CheckpointSnapshot {
             latest_seq: s.latest_seq,
             batches: s.batches.iter().cloned().collect(),
             pending_tx_hashes: s.pending_tx_hashes.iter().cloned().collect(),
-            frozen_cmx: s.frozen.frozen_values().into_iter().map(fr_to_be_bytes).collect(),
+            frozen_cmx: s
+                .frozen
+                .frozen_values()
+                .into_iter()
+                .map(fr_to_be_bytes)
+                .collect(),
             shield_accounting: s.shield_accounting,
         }
     }
@@ -2932,7 +3642,9 @@ impl StateBackend {
                 let mut seen: HashSet<u64> = HashSet::new();
                 for line in raw.lines() {
                     // Tolerate a torn final line from a crash mid-append.
-                    let Ok(env) = serde_json::from_str::<BatchEnvelope>(line) else { continue };
+                    let Ok(env) = serde_json::from_str::<BatchEnvelope>(line) else {
+                        continue;
+                    };
                     if env.seq > after_seq && env.seq < before_seq && seen.insert(env.seq) {
                         out.push(env);
                     }
@@ -2943,20 +3655,20 @@ impl StateBackend {
             StateBackend::Json(None) => Vec::new(),
             StateBackend::Pgsql(pool) => {
                 type NoteRow = (
-                    String,          // cmx_hex
-                    i64,             // seq
-                    i64,             // block_number
-                    String,          // tx_hash
-                    i64,             // log_index
-                    Option<i64>,     // position
-                    String,          // enc_ciphertext_hex
-                    String,          // epk_hex
-                    String,          // out_ciphertext_hex
-                    Option<String>,  // cv_net_x_hex
-                    String,          // nf_old_hex
-                    String,          // ack_hash_hex
-                    Option<i64>,     // shield_amount_sats
-                    bool,            // is_confirmed
+                    String,         // cmx_hex
+                    i64,            // seq
+                    i64,            // block_number
+                    String,         // tx_hash
+                    i64,            // log_index
+                    Option<i64>,    // position
+                    String,         // enc_ciphertext_hex
+                    String,         // epk_hex
+                    String,         // out_ciphertext_hex
+                    Option<String>, // cv_net_x_hex
+                    String,         // nf_old_hex
+                    String,         // ack_hash_hex
+                    Option<i64>,    // shield_amount_sats
+                    bool,           // is_confirmed
                 );
                 let rows: Vec<NoteRow> = sqlx::query_as(
                     "SELECT cmx_hex, seq, block_number, tx_hash, log_index, position, \
@@ -2974,8 +3686,20 @@ impl StateBackend {
                 rows.into_iter()
                     .filter_map(|r| {
                         let (
-                            cmx_hex, seq, block_number, tx_hash, log_index, position,
-                            enc_hex, epk_hex, out_hex, cv_hex, nf_hex, ack_hex, shield, confirmed,
+                            cmx_hex,
+                            seq,
+                            block_number,
+                            tx_hash,
+                            log_index,
+                            position,
+                            enc_hex,
+                            epk_hex,
+                            out_hex,
+                            cv_hex,
+                            nf_hex,
+                            ack_hex,
+                            shield,
+                            confirmed,
                         ) = r;
                         let note = OrchardIndexedAbiNote {
                             block_number: block_number as u64,
@@ -3020,8 +3744,14 @@ impl StateBackend {
         match self {
             StateBackend::Json(Some(path)) => {
                 save_checkpoint(
-                    path, snap.next_block, &snap.cmx_ordered, snap.active_root,
-                    snap.latest_seq, &snap.batches, &snap.pending_tx_hashes, &snap.frozen_cmx,
+                    path,
+                    snap.next_block,
+                    &snap.cmx_ordered,
+                    snap.active_root,
+                    snap.latest_seq,
+                    &snap.batches,
+                    &snap.pending_tx_hashes,
+                    &snap.frozen_cmx,
                     snap.shield_accounting,
                 );
                 Ok(())
@@ -3054,7 +3784,9 @@ struct Persist {
 
 impl Persist {
     fn notify(&self, s: &SharedState) {
-        let _ = self.tx.send(std::sync::Arc::new(CheckpointSnapshot::from_state(s)));
+        let _ = self
+            .tx
+            .send(std::sync::Arc::new(CheckpointSnapshot::from_state(s)));
     }
     /// Persist an already-built snapshot (for sites that dropped the lock first).
     fn notify_owned(&self, snap: CheckpointSnapshot) {
@@ -3120,8 +3852,12 @@ async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnaps
             "INSERT INTO cmx_leaves (pool_address, position, cmx_hex) VALUES ($1,$2,$3) \
              ON CONFLICT (pool_address, position) DO NOTHING",
         )
-        .bind(pool_address).bind(pos as i64).bind(hex::encode(cmx))
-        .execute(&mut *tx).await.context("insert cmx_leaves")?;
+        .bind(pool_address)
+        .bind(pos as i64)
+        .bind(hex::encode(cmx))
+        .execute(&mut *tx)
+        .await
+        .context("insert cmx_leaves")?;
     }
 
     // Frozen-set leaves (append-only, insertion order) — mirrors cmx_leaves so the
@@ -3131,8 +3867,12 @@ async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnaps
             "INSERT INTO frozen_cmx (pool_address, position, cmx_hex) VALUES ($1,$2,$3) \
              ON CONFLICT (pool_address, position) DO NOTHING",
         )
-        .bind(pool_address).bind(pos as i64).bind(hex::encode(cmx))
-        .execute(&mut *tx).await.context("insert frozen_cmx")?;
+        .bind(pool_address)
+        .bind(pos as i64)
+        .bind(hex::encode(cmx))
+        .execute(&mut *tx)
+        .await
+        .context("insert frozen_cmx")?;
     }
 
     for env in &snap.batches {
@@ -3153,15 +3893,26 @@ async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnaps
                 .bind(hex::encode(n.ack_hash))
                 .bind(n.shield_amount_sats.map(|v| v as i64))
                 .bind(n.is_confirmed)
-                .execute(&mut *tx).await.context("upsert notes")?;
+                .execute(&mut *tx)
+                .await
+                .context("upsert notes")?;
         }
     }
 
     sqlx::query("DELETE FROM pending_tx WHERE pool_address=$1")
-        .bind(pool_address).execute(&mut *tx).await.context("clear pending_tx")?;
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear pending_tx")?;
     for h in &snap.pending_tx_hashes {
-        sqlx::query("INSERT INTO pending_tx (pool_address, tx_hash) VALUES ($1,$2) ON CONFLICT DO NOTHING")
-            .bind(pool_address).bind(h).execute(&mut *tx).await.context("insert pending_tx")?;
+        sqlx::query(
+            "INSERT INTO pending_tx (pool_address, tx_hash) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+        )
+        .bind(pool_address)
+        .bind(h)
+        .execute(&mut *tx)
+        .await
+        .context("insert pending_tx")?;
     }
 
     sqlx::query(
@@ -3186,29 +3937,47 @@ async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnaps
 /// empty: `backfill_from_chain` rebuilds them (and the tree) from chain on startup, then
 /// persistence re-populates the `notes` table.
 async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> CheckpointData {
-    let meta: Option<(i64, Option<String>, i64)> =
-        sqlx::query_as("SELECT next_block, active_root_hex, latest_seq FROM indexer_meta WHERE pool_address=$1")
-            .bind(pool_address).fetch_optional(pool).await.ok().flatten();
-    let (nb, active_root_hex, latest_seq) =
-        meta.map(|(n, a, l)| (n as u64, a, l as u64)).unwrap_or((start_block, None, 0));
+    let meta: Option<(i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT next_block, active_root_hex, latest_seq FROM indexer_meta WHERE pool_address=$1",
+    )
+    .bind(pool_address)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let (nb, active_root_hex, latest_seq) = meta
+        .map(|(n, a, l)| (n as u64, a, l as u64))
+        .unwrap_or((start_block, None, 0));
     let next_block = nb.max(start_block);
     let active_root = active_root_hex.as_deref().and_then(parse_hex32);
 
     let leaf_rows: Vec<(String,)> =
         sqlx::query_as("SELECT cmx_hex FROM cmx_leaves WHERE pool_address=$1 ORDER BY position")
-            .bind(pool_address).fetch_all(pool).await.unwrap_or_default();
+            .bind(pool_address)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
     let cmx_ordered: Vec<[u8; 32]> = leaf_rows.iter().filter_map(|(h,)| parse_hex32(h)).collect();
 
     let pend_rows: Vec<(String,)> =
         sqlx::query_as("SELECT tx_hash FROM pending_tx WHERE pool_address=$1")
-            .bind(pool_address).fetch_all(pool).await.unwrap_or_default();
+            .bind(pool_address)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
     let pending_tx_hashes: VecDeque<String> = pend_rows.into_iter().map(|(h,)| h).collect();
 
     // Frozen-set leaves in insertion order → replayed to rebuild the FrozenImt.
     let frozen_rows: Vec<(String,)> =
         sqlx::query_as("SELECT cmx_hex FROM frozen_cmx WHERE pool_address=$1 ORDER BY position")
-            .bind(pool_address).fetch_all(pool).await.unwrap_or_default();
-    let frozen_cmx: Vec<[u8; 32]> = frozen_rows.iter().filter_map(|(h,)| parse_hex32(h)).collect();
+            .bind(pool_address)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    let frozen_cmx: Vec<[u8; 32]> = frozen_rows
+        .iter()
+        .filter_map(|(h,)| parse_hex32(h))
+        .collect();
 
     let stats_row: Option<(String, String, String, String)> =
         sqlx::query_as(
@@ -3234,7 +4003,16 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
         &pool_address[..10.min(pool_address.len())], cmx_ordered.len(), pending_tx_hashes.len(), frozen_cmx.len(),
         shield_accounting.total_shielded_units, shield_accounting.total_unshielded_units
     );
-    CheckpointData { next_block, cmx_ordered, active_root, latest_seq, batches: VecDeque::new(), pending_tx_hashes, frozen_cmx, shield_accounting }
+    CheckpointData {
+        next_block,
+        cmx_ordered,
+        active_root,
+        latest_seq,
+        batches: VecDeque::new(),
+        pending_tx_hashes,
+        frozen_cmx,
+        shield_accounting,
+    }
 }
 
 /// Load `out_ciphertext` + `cv_net_x` for one action from the tx `bundle()` calldata.
@@ -3262,10 +4040,7 @@ async fn lookup_bundle_out_fields(
         }
     }
     if let Some(entry) = cache.get(&key).and_then(|m| m.get(&cmx)) {
-        (
-            entry.out_ciphertext.clone(),
-            Some(entry.cv_net_x),
-        )
+        (entry.out_ciphertext.clone(), Some(entry.cv_net_x))
     } else {
         (Vec::new(), None)
     }
@@ -3363,7 +4138,10 @@ async fn backfill_from_chain(ctx: &PollContext) {
     // stale envelopes under re-issued seqs.
     ctx.backend.reset_archive();
 
-    println!("[indexer][{label}] backfill: scanning logs [{}, {head}]…", ctx.start_block);
+    println!(
+        "[indexer][{label}] backfill: scanning logs [{}, {head}]…",
+        ctx.start_block
+    );
     let mut from = ctx.start_block;
     let mut total = 0usize;
     while from <= head {
@@ -3627,7 +4405,9 @@ async fn run_event_loop(ctx: PollContext) -> Result<()> {
                 // getLogs replay) instead of running the incremental catchup.
                 let dirty = { ctx_catchup.shared.read().await.tree_out_of_order };
                 if dirty {
-                    eprintln!("[indexer] commitment tree flagged out-of-order — rebuilding from chain");
+                    eprintln!(
+                        "[indexer] commitment tree flagged out-of-order — rebuilding from chain"
+                    );
                     backfill_from_chain(&ctx_catchup).await;
                 } else {
                     catchup_from_chain(&ctx_catchup).await;
@@ -3669,7 +4449,11 @@ async fn recover_pending_txs(ctx: &PollContext) {
     if hashes.is_empty() {
         return;
     }
-    println!("[indexer][{}] recovering {} pending tx(s)…", &ctx.contract_address[..10], hashes.len());
+    println!(
+        "[indexer][{}] recovering {} pending tx(s)…",
+        &ctx.contract_address[..10],
+        hashes.len()
+    );
     for tx_hash in hashes {
         match ctx.rpc.get_transaction_receipt_logs(&tx_hash).await {
             Ok(Some((success, logs))) => {
@@ -3713,7 +4497,11 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
     let (mut ws, _) = connect_async(&ctx.wss_url)
         .await
         .with_context(|| format!("WebSocket connect failed: {}", ctx.wss_url))?;
-    println!("[indexer][{}] WebSocket connected: {}", &ctx.contract_address[..10], ctx.wss_url);
+    println!(
+        "[indexer][{}] WebSocket connected: {}",
+        &ctx.contract_address[..10],
+        ctx.wss_url
+    );
 
     // Build topic0 OR list for subscription filter.
     let mut topics: Vec<String> = Vec::new();
@@ -3740,7 +4528,8 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
             "topics": [topics]
         }]
     });
-    ws.send(Message::Text(sub_req.to_string().into())).await
+    ws.send(Message::Text(sub_req.to_string().into()))
+        .await
         .context("failed to send eth_subscribe")?;
 
     // Expect subscription confirmation — with timeout to avoid hanging forever.
@@ -3748,17 +4537,22 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(txt))) => {
-                    let v: serde_json::Value = serde_json::from_str(&txt)
-                        .context("invalid JSON from WebSocket")?;
+                    let v: serde_json::Value =
+                        serde_json::from_str(&txt).context("invalid JSON from WebSocket")?;
                     if v.get("id") == Some(&serde_json::Value::Number(1.into())) {
                         if let Some(id) = v["result"].as_str() {
-                            println!("[indexer][{}] subscribed id={id}", &ctx.contract_address[..10]);
+                            println!(
+                                "[indexer][{}] subscribed id={id}",
+                                &ctx.contract_address[..10]
+                            );
                             return Ok::<_, anyhow::Error>(id.to_string());
                         }
                         return Err(anyhow!("eth_subscribe error: {}", v["error"]));
                     }
                 }
-                Some(Ok(Message::Ping(d))) => { ws.send(Message::Pong(d)).await.ok(); }
+                Some(Ok(Message::Ping(d))) => {
+                    ws.send(Message::Pong(d)).await.ok();
+                }
                 Some(Err(e)) => return Err(e.into()),
                 None => return Err(anyhow!("WebSocket closed before subscription confirmed")),
                 _ => {}
@@ -3768,7 +4562,10 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
     .await
     .context("eth_subscribe timed out after 15s")??;
 
-    println!("[indexer][{}] listening for events (sub={sub_id})", &ctx.contract_address[..10]);
+    println!(
+        "[indexer][{}] listening for events (sub={sub_id})",
+        &ctx.contract_address[..10]
+    );
 
     // Process incoming events.
     while let Some(msg) = ws.next().await {
@@ -3776,10 +4573,17 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
             Ok(Message::Text(txt)) => {
                 let v: serde_json::Value = match serde_json::from_str(&txt) {
                     Ok(v) => v,
-                    Err(e) => { eprintln!("[indexer] JSON parse error: {e}"); continue; }
+                    Err(e) => {
+                        eprintln!("[indexer] JSON parse error: {e}");
+                        continue;
+                    }
                 };
-                if v["method"].as_str() != Some("eth_subscription") { continue; }
-                if v["params"]["subscription"].as_str() != Some(&sub_id) { continue; }
+                if v["method"].as_str() != Some("eth_subscription") {
+                    continue;
+                }
+                if v["params"]["subscription"].as_str() != Some(&sub_id) {
+                    continue;
+                }
                 let log_val = &v["params"]["result"];
                 if let Ok(log) = serde_json::from_value::<EthLog>(log_val.clone()) {
                     if let Err(e) = ingest_ws_log(ctx, log).await {
@@ -3787,9 +4591,14 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
                     }
                 }
             }
-            Ok(Message::Ping(d)) => { ws.send(Message::Pong(d)).await.ok(); }
+            Ok(Message::Ping(d)) => {
+                ws.send(Message::Pong(d)).await.ok();
+            }
             Ok(Message::Close(_)) => {
-                println!("[indexer][{}] WebSocket closed by server", &ctx.contract_address[..10]);
+                println!(
+                    "[indexer][{}] WebSocket closed by server",
+                    &ctx.contract_address[..10]
+                );
                 return Err(anyhow!("server closed connection"));
             }
             Err(e) => return Err(e.into()),
@@ -3815,7 +4624,10 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
     // the other pool's events, corrupting the local Merkle tree and producing
     // expensive spurious Poseidon hash computations in debug builds.
     let log_addr = log.address.trim_start_matches("0x").to_ascii_lowercase();
-    let pool_addr = ctx.contract_address.trim_start_matches("0x").to_ascii_lowercase();
+    let pool_addr = ctx
+        .contract_address
+        .trim_start_matches("0x")
+        .to_ascii_lowercase();
     if !log_addr.is_empty() && log_addr != pool_addr {
         return Ok(());
     }
@@ -3835,7 +4647,11 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         .with_context(|| format!("invalid blockNumber: {}", log.block_number))?;
     let log_index = parse_hex_u64(&log.log_index)
         .with_context(|| format!("invalid logIndex: {}", log.log_index))?;
-    let t0 = log.topics.as_ref().and_then(|x| x.first()).map(|s| norm_topic(s));
+    let t0 = log
+        .topics
+        .as_ref()
+        .and_then(|x| x.first())
+        .map(|s| norm_topic(s));
 
     let mut state = ctx.shared.write().await;
 
@@ -3845,12 +4661,20 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
     // later events (the tx is gone from pending when recover_pending_txs runs).
     // Only recover_pending_txs (which fetches the full receipt) removes from queue.
 
-    if na_topics.iter().any(|na| t0.as_deref() == Some(na.as_str())) {
+    if na_topics
+        .iter()
+        .any(|na| t0.as_deref() == Some(na.as_str()))
+    {
         // ── NoteAdded ────────────────────────────────────────────────────────
-        if state.seen_event_ids.contains(&event_id) { return Ok(()); }
+        if state.seen_event_ids.contains(&event_id) {
+            return Ok(());
+        }
         let d = match decode_note_added_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
             Ok(d) => d,
-            Err(e) => { eprintln!("[indexer] NoteAdded decode FAILED: {e}"); return Ok(()); }
+            Err(e) => {
+                eprintln!("[indexer] NoteAdded decode FAILED: {e}");
+                return Ok(());
+            }
         };
         // Monotonicity guard: an append-only tree must receive leaves in exact
         // (block, log_index) order. If this leaf is OLDER than the newest one
@@ -3883,17 +4707,18 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         state.seen_event_ids.insert(event_id);
         let is_confirmed = state.confirmed_cmx.contains(&d.cmx);
         const OUT_LEN: usize = 80;
-        let (out_ciphertext, cv_net_x) = if d.out_ciphertext.len() == OUT_LEN && d.cv_net_x.is_some() {
-            (d.out_ciphertext, d.cv_net_x)
-        } else {
-            lookup_bundle_out_fields(
-                &ctx.rpc,
-                &mut state.bundle_out_cache,
-                &log.transaction_hash,
-                d.cmx,
-            )
-            .await
-        };
+        let (out_ciphertext, cv_net_x) =
+            if d.out_ciphertext.len() == OUT_LEN && d.cv_net_x.is_some() {
+                (d.out_ciphertext, d.cv_net_x)
+            } else {
+                lookup_bundle_out_fields(
+                    &ctx.rpc,
+                    &mut state.bundle_out_cache,
+                    &log.transaction_hash,
+                    d.cmx,
+                )
+                .await
+            };
         let note = OrchardIndexedAbiNote {
             block_number,
             tx_hash: log.transaction_hash.clone(),
@@ -3918,9 +4743,15 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             bundles: vec![],
             latest_root: state.tree.latest_root(),
         };
-        let envelope = BatchEnvelope { seq, pool_address: Some(ctx.contract_address.clone()), batch };
+        let envelope = BatchEnvelope {
+            seq,
+            pool_address: Some(ctx.contract_address.clone()),
+            batch,
+        };
         state.batches.push_back(envelope.clone());
-        while state.batches.len() > state.max_batches { state.batches.pop_front(); }
+        while state.batches.len() > state.max_batches {
+            state.batches.pop_front();
+        }
         // Advance the cursor only TO this block, never past it: this log alone
         // does not prove the rest of the block's logs were ingested (getLogs
         // can lag the WS push), so the block must stay inside the replay
@@ -3932,8 +4763,12 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         let seq_snap = state.latest_seq;
         let batches_snap: Vec<BatchEnvelope> = state.batches.iter().cloned().collect();
         let pending_snap: Vec<String> = state.pending_tx_hashes.iter().cloned().collect();
-        let frozen_snap: Vec<[u8; 32]> =
-            state.frozen.frozen_values().into_iter().map(fr_to_be_bytes).collect();
+        let frozen_snap: Vec<[u8; 32]> = state
+            .frozen
+            .frozen_values()
+            .into_iter()
+            .map(fr_to_be_bytes)
+            .collect();
         let accounting_snap = state.shield_accounting;
         drop(state);
         ctx.backend.archive_batch(&envelope);
@@ -3948,10 +4783,11 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             frozen_cmx: frozen_snap,
             shield_accounting: accounting_snap,
         });
-
     } else if t0.as_deref() == Some(nc.as_str()) {
         // ── NoteConfirmed ────────────────────────────────────────────────────
-        if !state.confirm_seen_ids.insert(event_id) { return Ok(()); }
+        if !state.confirm_seen_ids.insert(event_id) {
+            return Ok(());
+        }
         if let Ok((cmx, new_root, position)) =
             decode_note_confirmed_log(log.topics.as_deref().unwrap_or(&[]), &log.data)
         {
@@ -3963,17 +4799,27 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
 
             // Find the shield/transfer note in batches history and mark it confirmed.
             let maybe_note: Option<OrchardIndexedAbiNote> = {
-                let found = state.batches.iter().rev()
+                let found = state
+                    .batches
+                    .iter()
+                    .rev()
                     .flat_map(|env| env.batch.abi_notes.iter())
                     .find(|n| n.cmx == cmx)
                     .cloned();
                 if let Some(mut note) = found {
                     note.is_confirmed = true;
                     note.cmx_position = Some(position);
-                    println!("[indexer] note confirmed: cmx={} pos={}", hex::encode(cmx), position);
+                    println!(
+                        "[indexer] note confirmed: cmx={} pos={}",
+                        hex::encode(cmx),
+                        position
+                    );
                     Some(note)
                 } else {
-                    println!("[indexer] NoteConfirmed cmx={} not found in batches, skipping re-emit", hex::encode(cmx));
+                    println!(
+                        "[indexer] NoteConfirmed cmx={} not found in batches, skipping re-emit",
+                        hex::encode(cmx)
+                    );
                     None
                 }
             };
@@ -3991,17 +4837,27 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                     bundles: vec![],
                     latest_root: state.tree.latest_root(),
                 };
-                let envelope = BatchEnvelope { seq, pool_address: Some(ctx.contract_address.clone()), batch };
+                let envelope = BatchEnvelope {
+                    seq,
+                    pool_address: Some(ctx.contract_address.clone()),
+                    batch,
+                };
                 state.batches.push_back(envelope.clone());
-                while state.batches.len() > state.max_batches { state.batches.pop_front(); }
+                while state.batches.len() > state.max_batches {
+                    state.batches.pop_front();
+                }
                 let cmx_snap = state.cmx_ordered.clone();
                 let root_snap = state.active_root;
-                let seq_snap  = state.latest_seq;
+                let seq_snap = state.latest_seq;
                 let next_block = state.next_block;
                 let batches_snap: Vec<BatchEnvelope> = state.batches.iter().cloned().collect();
                 let pending_snap: Vec<String> = state.pending_tx_hashes.iter().cloned().collect();
-                let frozen_snap: Vec<[u8; 32]> =
-                    state.frozen.frozen_values().into_iter().map(fr_to_be_bytes).collect();
+                let frozen_snap: Vec<[u8; 32]> = state
+                    .frozen
+                    .frozen_values()
+                    .into_iter()
+                    .map(fr_to_be_bytes)
+                    .collect();
                 let accounting_snap = state.shield_accounting;
                 drop(state);
                 ctx.backend.archive_batch(&envelope);
@@ -4019,35 +4875,43 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 return Ok(());
             }
         }
-
     } else if t0.as_deref() == Some(ru.as_str()) {
         // ── RootUpdated (batch confirm) ──────────────────────────────────────
         // One verified `updateRoot` batch: authoritative watermark advance. The
         // per-note NoteConfirmed events of the same tx also advance it; this
         // branch makes the watermark robust if any of them fails to decode.
-        if !state.confirm_seen_ids.insert(event_id) { return Ok(()); }
+        if !state.confirm_seen_ids.insert(event_id) {
+            return Ok(());
+        }
         match decode_root_updated_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
             Ok(d) => {
                 state.confirmed_count = state.confirmed_count.max(d.to_count);
                 state.active_root = Some(d.new_root);
                 println!(
                     "[indexer] root updated: confirmed [{}, {}) root={} batch={}",
-                    d.from_count, d.to_count, hex::encode(d.new_root), d.batch_size
+                    d.from_count,
+                    d.to_count,
+                    hex::encode(d.new_root),
+                    d.batch_size
                 );
                 ctx.persist.notify(&state);
             }
             Err(e) => eprintln!("[indexer] RootUpdated decode FAILED: {e}"),
         }
-
     } else if t0.as_deref() == Some(sc.as_str()) {
         // ── ShieldCompleted ──────────────────────────────────────────────────
         // NoteAdded was already processed; update shield_amount_sats on the
         // existing batch entry and re-emit.
-        if !state.shield_seen_ids.insert(event_id) { return Ok(()); }
+        if !state.shield_seen_ids.insert(event_id) {
+            return Ok(());
+        }
         if let Ok((cmx, amt)) =
             decode_shield_completed_log(log.topics.as_deref().unwrap_or(&[]), &log.data)
         {
-            let maybe_note = state.batches.iter().rev()
+            let maybe_note = state
+                .batches
+                .iter()
+                .rev()
                 .flat_map(|env| env.batch.abi_notes.iter())
                 .find(|n| n.cmx == cmx && n.tx_hash == log.transaction_hash)
                 .cloned();
@@ -4062,9 +4926,15 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                     bundles: vec![],
                     latest_root: state.tree.latest_root(),
                 };
-                let envelope = BatchEnvelope { seq, pool_address: Some(ctx.contract_address.clone()), batch };
+                let envelope = BatchEnvelope {
+                    seq,
+                    pool_address: Some(ctx.contract_address.clone()),
+                    batch,
+                };
                 state.batches.push_back(envelope.clone());
-                while state.batches.len() > state.max_batches { state.batches.pop_front(); }
+                while state.batches.len() > state.max_batches {
+                    state.batches.pop_front();
+                }
                 drop(state);
                 ctx.backend.archive_batch(&envelope);
                 ctx.batch_tx.send(envelope).ok();
@@ -4073,14 +4943,20 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         }
     } else if t0.as_deref() == Some(shielded_topic.as_str()) {
         // ── Shielded accounting ───────────────────────────────────────────────
-        if state.accounting_seen_ids.contains(&event_id) { return Ok(()); }
+        if state.accounting_seen_ids.contains(&event_id) {
+            return Ok(());
+        }
         match decode_shielded_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
             Ok(d) => {
                 state.accounting_seen_ids.insert(event_id);
-                state.shield_accounting.total_shielded_units =
-                    state.shield_accounting.total_shielded_units.saturating_add(d.amount_units);
-                state.shield_accounting.total_shielded_wei =
-                    state.shield_accounting.total_shielded_wei.saturating_add(d.wei_amount);
+                state.shield_accounting.total_shielded_units = state
+                    .shield_accounting
+                    .total_shielded_units
+                    .saturating_add(d.amount_units);
+                state.shield_accounting.total_shielded_wei = state
+                    .shield_accounting
+                    .total_shielded_wei
+                    .saturating_add(d.wei_amount);
                 state.next_block = block_number.saturating_add(1).max(state.next_block);
                 ctx.persist.notify(&state);
             }
@@ -4088,14 +4964,20 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         }
     } else if t0.as_deref() == Some(unshielded_topic.as_str()) {
         // ── Unshielded accounting ─────────────────────────────────────────────
-        if state.accounting_seen_ids.contains(&event_id) { return Ok(()); }
+        if state.accounting_seen_ids.contains(&event_id) {
+            return Ok(());
+        }
         match decode_unshielded_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
             Ok(d) => {
                 state.accounting_seen_ids.insert(event_id);
-                state.shield_accounting.total_unshielded_units =
-                    state.shield_accounting.total_unshielded_units.saturating_add(d.amount_units);
-                state.shield_accounting.total_unshielded_wei =
-                    state.shield_accounting.total_unshielded_wei.saturating_add(d.wei_amount);
+                state.shield_accounting.total_unshielded_units = state
+                    .shield_accounting
+                    .total_unshielded_units
+                    .saturating_add(d.amount_units);
+                state.shield_accounting.total_unshielded_wei = state
+                    .shield_accounting
+                    .total_unshielded_wei
+                    .saturating_add(d.wei_amount);
                 state.next_block = block_number.saturating_add(1).max(state.next_block);
                 ctx.persist.notify(&state);
             }
@@ -4201,7 +5083,11 @@ impl RpcClient {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(GETLOGS_DEFAULT_SPAN);
-        Self { http, urls, getlogs_span: Arc::new(AtomicU64::new(initial_span)) }
+        Self {
+            http,
+            urls,
+            getlogs_span: Arc::new(AtomicU64::new(initial_span)),
+        }
     }
 
     /// Current learned `eth_getLogs` window span.
@@ -4215,7 +5101,8 @@ impl RpcClient {
     fn shrink_getlogs_span(&self, failed_span: u64) -> u64 {
         let new_span = (failed_span / 2).max(1);
         // Only ever shrink (another task may have already learned a smaller cap).
-        self.getlogs_span.fetch_min(new_span, AtomicOrdering::Relaxed);
+        self.getlogs_span
+            .fetch_min(new_span, AtomicOrdering::Relaxed);
         let effective = self.getlogs_span();
         eprintln!(
             "[indexer] provider rejected eth_getLogs span of {failed_span} blocks; \
@@ -4225,13 +5112,18 @@ impl RpcClient {
     }
 
     async fn block_number(&self) -> Result<u64> {
-        let hex_num: String = self.rpc_call("eth_blockNumber", serde_json::json!([])).await?;
+        let hex_num: String = self
+            .rpc_call("eth_blockNumber", serde_json::json!([]))
+            .await?;
         parse_hex_u64(&hex_num).context("invalid eth_blockNumber")
     }
 
     async fn get_transaction_count(&self, address: &str) -> Result<u64> {
         let hex_num: String = self
-            .rpc_call("eth_getTransactionCount", serde_json::json!([address, "latest"]))
+            .rpc_call(
+                "eth_getTransactionCount",
+                serde_json::json!([address, "latest"]),
+            )
             .await?;
         parse_hex_u64(&hex_num).context("invalid eth_getTransactionCount")
     }
@@ -4253,7 +5145,8 @@ impl RpcClient {
 
     async fn send_raw_transaction(&self, raw_tx: &[u8]) -> Result<String> {
         let hex_tx = format!("0x{}", hex::encode(raw_tx));
-        self.rpc_call("eth_sendRawTransaction", serde_json::json!([hex_tx])).await
+        self.rpc_call("eth_sendRawTransaction", serde_json::json!([hex_tx]))
+            .await
     }
 
     /// `eth_call` against `latest` — read-only contract query (and crank tx simulation).
@@ -4265,7 +5158,9 @@ impl RpcClient {
         if let Some(f) = from {
             call["from"] = serde_json::json!(normalize_hex_0x(f));
         }
-        let out: String = self.rpc_call("eth_call", serde_json::json!([call, "latest"])).await?;
+        let out: String = self
+            .rpc_call("eth_call", serde_json::json!([call, "latest"]))
+            .await?;
         hex::decode(out.trim_start_matches("0x")).context("invalid eth_call result hex")
     }
 
@@ -4280,16 +5175,17 @@ impl RpcClient {
     /// Returns `None` if tx not yet mined, `Some(true)` if success, `Some(false)` if reverted.
     async fn get_transaction_receipt_status(&self, tx_hash: &str) -> Result<Option<bool>> {
         #[derive(Deserialize)]
-        struct Receipt { status: Option<String> }
+        struct Receipt {
+            status: Option<String>,
+        }
         let hash = if tx_hash.starts_with("0x") || tx_hash.starts_with("0X") {
             tx_hash.to_string()
         } else {
             format!("0x{tx_hash}")
         };
-        let receipt: Option<Receipt> = self.rpc_call(
-            "eth_getTransactionReceipt",
-            serde_json::json!([hash]),
-        ).await?;
+        let receipt: Option<Receipt> = self
+            .rpc_call("eth_getTransactionReceipt", serde_json::json!([hash]))
+            .await?;
         Ok(receipt.map(|r| r.status.as_deref().unwrap_or("0x1") == "0x1"))
     }
 
@@ -4297,14 +5193,15 @@ impl RpcClient {
     /// Returns `None` if the transaction is not yet mined.
     async fn get_transaction_input(&self, tx_hash: &str) -> Result<Option<Vec<u8>>> {
         #[derive(Deserialize)]
-        struct Tx { input: String }
+        struct Tx {
+            input: String,
+        }
         let hash = normalize_hex_0x(tx_hash);
         let tx: Option<Tx> = self
             .rpc_call("eth_getTransactionByHash", serde_json::json!([hash]))
             .await?;
         Ok(tx.map(|t| {
-            hex::decode(t.input.strip_prefix("0x").unwrap_or(&t.input))
-                .unwrap_or_default()
+            hex::decode(t.input.strip_prefix("0x").unwrap_or(&t.input)).unwrap_or_default()
         }))
     }
 
@@ -4324,12 +5221,16 @@ impl RpcClient {
             .rpc_call("eth_getTransactionByHash", serde_json::json!([hash]))
             .await?;
         Ok(tx.map(|t| {
-            let input = hex::decode(t.input.strip_prefix("0x").unwrap_or(&t.input)).unwrap_or_default();
+            let input =
+                hex::decode(t.input.strip_prefix("0x").unwrap_or(&t.input)).unwrap_or_default();
             (input, t.from.to_lowercase())
         }))
     }
 
-    async fn get_transaction_receipt_logs(&self, tx_hash: &str) -> Result<Option<(bool, Vec<EthLog>)>> {
+    async fn get_transaction_receipt_logs(
+        &self,
+        tx_hash: &str,
+    ) -> Result<Option<(bool, Vec<EthLog>)>> {
         #[derive(Deserialize)]
         struct ReceiptLog {
             #[serde(default)]
@@ -4356,7 +5257,8 @@ impl RpcClient {
             .await?;
         Ok(receipt.map(|r| {
             let success = r.status.as_deref().unwrap_or("0x1") == "0x1";
-            let logs = r.logs
+            let logs = r
+                .logs
                 .into_iter()
                 .map(|l| EthLog {
                     address: l.address,
@@ -4378,7 +5280,11 @@ impl RpcClient {
         contract_address: &str,
         topic0_alternatives: &[String],
     ) -> Result<Vec<EthLog>> {
-        let alt: Vec<serde_json::Value> = topic0_alternatives.iter().cloned().map(Into::into).collect();
+        let alt: Vec<serde_json::Value> = topic0_alternatives
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect();
         let filter = serde_json::json!({
             "fromBlock": format!("0x{:x}", from_block),
             "toBlock":   format!("0x{:x}", to_block),
@@ -4400,7 +5306,11 @@ impl RpcClient {
         topic0_alternatives: &[String],
         topic1: &str,
     ) -> Result<Vec<EthLog>> {
-        let alt: Vec<serde_json::Value> = topic0_alternatives.iter().cloned().map(Into::into).collect();
+        let alt: Vec<serde_json::Value> = topic0_alternatives
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect();
         let filter = serde_json::json!({
             "fromBlock": format!("0x{:x}", from_block),
             "toBlock":   format!("0x{:x}", to_block),
@@ -4410,44 +5320,6 @@ impl RpcClient {
         self.rpc_call("eth_getLogs", serde_json::json!([filter]))
             .await
             .with_context(|| format!("eth_getLogs (swap) failed for [{from_block}, {to_block}]"))
-    }
-
-    /// True if `pool` (0x-prefixed) emitted `Perc20Created(pool,…)` at construction
-    /// — i.e. it is a genuine pERC20 asset (factory-deployed or standalone, both
-    /// conformant). The event's indexed `pool` arg equals the emitting contract,
-    /// so we filter by both `address` and `topics[1]` for a precise, cheap lookup.
-    async fn is_perc20_created(&self, pool: &str) -> Result<bool> {
-        let addr = normalize_hex_0x(pool);
-        let topic1 = format!("0x{:0>64}", addr.trim_start_matches("0x"));
-        let filter = serde_json::json!({
-            "fromBlock": "0x0",
-            "toBlock":   "latest",
-            "address":   addr,
-            "topics":    [perc20_created_topic0(), topic1],
-        });
-        let logs: Vec<EthLog> = self
-            .rpc_call("eth_getLogs", serde_json::json!([filter]))
-            .await
-            .context("eth_getLogs (Perc20Created verification) failed")?;
-        Ok(!logs.is_empty())
-    }
-
-    /// True if `pool` emitted `ShieldPoolCreated(pool,…)` at construction — i.e. it is a genuine
-    /// `ERC20Shield` backed pool. Mirrors `is_perc20_created` but for the shield-pool event.
-    async fn is_shield_pool_created(&self, pool: &str) -> Result<bool> {
-        let addr = normalize_hex_0x(pool);
-        let topic1 = format!("0x{:0>64}", addr.trim_start_matches("0x"));
-        let filter = serde_json::json!({
-            "fromBlock": "0x0",
-            "toBlock":   "latest",
-            "address":   addr,
-            "topics":    [shield_pool_created_topic0_hex(), topic1],
-        });
-        let logs: Vec<EthLog> = self
-            .rpc_call("eth_getLogs", serde_json::json!([filter]))
-            .await
-            .context("eth_getLogs (ShieldPoolCreated verification) failed")?;
-        Ok(!logs.is_empty())
     }
 
     /// Fetch pool metadata by reading the pool's genesis event. Returns shield-pool metadata
@@ -4495,35 +5367,33 @@ impl RpcClient {
         Ok(None)
     }
 
-    /// Scan `Perc20Created` chain-wide (no address filter) over [from, to] and
-    /// return `(pool_address, block_number)` for each match. When `issuer_topics`
-    /// is non-empty, only those issuers (indexed topic[2]) are returned.
-    async fn fetch_created_pools(
+    /// Scan one trusted factory's canonical deployment event over [from, to].
+    async fn fetch_factory_deployed_pools(
         &self,
         from_block: u64,
         to_block: u64,
+        factory: &str,
         topic0: &str,
-        issuer_topics: &[String],
     ) -> Result<Vec<(String, u64)>> {
-        let topics = if issuer_topics.is_empty() {
-            serde_json::json!([topic0])
-        } else {
-            let issuers: Vec<serde_json::Value> =
-                issuer_topics.iter().cloned().map(Into::into).collect();
-            // [topic0, null(pool, any), [issuer…]]
-            serde_json::json!([topic0, serde_json::Value::Null, issuers])
-        };
         let filter = serde_json::json!({
             "fromBlock": format!("0x{:x}", from_block),
             "toBlock":   format!("0x{:x}", to_block),
-            "topics":    topics,
+            "address":   normalize_hex_0x(factory),
+            "topics":    [topic0],
         });
         let logs: Vec<EthLog> = self
             .rpc_call("eth_getLogs", serde_json::json!([filter]))
             .await
-            .with_context(|| format!("eth_getLogs (Perc20Created discovery) [{from_block},{to_block}]"))?;
+            .with_context(|| {
+                format!("eth_getLogs (trusted factory {factory}) [{from_block},{to_block}]")
+            })?;
         let mut out = Vec::new();
         for l in logs {
+            if normalize_hex_0x(&l.address).to_lowercase()
+                != normalize_hex_0x(factory).to_lowercase()
+            {
+                continue;
+            }
             let pool = l
                 .topics
                 .as_ref()
@@ -4535,6 +5405,79 @@ impl RpcClient {
             }
         }
         Ok(out)
+    }
+
+    async fn runtime_codehash(&self, address: &str) -> Result<String> {
+        let code: String = self
+            .rpc_call(
+                "eth_getCode",
+                serde_json::json!([normalize_hex_0x(address), "latest"]),
+            )
+            .await
+            .with_context(|| format!("eth_getCode failed for {address}"))?;
+        let bytes = hex::decode(strip_0x(&code))
+            .with_context(|| format!("eth_getCode returned invalid hex for {address}"))?;
+        if bytes.is_empty() {
+            return Err(anyhow!("address {address} has no runtime code"));
+        }
+        Ok(format!("0x{}", hex::encode(Keccak256::digest(bytes))))
+    }
+
+    async fn was_pool_deployed_by(
+        &self,
+        factory: &str,
+        pool: &str,
+        event_topic: &str,
+    ) -> Result<bool> {
+        let filter = serde_json::json!({
+            "fromBlock": "0x0",
+            "toBlock":   "latest",
+            "address":   normalize_hex_0x(factory),
+            "topics":    [event_topic, address_to_topic(pool)],
+        });
+        let logs: Vec<EthLog> = self
+            .rpc_call("eth_getLogs", serde_json::json!([filter]))
+            .await
+            .with_context(|| format!("eth_getLogs deployment proof failed for pool {pool}"))?;
+        Ok(logs
+            .iter()
+            .any(|log| factory_log_matches(log, factory, event_topic, pool)))
+    }
+
+    async fn pool_uses_factory_beacon(
+        &self,
+        factory: &str,
+        pool: &str,
+        allowed_implementation_codehashes: &HashSet<String>,
+    ) -> Result<bool> {
+        let factory_beacon = self
+            .eth_call_word(factory, eth_selector(b"beacon()"))
+            .await
+            .with_context(|| format!("read beacon() from trusted factory {factory}"))?;
+        let slot = format!("0x{}", hex::encode(eip1967_beacon_slot()));
+        let stored: String = self
+            .rpc_call(
+                "eth_getStorageAt",
+                serde_json::json!([normalize_hex_0x(pool), slot, "latest"]),
+            )
+            .await
+            .with_context(|| format!("read EIP-1967 beacon slot from pool {pool}"))?;
+        let stored = parse_hex32(&stored)
+            .ok_or_else(|| anyhow!("invalid EIP-1967 beacon slot returned for pool {pool}"))?;
+        if !beacon_words_match(&factory_beacon, &stored) {
+            return Ok(false);
+        }
+        let beacon = format!("0x{}", hex::encode(&factory_beacon[12..]));
+        let implementation = self
+            .eth_call_word(&beacon, eth_selector(b"implementation()"))
+            .await
+            .with_context(|| format!("read implementation() from trusted beacon {beacon}"))?;
+        if !implementation[12..].iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+        let implementation = format!("0x{}", hex::encode(&implementation[12..]));
+        let hash = self.runtime_codehash(&implementation).await?;
+        Ok(allowed_implementation_codehashes.contains(&hash))
     }
 
     async fn rpc_call<T: DeserializeOwned>(
@@ -4560,12 +5503,25 @@ impl RpcClient {
                         Ok(r) => match (r.result, r.error) {
                             (Some(v), None) => return Ok(v),
                             (None, Some(e)) => {
-                                last_err = anyhow!("eth_{} failed for {url}: rpc error {}: {}", method, e.code, e.message);
+                                last_err = anyhow!(
+                                    "eth_{} failed for {url}: rpc error {}: {}",
+                                    method,
+                                    e.code,
+                                    e.message
+                                );
                                 return Err(last_err);
                             }
-                            _ => { last_err = anyhow!("malformed rpc response for method {method} from {url}"); break 'attempts; }
+                            _ => {
+                                last_err = anyhow!(
+                                    "malformed rpc response for method {method} from {url}"
+                                );
+                                break 'attempts;
+                            }
                         },
-                        Err(e) => { last_err = anyhow!("eth_{} rpc decode failed: {}", method, e); break 'attempts; }
+                        Err(e) => {
+                            last_err = anyhow!("eth_{} rpc decode failed: {}", method, e);
+                            break 'attempts;
+                        }
                     },
                     Err(e) => {
                         last_err = anyhow!("eth_{} send failed from {url}: {}", method, e);
@@ -4592,10 +5548,9 @@ fn encode_confirm_receipt_calldata(
     ack_preimage: &[u8; 32],
     new_root: &[u8; 32],
 ) -> Vec<u8> {
-    let selector: [u8; 4] =
-        Keccak256::digest(b"confirmReceipt(bytes32,bytes32,bytes32)")[..4]
-            .try_into()
-            .expect("keccak digest is 32 bytes");
+    let selector: [u8; 4] = Keccak256::digest(b"confirmReceipt(bytes32,bytes32,bytes32)")[..4]
+        .try_into()
+        .expect("keccak digest is 32 bytes");
     let mut calldata = Vec::with_capacity(4 + 32 + 32 + 32);
     calldata.extend_from_slice(&selector);
     calldata.extend_from_slice(cmx);
@@ -4665,7 +5620,9 @@ fn eth_address_from_signing_key(signing_key: &SigningKey) -> [u8; 20] {
     let encoded = vk.to_encoded_point(false); // uncompressed (65 bytes: 0x04 + x + y)
     let pubkey_bytes = &encoded.as_bytes()[1..]; // drop 0x04 prefix → 64 bytes
     let hash: [u8; 32] = Keccak256::digest(pubkey_bytes).into();
-    hash[12..].try_into().expect("20 bytes from last 12 of keccak")
+    hash[12..]
+        .try_into()
+        .expect("20 bytes from last 12 of keccak")
 }
 
 // ─── Minimal RLP encoder ─────────────────────────────────────────────────────
@@ -4783,6 +5740,19 @@ fn parse_address20(s: &str) -> Option<[u8; 20]> {
     bytes.try_into().ok()
 }
 
+fn parse_address_set(name: &str, values: &[String]) -> Result<HashSet<String>> {
+    values
+        .iter()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| {
+            if parse_address20(v).is_none() {
+                return Err(anyhow!("{name} contains invalid address: {v}"));
+            }
+            Ok(normalize_hex_0x(v).to_lowercase())
+        })
+        .collect()
+}
+
 fn normalize_hex_0x(s: &str) -> String {
     if s.starts_with("0x") || s.starts_with("0X") {
         s.to_owned()
@@ -4802,9 +5772,11 @@ fn strip_0x(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_cursor, decode_orchard_bundle_from_log_data, encode_confirm_receipt_calldata,
-        getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, require_admin, rlp_bytes,
-        rlp_list, rlp_uint, RpcClient,
+        advance_cursor, beacon_words_match, decode_orchard_bundle_from_log_data,
+        eip1967_beacon_slot, encode_confirm_receipt_calldata, factory_log_matches,
+        getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, parse_address_set,
+        perc20_deployed_topic0, require_admin, rlp_bytes, rlp_list, rlp_uint, EthLog,
+        HourlyTxBudget, RpcClient,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use privacy_core::types::OrchardStoredBundle;
@@ -4816,9 +5788,7 @@ mod tests {
     /// a non-frozen cmx still opens to the live root.
     #[test]
     fn frozen_imt_root_matches_perc20_and_updates_on_freeze() {
-        use privacy_core::commitment_tree::frozen::{
-            fr_from_be_bytes, fr_to_le_hex, FrozenImt,
-        };
+        use privacy_core::commitment_tree::frozen::{fr_from_be_bytes, fr_to_le_hex, FrozenImt};
 
         // Empty-blacklist root == poseidon_merkle_bn254::frozen_empty_tree_root.
         const EMPTY_ROOT_DEC: &str =
@@ -4878,6 +5848,73 @@ mod tests {
     }
 
     #[test]
+    fn factory_admission_rejects_self_emitted_or_wrong_factory_logs() {
+        let factory = format!("0x{}", "11".repeat(20));
+        let pool = format!("0x{}", "22".repeat(20));
+        let topic0 = perc20_deployed_topic0();
+        let make_log = |address: String, event: String| EthLog {
+            address,
+            block_number: "0x1".into(),
+            transaction_hash: format!("0x{}", "33".repeat(32)),
+            log_index: "0x0".into(),
+            topics: Some(vec![event, super::address_to_topic(&pool)]),
+            data: "0x".into(),
+        };
+        assert!(factory_log_matches(
+            &make_log(factory.clone(), topic0.clone()),
+            &factory,
+            &topic0,
+            &pool
+        ));
+        assert!(!factory_log_matches(
+            &make_log(pool.clone(), topic0.clone()),
+            &factory,
+            &topic0,
+            &pool
+        ));
+        assert!(!factory_log_matches(
+            &make_log(factory.clone(), format!("0x{}", "44".repeat(32))),
+            &factory,
+            &topic0,
+            &pool
+        ));
+    }
+
+    #[test]
+    fn beacon_binding_and_eip1967_slot_are_exact() {
+        assert_eq!(
+            hex::encode(eip1967_beacon_slot()),
+            "a3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50"
+        );
+        let mut factory = [0u8; 32];
+        factory[12..].fill(0x11);
+        let mut same = [0u8; 32];
+        same[12..].fill(0x11);
+        let mut other = [0u8; 32];
+        other[12..].fill(0x22);
+        assert!(beacon_words_match(&factory, &same));
+        assert!(!beacon_words_match(&factory, &other));
+        assert!(!beacon_words_match(&[0u8; 32], &[0u8; 32]));
+    }
+
+    #[test]
+    fn crank_hourly_budget_is_rolling_and_fail_closed() {
+        let mut budget = HourlyTxBudget::new(2);
+        assert!(budget.try_take(10));
+        assert!(budget.try_take(20));
+        assert!(!budget.try_take(30));
+        assert!(budget.try_take(3610));
+        assert!(!budget.try_take(3611));
+    }
+
+    #[test]
+    fn configured_address_sets_reject_malformed_values() {
+        let valid = vec![format!("0x{}", "ab".repeat(20))];
+        assert_eq!(parse_address_set("test", &valid).unwrap().len(), 1);
+        assert!(parse_address_set("test", &["0x1234".into()]).is_err());
+    }
+
+    #[test]
     fn frozen_admin_auth_requires_configured_bearer_token() {
         let mut headers = HeaderMap::new();
         let token = Arc::<str>::from("secret");
@@ -4891,13 +5928,19 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
 
-        headers.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer wrong"));
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong"),
+        );
         assert_eq!(
             require_admin(&headers, Some(&token)).unwrap_err().0,
             StatusCode::UNAUTHORIZED
         );
 
-        headers.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
         assert!(require_admin(&headers, Some(&token)).is_ok());
     }
 
@@ -4917,8 +5960,8 @@ mod tests {
         let json = serde_json::to_vec(&bundle).expect("bundle should serialize");
         let encoded = ethabi::encode(&[ethabi::Token::Bytes(json)]);
         let data_hex = format!("0x{}", hex::encode(encoded));
-        let decoded = decode_orchard_bundle_from_log_data(&data_hex)
-            .expect("abi wrapped json should decode");
+        let decoded =
+            decode_orchard_bundle_from_log_data(&data_hex).expect("abi wrapped json should decode");
         assert_eq!(decoded.flags_orchard, 3);
     }
 
@@ -4995,7 +6038,7 @@ mod tests {
         // Single block and degenerate span values never exceed `to`.
         assert_eq!(getlogs_window_end(42, 42, 5_000), 42);
         assert_eq!(getlogs_window_end(7, 100, 0), 7); // span 0 treated as 1
-        // No overflow at the top of the u64 range.
+                                                      // No overflow at the top of the u64 range.
         assert_eq!(getlogs_window_end(u64::MAX - 1, u64::MAX, 5_000), u64::MAX);
     }
 
