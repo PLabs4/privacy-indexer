@@ -4,6 +4,9 @@
 # toolchain, reproducible rollbacks by tag (see the perc20-deploy repo).
 name: docker-image
 
+env:
+  PERC20_PROTOCOL_VERSION: perc20-v1
+
 on:
   push:
     tags: ["v*"]
@@ -32,9 +35,13 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/privacy-indexer
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=latest
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            io.perc20.protocol=${{ env.PERC20_PROTOCOL_VERSION }}
 
-      - uses: docker/build-push-action@v6
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           # Production servers are x86_64. Add linux/arm64 if you also deploy
@@ -43,5 +50,13 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Record immutable release input
+        run: |
+          echo "privacy-indexer=${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "source_commit=${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          echo "protocol=${PERC20_PROTOCOL_VERSION}" >> "$GITHUB_STEP_SUMMARY"
