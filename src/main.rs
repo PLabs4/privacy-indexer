@@ -9,18 +9,19 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, Method, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
 };
 use futures_util::stream::{self, StreamExt};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::SinkExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::timeout::TimeoutLayer;
 use clap::Parser;
 use k256::ecdsa::{RecoveryId, SigningKey};
 use privacy_core::commitment_tree::OrchardCommitmentTree;
@@ -184,6 +185,13 @@ struct Cli {
     /// Poll interval (seconds) for the auto-discovery scan.
     #[arg(long, env = "PRIVACYBTC_INDEXER_DISCOVER_POLL_SECS", default_value_t = 12)]
     discover_poll_secs: u64,
+    /// Permit authenticated operator registration through POST /pools. Production
+    /// should prefer factory discovery and leave this disabled.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_ALLOW_RUNTIME_POOL_REGISTRATION", default_value_t = false, value_parser = parse_bool_flag)]
+    allow_runtime_pool_registration: bool,
+    /// Hard cap on watched pools, including CLI, persisted and discovered pools.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_MAX_POOLS", default_value_t = 100)]
+    max_pools: usize,
 }
 
 /// Lenient boolean parser for env/CLI flags so deployers can use 1/0/yes/no/on/off
@@ -507,6 +515,12 @@ struct PoolRegistry {
     tx_meta: Arc<RwLock<HashMap<String, TxMeta>>>,
     /// Bearer token required by admin-only write endpoints such as POST /frozen.
     admin_token: Option<Arc<str>>,
+    /// Separate token used only by the relayer to wake receipt recovery.
+    relayer_token: Option<Arc<str>>,
+    allow_runtime_pool_registration: bool,
+    max_pools: usize,
+    /// Bounds expensive registration/confirmation RPC work.
+    write_semaphore: Arc<Semaphore>,
 }
 
 /// Public pool metadata surfaced by the API. `Issuer` pools are PERC20 assets minted by an
@@ -1009,6 +1023,14 @@ async fn main() -> Result<()> {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .map(Arc::<str>::from),
+        relayer_token: std::env::var("PRIVACYBTC_INDEXER_RELAYER_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .map(Arc::<str>::from),
+        allow_runtime_pool_registration: cli.allow_runtime_pool_registration,
+        max_pools: cli.max_pools,
+        write_semaphore: Arc::new(Semaphore::new(2)),
     };
 
     // 1) CLI pools (the first one becomes primary and owns the confirm signer).
@@ -1099,6 +1121,8 @@ async fn main() -> Result<()> {
         .route("/frozen_root", get(get_frozen_root))
         .route("/frozen_witness", get(get_frozen_witness))
         .route("/frozen", post(post_frozen))
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(TimeoutLayer::new(Duration::from_secs(30)))
         .layer(build_cors_layer())
         .with_state(registry);
 
@@ -1476,6 +1500,24 @@ fn require_admin(headers: &HeaderMap, token: Option<&Arc<str>>) -> Result<(), (S
     Ok(())
 }
 
+fn require_relayer(headers: &HeaderMap, token: Option<&Arc<str>>) -> Result<(), (StatusCode, String)> {
+    let Some(expected) = token else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relayer notifications are disabled; set PRIVACYBTC_INDEXER_RELAYER_TOKEN".to_owned(),
+        ));
+    };
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let supplied = auth.strip_prefix("Bearer ").unwrap_or_default();
+    if supplied.is_empty() || supplied != expected.as_ref() {
+        return Err((StatusCode::UNAUTHORIZED, "invalid relayer token".to_owned()));
+    }
+    Ok(())
+}
+
 // ─── HTTP handlers ────────────────────────────────────────────────────────────
 
 async fn healthz() -> &'static str {
@@ -1572,8 +1614,19 @@ struct RegisterPoolRequest {
 /// `Perc20Created`); no shared secret is required.
 async fn register_pool(
     State(reg): State<PoolRegistry>,
+    headers: HeaderMap,
     Json(req): Json<RegisterPoolRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    require_admin(&headers, reg.admin_token.as_ref())?;
+    if !reg.allow_runtime_pool_registration {
+        return Err((StatusCode::FORBIDDEN, "runtime pool registration is disabled; use factory discovery".to_owned()));
+    }
+    if reg.pools.read().await.len() >= reg.max_pools {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "maximum watched pool count reached".to_owned()));
+    }
+    let _permit = reg.write_semaphore.clone().try_acquire_owned().map_err(|_| {
+        (StatusCode::TOO_MANY_REQUESTS, "indexer write capacity is busy; retry later".to_owned())
+    })?;
     if parse_address20(&req.contract_address).is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2579,9 +2632,14 @@ async fn post_frozen(
 
 async fn post_confirm(
     State(reg): State<PoolRegistry>,
+    headers: HeaderMap,
     Query(q): Query<SimplePoolQuery>,
     Json(req): Json<ConfirmRequest>,
 ) -> Result<Json<ConfirmResponse>, (StatusCode, String)> {
+    require_admin(&headers, reg.admin_token.as_ref())?;
+    let _permit = reg.write_semaphore.clone().try_acquire_owned().map_err(|_| {
+        (StatusCode::TOO_MANY_REQUESTS, "indexer write capacity is busy; retry later".to_owned())
+    })?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let cmx = parse_hex32(&req.cmx_hex)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx_hex".to_owned()))?;
@@ -2658,10 +2716,15 @@ struct NotifyTxRequest {
 /// are recovered by fetching their receipts and replaying the logs.
 async fn post_notify_tx(
     State(reg): State<PoolRegistry>,
+    headers: HeaderMap,
     Query(q): Query<SimplePoolQuery>,
     Json(req): Json<NotifyTxRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    require_relayer(&headers, reg.relayer_token.as_ref())?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
+    if parse_hex32(&req.tx_hash).is_none() {
+        return Err((StatusCode::BAD_REQUEST, "tx_hash must be a 32-byte hex value".to_owned()));
+    }
     let tx_hash = normalize_hex_0x(&req.tx_hash);
     let mut s = ctx.state.write().await;
     if !s.pending_tx_hashes.iter().any(|h| h == &tx_hash) {
@@ -4803,7 +4866,7 @@ fn strip_0x(s: &str) -> &str {
 mod tests {
     use super::{
         advance_cursor, decode_orchard_bundle_from_log_data, encode_confirm_receipt_calldata,
-        getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, require_admin, rlp_bytes,
+        getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, require_admin, require_relayer, rlp_bytes,
         rlp_list, rlp_uint, RpcClient,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -4899,6 +4962,16 @@ mod tests {
 
         headers.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
         assert!(require_admin(&headers, Some(&token)).is_ok());
+    }
+
+    #[test]
+    fn relayer_auth_requires_a_distinct_configured_bearer_token() {
+        let mut headers = HeaderMap::new();
+        let token = Arc::<str>::from("relayer-secret");
+        assert_eq!(require_relayer(&headers, None).unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(require_relayer(&headers, Some(&token)).unwrap_err().0, StatusCode::UNAUTHORIZED);
+        headers.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer relayer-secret"));
+        assert!(require_relayer(&headers, Some(&token)).is_ok());
     }
 
     #[test]
