@@ -213,8 +213,13 @@ struct Cli {
     crank_max_tx_per_hour: u64,
     #[arg(long, env = "PRIVACYBTC_CHAIN_ID", default_value_t = 1u64)]
     chain_id: u64,
-    /// Gas price in wei for confirm transactions. Default: 1 Gwei.
-    #[arg(long, default_value_t = 1_000_000_000u64)]
+    /// Gas price in wei for confirmation and crank transactions. Default: 1 Gwei.
+    /// Networks with a higher minimum gas price must set this explicitly.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_GAS_PRICE",
+        default_value_t = 1_000_000_000u64
+    )]
     gas_price: u64,
     /// Gas limit for confirmReceipt transactions. Default: 100_000.
     #[arg(long, default_value_t = 100_000u64)]
@@ -5848,13 +5853,27 @@ mod tests {
         advance_cursor, beacon_words_match, decode_orchard_bundle_from_log_data,
         eip1967_beacon_slot, encode_confirm_receipt_calldata, factory_log_matches,
         getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, parse_address_set,
-        perc20_deployed_topic0, require_admin, require_relayer, rlp_bytes, rlp_list, rlp_uint,
+        perc20_deployed_topic0, require_admin, require_relayer, rlp_bytes, rlp_list, rlp_uint, Cli,
         EthLog, HourlyTxBudget, RpcClient,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use clap::CommandFactory;
     use privacy_core::types::OrchardStoredBundle;
     use sha3::{Digest, Keccak256};
     use std::sync::Arc;
+
+    #[test]
+    fn gas_price_is_configurable_from_the_runtime_environment() {
+        let command = Cli::command();
+        let gas_price = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "gas_price")
+            .expect("gas_price CLI argument");
+        assert_eq!(
+            gas_price.get_env(),
+            Some(std::ffi::OsStr::new("PRIVACYBTC_INDEXER_GAS_PRICE"))
+        );
+    }
 
     /// The indexer's empty frozen tree must publish the same `rt_frozen` the PERC20
     /// circuit/prover expect, and a freeze must change the root while the witness for
