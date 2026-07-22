@@ -1,7 +1,7 @@
-# Build and push the privacy-indexer image to GHCR on version tags.
+# Build and push the privacy-indexer image from the two deployment channels.
 #
 # Production hosts then deploy with `docker compose pull && up -d` — no Rust
-# toolchain, reproducible rollbacks by tag (see the perc20-deploy repo).
+# toolchain, reproducible rollbacks by immutable Stack Release (see perc20-deploy).
 name: docker-image
 
 env:
@@ -9,8 +9,12 @@ env:
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main, develop]
   workflow_dispatch:
+
+concurrency:
+  group: docker-image-${{ github.ref_name }}-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   build-push:
@@ -19,6 +23,12 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Validate source channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" == "main" || "$GITHUB_REF_NAME" == "develop" ]]
+
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
@@ -36,11 +46,12 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=semver,pattern={{version}}
+            type=raw,value=${{ github.ref_name }}-${{ github.sha }}
             type=sha,format=long
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             io.perc20.protocol=${{ env.PERC20_PROTOCOL_VERSION }}
+            io.perc20.source_branch=${{ github.ref_name }}
 
       - id: build
         uses: docker/build-push-action@v6
@@ -60,5 +71,6 @@ jobs:
       - name: Record immutable release input
         run: |
           echo "privacy-indexer=${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "source_branch=${GITHUB_REF_NAME}" >> "$GITHUB_STEP_SUMMARY"
           echo "source_commit=${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
           echo "protocol=${PERC20_PROTOCOL_VERSION}" >> "$GITHUB_STEP_SUMMARY"
