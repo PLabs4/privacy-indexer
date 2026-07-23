@@ -213,6 +213,18 @@ struct Cli {
     crank_max_tx_per_hour: u64,
     #[arg(long, env = "PRIVACYBTC_CHAIN_ID", default_value_t = 1u64)]
     chain_id: u64,
+    /// Wire/storage protocol expected from every admitted pool. Protocol 3 is the
+    /// Binding-Groth16 cutover and must never be mixed with protocol-2 calldata.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_EXPECTED_PROTOCOL_VERSION",
+        default_value_t = 3u64
+    )]
+    expected_protocol_version: u64,
+    /// Exact verifier-set fingerprint returned by `verifierSetId()` on every pool.
+    /// This is release-bound and therefore intentionally has no default.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_EXPECTED_VERIFIER_SET_ID")]
+    expected_verifier_set_id: String,
     /// Gas price in wei for confirmation and crank transactions. Default: 1 Gwei.
     /// Networks with a higher minimum gas price must set this explicitly.
     #[arg(
@@ -670,6 +682,8 @@ struct PoolAdmissionPolicy {
     factory_codehashes: HashSet<String>,
     pool_codehashes: HashSet<String>,
     implementation_codehashes: HashSet<String>,
+    expected_protocol_version: u64,
+    expected_verifier_set_id: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -735,7 +749,17 @@ impl PoolAdmissionPolicy {
                 "PRIVACYBTC_INDEXER_TRUSTED_IMPLEMENTATION_CODEHASHES",
                 &cli.trusted_implementation_codehash,
             )?,
+            expected_protocol_version: cli.expected_protocol_version,
+            expected_verifier_set_id: parse_bytes32_strict(
+                "PRIVACYBTC_INDEXER_EXPECTED_VERIFIER_SET_ID",
+                &cli.expected_verifier_set_id,
+            )?,
         };
+        if policy.expected_protocol_version != 3 {
+            return Err(anyhow!(
+                "PRIVACYBTC_INDEXER_EXPECTED_PROTOCOL_VERSION must be 3 for Binding Groth16"
+            ));
+        }
         if (!policy.perc20_factories.is_empty() || !policy.shield_factories.is_empty())
             && policy.factory_codehashes.is_empty()
         {
@@ -958,6 +982,7 @@ impl PoolRegistry {
             return Ok(true);
         }
         if let Some(provenance) = self.resolve_pool_provenance(pool_lc).await? {
+            self.ensure_pool_protocol(pool_lc).await?;
             self.verified_pools
                 .write()
                 .await
@@ -978,6 +1003,7 @@ impl PoolRegistry {
         if !self.admission.pool_codehashes.contains(&codehash) {
             return Ok(false);
         }
+        self.ensure_pool_protocol(pool_lc).await?;
         let provenance = match self
             .verified_pool_provenance
             .read()
@@ -1034,6 +1060,45 @@ impl PoolRegistry {
             }
         }
         Ok(None)
+    }
+
+    /// Bind every ingestion/crank target to the exact protocol/verifier set in
+    /// the coordinated release. A codehash allowlist alone cannot distinguish a
+    /// pool initialized with different immutable verifier addresses.
+    async fn ensure_pool_protocol(&self, pool_lc: &str) -> Result<()> {
+        let version_word = self
+            .builder
+            .rpc
+            .eth_call_word(pool_lc, eth_selector(b"protocolVersion()"))
+            .await
+            .with_context(|| format!("read protocolVersion() from pool {pool_lc}"))?;
+        if version_word[..24].iter().any(|b| *b != 0) {
+            return Err(anyhow!(
+                "pool {pool_lc} returned a non-canonical protocolVersion word"
+            ));
+        }
+        let version = u64::from_be_bytes(version_word[24..].try_into().expect("8-byte suffix"));
+        if version != self.admission.expected_protocol_version {
+            return Err(anyhow!(
+                "pool {pool_lc} protocolVersion mismatch: expected {}, got {version}",
+                self.admission.expected_protocol_version
+            ));
+        }
+
+        let verifier_set_id = self
+            .builder
+            .rpc
+            .eth_call_word(pool_lc, eth_selector(b"verifierSetId()"))
+            .await
+            .with_context(|| format!("read verifierSetId() from pool {pool_lc}"))?;
+        if verifier_set_id != self.admission.expected_verifier_set_id {
+            return Err(anyhow!(
+                "pool {pool_lc} verifierSetId mismatch: expected 0x{}, got 0x{}",
+                hex::encode(self.admission.expected_verifier_set_id),
+                hex::encode(verifier_set_id)
+            ));
+        }
+        Ok(())
     }
 
     /// Best-effort: fetch + cache pool metadata (issuer or wrapped) from its genesis event.
@@ -2544,6 +2609,18 @@ fn classify_selector(input: &[u8]) -> Option<&'static str> {
         return None;
     }
     match &input[0..4] {
+        // Protocol 3 (Binding Groth16, PrivacyCall = (bytes,uint256[8])).
+        [0x33, 0xb8, 0x54, 0xb0] => Some("shield"),
+        [0x19, 0x52, 0xce, 0x65] => Some("unshield"),
+        [0x14, 0x1f, 0x64, 0x1d] => Some("mint"),
+        [0xb7, 0x45, 0x34, 0xe9] => Some("burn"),
+        [0xb2, 0xd4, 0x79, 0x7b] => Some("transfer"),
+        [0x5e, 0x09, 0xe2, 0xb1] => Some("transfer"),
+        [0xd4, 0x1e, 0x4a, 0x7a] => Some("swap"),
+        [0x74, 0xda, 0x02, 0xc8] => Some("swap"),
+        [0xe3, 0xb3, 0xfa, 0xe4] => Some("swap"),
+        // Historical protocol-2 selectors remain classified for read-only
+        // explorer compatibility; current calldata emission never uses them.
         // Wrapped ERC20Shield pools: deposit/withdraw a public ERC20 balance.
         [0x04, 0x11, 0xcb, 0xab] => Some("shield"),
         [0x53, 0x64, 0x4c, 0x61] => Some("unshield"), // has a public `recipient`
@@ -2590,9 +2667,11 @@ fn parse_tx_meta(input: &[u8]) -> TxMeta {
         }
         _ => None,
     };
-    // Recipient is public ONLY for unshield (0x53644c61) — burn shares the "unshield"
-    // op label but has no recipient arg, so match the exact selector here.
-    let recipient = if input.len() >= 68 && input[0..4] == [0x53, 0x64, 0x4c, 0x61] {
+    // Recipient is public ONLY for unshield. Burn has no recipient, so match the
+    // exact v3 or historical v2 selector here.
+    let recipient = if input.len() >= 68
+        && (input[0..4] == [0x19, 0x52, 0xce, 0x65] || input[0..4] == [0x53, 0x64, 0x4c, 0x61])
+    {
         Some(format!("0x{}", hex::encode(&input[48..68])))
     } else {
         None
@@ -2906,13 +2985,12 @@ struct SwapCallActionJson {
     proof: String,
     /// 8 BN254 pub fields: [anchor, cv_x, cv_y, nf, rk_x, rk_y, cmx, rt_frozen].
     pub_fields: Vec<String>,
-    spend_auth_sig: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct SwapCallJson {
     actions: Vec<SwapCallActionJson>,
-    binding_sig: Vec<String>,
+    binding_proof: Vec<String>,
 }
 
 fn swap_call_json(call: &PrivacyCallArgs) -> SwapCallJson {
@@ -2932,10 +3010,9 @@ fn swap_call_json(call: &PrivacyCallArgs) -> SwapCallJson {
                 anchor: hx(&a.anchor),
                 proof: hx(&a.proof),
                 pub_fields: a.pub_fields.iter().map(|f| hx(f)).collect(),
-                spend_auth_sig: a.spend_auth_sig.iter().map(|f| hx(f)).collect(),
             })
             .collect(),
-        binding_sig: call.binding_sig.iter().map(|f| hx(f)).collect(),
+        binding_proof: call.binding_proof.iter().map(|f| hx(f)).collect(),
     }
 }
 
@@ -5813,6 +5890,11 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
+fn parse_bytes32_strict(name: &str, value: &str) -> Result<[u8; 32]> {
+    parse_hex32(value)
+        .ok_or_else(|| anyhow!("{name} must be exactly one 0x-prefixed bytes32 value"))
+}
+
 fn parse_address20(s: &str) -> Option<[u8; 20]> {
     let bytes = hex::decode(strip_0x(s)).ok()?;
     bytes.try_into().ok()
@@ -5850,11 +5932,11 @@ fn strip_0x(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_cursor, beacon_words_match, decode_orchard_bundle_from_log_data,
+        advance_cursor, beacon_words_match, classify_selector, decode_orchard_bundle_from_log_data,
         eip1967_beacon_slot, encode_confirm_receipt_calldata, factory_log_matches,
         getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, parse_address_set,
-        perc20_deployed_topic0, require_admin, require_relayer, rlp_bytes, rlp_list, rlp_uint, Cli,
-        EthLog, HourlyTxBudget, RpcClient,
+        parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0, require_admin,
+        require_relayer, rlp_bytes, rlp_list, rlp_uint, Cli, EthLog, HourlyTxBudget, RpcClient,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use clap::CommandFactory;
@@ -5873,6 +5955,67 @@ mod tests {
             gas_price.get_env(),
             Some(std::ffi::OsStr::new("PRIVACYBTC_INDEXER_GAS_PRICE"))
         );
+    }
+
+    #[test]
+    fn binding_groth16_selectors_are_classified_and_legacy_remains_readable() {
+        assert_eq!(
+            classify_selector(&hex::decode("33b854b0").unwrap()),
+            Some("shield")
+        );
+        assert_eq!(
+            classify_selector(&hex::decode("1952ce65").unwrap()),
+            Some("unshield")
+        );
+        assert_eq!(
+            classify_selector(&hex::decode("141f641d").unwrap()),
+            Some("mint")
+        );
+        assert_eq!(
+            classify_selector(&hex::decode("b74534e9").unwrap()),
+            Some("burn")
+        );
+        assert_eq!(
+            classify_selector(&hex::decode("b2d4797b").unwrap()),
+            Some("transfer")
+        );
+        assert_eq!(
+            classify_selector(&hex::decode("5e09e2b1").unwrap()),
+            Some("transfer")
+        );
+        assert_eq!(
+            classify_selector(&hex::decode("d41e4a7a").unwrap()),
+            Some("swap")
+        );
+        assert_eq!(
+            classify_selector(&hex::decode("74da02c8").unwrap()),
+            Some("swap")
+        );
+        assert_eq!(
+            classify_selector(&hex::decode("e3b3fae4").unwrap()),
+            Some("swap")
+        );
+        assert_eq!(
+            classify_selector(&hex::decode("eda1a0ac").unwrap()),
+            Some("transfer")
+        );
+
+        let mut unshield = vec![0u8; 68];
+        unshield[..4].copy_from_slice(&hex::decode("1952ce65").unwrap());
+        unshield[48..68].fill(0x42);
+        assert_eq!(
+            parse_tx_meta(&unshield).recipient,
+            Some(format!("0x{}", "42".repeat(20)))
+        );
+    }
+
+    #[test]
+    fn verifier_set_id_parser_requires_exact_bytes32() {
+        assert_eq!(
+            parse_bytes32_strict("ID", &format!("0x{}", "ab".repeat(32))).unwrap(),
+            [0xabu8; 32]
+        );
+        assert!(parse_bytes32_strict("ID", &format!("0x{}", "ab".repeat(31))).is_err());
     }
 
     /// The indexer's empty frozen tree must publish the same `rt_frozen` the PERC20
@@ -5928,6 +6071,7 @@ mod tests {
             binding_sig_orchard: vec![0u8; 64],
             proof_bn254: None,
             pub_fields_bn254: None,
+            binding_proof_bn254: None,
             binding_sig_bn254: None,
             value_balance_bn254: 0,
         }

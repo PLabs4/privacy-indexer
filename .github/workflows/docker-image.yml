@@ -5,7 +5,7 @@
 name: docker-image
 
 env:
-  PERC20_PROTOCOL_VERSION: perc20-v1
+  PERC20_PROTOCOL_VERSION: perc20-v2
 
 on:
   push:
