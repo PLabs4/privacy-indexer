@@ -189,14 +189,23 @@ struct Cli {
         default_value_t = 15
     )]
     crank_interval_secs: u64,
-    /// Gas limit for `updateRoot` (Groth16 verify + up to 8 confirms) and
-    /// `syncBatchModel` (32 Poseidon folds) transactions.
+    /// Hard gas cap for `updateRoot` (Groth16 verify + up to 8 confirms) and
+    /// `syncBatchModel` (32 Poseidon folds). Every exact transaction is first
+    /// estimated and padded; the signer fails closed above this cap.
     #[arg(
         long,
         env = "PRIVACYBTC_INDEXER_CRANK_GAS_LIMIT",
         default_value_t = 2_000_000u64
     )]
     gas_limit_update_root: u64,
+    /// Safety margin applied to the exact crank `eth_estimateGas`, in basis
+    /// points. Bounded to 10% at startup.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_GAS_MARGIN_BPS",
+        default_value_t = 200u64
+    )]
+    crank_gas_margin_bps: u64,
     /// Pools the signer may crank. Required and non-empty when --crank is enabled.
     #[arg(
         long,
@@ -1503,6 +1512,16 @@ async fn main() -> Result<()> {
                 "--crank requires PRIVACYBTC_INDEXER_CRANK_MAX_TX_PER_HOUR > 0"
             ));
         }
+        if cli.gas_limit_update_root == 0 {
+            return Err(anyhow!(
+                "--crank requires PRIVACYBTC_INDEXER_CRANK_GAS_LIMIT > 0"
+            ));
+        }
+        if cli.crank_gas_margin_bps > MAX_CRANK_GAS_MARGIN_BPS {
+            return Err(anyhow!(
+                "PRIVACYBTC_INDEXER_CRANK_GAS_MARGIN_BPS must be <= {MAX_CRANK_GAS_MARGIN_BPS}"
+            ));
+        }
         if cli
             .crank_prover_api_token
             .as_deref()
@@ -1610,7 +1629,8 @@ async fn main() -> Result<()> {
                         prover_url: cli.crank_prover_url.clone(),
                         prover_api_token: cli.crank_prover_api_token.clone().unwrap_or_default(),
                         interval_secs: cli.crank_interval_secs,
-                        gas_limit: cli.gas_limit_update_root,
+                        gas_limit_cap: cli.gas_limit_update_root,
+                        gas_margin_bps: cli.crank_gas_margin_bps,
                         allowed_pools: parse_address_set(
                             "PRIVACYBTC_INDEXER_CRANK_ALLOWED_POOLS",
                             &cli.crank_allowed_pool,
@@ -1798,12 +1818,44 @@ fn word_to_u64(w: &[u8; 32]) -> u64 {
     u64::from_be_bytes(w[24..32].try_into().unwrap())
 }
 
+const GAS_BPS_DENOMINATOR: u64 = 10_000;
+const MAX_CRANK_GAS_MARGIN_BPS: u64 = 1_000;
+
+fn crank_gas_limit(estimate: u64, margin_bps: u64, cap: u64) -> Result<u64> {
+    if estimate == 0 {
+        return Err(anyhow!("crank gas estimate must be greater than zero"));
+    }
+    if cap == 0 {
+        return Err(anyhow!("crank gas cap must be greater than zero"));
+    }
+    if margin_bps > MAX_CRANK_GAS_MARGIN_BPS {
+        return Err(anyhow!(
+            "crank gas margin must be <= {MAX_CRANK_GAS_MARGIN_BPS} basis points"
+        ));
+    }
+    let numerator = u128::from(estimate)
+        .checked_mul(u128::from(GAS_BPS_DENOMINATOR + margin_bps))
+        .ok_or_else(|| anyhow!("crank gas margin calculation overflow"))?;
+    let padded = numerator
+        .checked_add(u128::from(GAS_BPS_DENOMINATOR - 1))
+        .ok_or_else(|| anyhow!("crank gas margin calculation overflow"))?
+        / u128::from(GAS_BPS_DENOMINATOR);
+    let padded = u64::try_from(padded).context("padded crank gas does not fit u64")?;
+    if padded > cap {
+        return Err(anyhow!(
+            "crank estimate {estimate} with {margin_bps}bps margin requires {padded} gas, above cap {cap}"
+        ));
+    }
+    Ok(padded)
+}
+
 struct CrankConfig {
     signer: Arc<SignerConfig>,
     prover_url: String,
     prover_api_token: String,
     interval_secs: u64,
-    gas_limit: u64,
+    gas_limit_cap: u64,
+    gas_margin_bps: u64,
     allowed_pools: HashSet<String>,
     max_tx_per_hour: u64,
 }
@@ -2079,7 +2131,8 @@ async fn prove_cmxconfirm(
     hex::decode(out.proof_hex.trim_start_matches("0x")).context("proof hex")
 }
 
-/// Simulate (eth_call) then submit one crank transaction and wait for its receipt.
+/// Simulate (`eth_call`), estimate and submit one crank transaction, then wait
+/// for its receipt. Estimation is mandatory: there is no fixed-limit fallback.
 /// `Ok(true)` = mined successfully, `Ok(false)` = reverted (simulation or on-chain).
 async fn submit_crank_tx(
     rpc: &RpcClient,
@@ -2096,6 +2149,15 @@ async fn submit_crank_tx(
         eprintln!("[crank] {what} simulation reverted: {e:#}");
         return Ok(false);
     }
+    let estimated_gas = rpc
+        .estimate_gas(pool, calldata, Some(&from_hex))
+        .await
+        .with_context(|| format!("{what} gas estimation failed; refusing fixed-limit fallback"))?;
+    let gas_limit = crank_gas_limit(estimated_gas, cfg.gas_margin_bps, cfg.gas_limit_cap)?;
+    println!(
+        "[crank] {what} gas: estimate={estimated_gas} margin_bps={} signed_limit={gas_limit} cap={}",
+        cfg.gas_margin_bps, cfg.gas_limit_cap
+    );
     if !budget.try_take(unix_seconds()) {
         return Err(anyhow!(
             "hourly crank transaction budget exhausted (limit={})",
@@ -2107,7 +2169,7 @@ async fn submit_crank_tx(
     let raw = build_and_sign_raw_tx(
         nonce,
         cfg.signer.gas_price,
-        cfg.gas_limit,
+        gas_limit,
         pool,
         0u64,
         calldata,
@@ -5304,19 +5366,34 @@ impl RpcClient {
             .await
     }
 
-    /// `eth_call` against `latest` — read-only contract query (and crank tx simulation).
-    async fn eth_call(&self, to: &str, data: &[u8], from: Option<&str>) -> Result<Vec<u8>> {
+    fn transaction_call(to: &str, data: &[u8], from: Option<&str>) -> serde_json::Value {
         let mut call = serde_json::json!({
             "to": normalize_hex_0x(to),
             "data": format!("0x{}", hex::encode(data)),
+            "value": "0x0",
         });
         if let Some(f) = from {
             call["from"] = serde_json::json!(normalize_hex_0x(f));
         }
+        call
+    }
+
+    /// `eth_call` against `latest` — read-only contract query (and crank tx simulation).
+    async fn eth_call(&self, to: &str, data: &[u8], from: Option<&str>) -> Result<Vec<u8>> {
+        let call = Self::transaction_call(to, data, from);
         let out: String = self
             .rpc_call("eth_call", serde_json::json!([call, "latest"]))
             .await?;
         hex::decode(out.trim_start_matches("0x")).context("invalid eth_call result hex")
+    }
+
+    /// Exact `eth_estimateGas` for the transaction the crank signer will send.
+    async fn estimate_gas(&self, to: &str, data: &[u8], from: Option<&str>) -> Result<u64> {
+        let call = Self::transaction_call(to, data, from);
+        let gas: String = self
+            .rpc_call("eth_estimateGas", serde_json::json!([call]))
+            .await?;
+        parse_hex_u64(&gas).context("invalid eth_estimateGas result")
     }
 
     /// `eth_call` a no-arg view returning one 32-byte word (uint256 / bytes32).
@@ -5932,11 +6009,12 @@ fn strip_0x(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_cursor, beacon_words_match, classify_selector, decode_orchard_bundle_from_log_data,
-        eip1967_beacon_slot, encode_confirm_receipt_calldata, factory_log_matches,
-        getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, parse_address_set,
-        parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0, require_admin,
-        require_relayer, rlp_bytes, rlp_list, rlp_uint, Cli, EthLog, HourlyTxBudget, RpcClient,
+        advance_cursor, beacon_words_match, classify_selector, crank_gas_limit,
+        decode_orchard_bundle_from_log_data, eip1967_beacon_slot, encode_confirm_receipt_calldata,
+        factory_log_matches, getlogs_window_end, is_getlogs_range_error, normalize_hex_0x,
+        parse_address_set, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
+        require_admin, require_relayer, rlp_bytes, rlp_list, rlp_uint, Cli, EthLog, HourlyTxBudget,
+        RpcClient, MAX_CRANK_GAS_MARGIN_BPS,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use clap::CommandFactory;
@@ -5954,6 +6032,69 @@ mod tests {
         assert_eq!(
             gas_price.get_env(),
             Some(std::ffi::OsStr::new("PRIVACYBTC_INDEXER_GAS_PRICE"))
+        );
+    }
+
+    #[test]
+    fn crank_gas_policy_is_configurable_from_the_runtime_environment() {
+        let command = Cli::command();
+        let cap = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "gas_limit_update_root")
+            .expect("crank gas cap CLI argument");
+        assert_eq!(
+            cap.get_env(),
+            Some(std::ffi::OsStr::new("PRIVACYBTC_INDEXER_CRANK_GAS_LIMIT"))
+        );
+        let margin = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "crank_gas_margin_bps")
+            .expect("crank gas margin CLI argument");
+        assert_eq!(
+            margin.get_env(),
+            Some(std::ffi::OsStr::new(
+                "PRIVACYBTC_INDEXER_CRANK_GAS_MARGIN_BPS"
+            ))
+        );
+    }
+
+    #[test]
+    fn crank_gas_limit_uses_ceiling_margin_and_cap() {
+        assert_eq!(
+            crank_gas_limit(1_665_014, 200, 2_000_000).unwrap(),
+            1_698_315
+        );
+        assert_eq!(
+            crank_gas_limit(1_588_186, 200, 2_000_000).unwrap(),
+            1_619_950
+        );
+        assert_eq!(crank_gas_limit(2_000_000, 0, 2_000_000).unwrap(), 2_000_000);
+    }
+
+    #[test]
+    fn crank_gas_limit_fails_closed_for_invalid_or_over_cap_values() {
+        assert!(crank_gas_limit(0, 200, 2_000_000).is_err());
+        assert!(crank_gas_limit(1_000_000, 200, 0).is_err());
+        assert!(crank_gas_limit(1_900_000, 1_000, 2_000_000)
+            .unwrap_err()
+            .to_string()
+            .contains("above cap"));
+        assert!(crank_gas_limit(1_000_000, MAX_CRANK_GAS_MARGIN_BPS + 1, 2_000_000).is_err());
+        assert!(crank_gas_limit(u64::MAX, 200, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn crank_estimate_transaction_matches_the_signed_target() {
+        let to = "11".repeat(20);
+        let from = format!("0x{}", "22".repeat(20));
+        let call = RpcClient::transaction_call(&to, &[0xaa, 0xbb], Some(&from));
+        assert_eq!(call["to"], format!("0x{to}"));
+        assert_eq!(call["from"], from);
+        assert_eq!(call["data"], "0xaabb");
+        assert_eq!(call["value"], "0x0");
+        assert!(
+            call.get("gas").is_none(),
+            "RPC must estimate without a fixed gas"
         );
     }
 
