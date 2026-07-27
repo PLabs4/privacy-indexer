@@ -1532,7 +1532,7 @@ dependencies = [
 [[package]]
 name = "privacy-core"
 version = "0.1.8"
-source = "git+https://github.com/PLabs4/privacy-core.git?rev=71ede020988c7386c36fbc8f19376cf27f382a52#71ede020988c7386c36fbc8f19376cf27f382a52"
+source = "git+https://github.com/PLabs4/privacy-core.git?rev=30e2411c24c332e0633cf433456e25a51bd4b881#30e2411c24c332e0633cf433456e25a51bd4b881"
 dependencies = [
  "anyhow",
  "bitvec",

@@ -19,7 +19,9 @@ use clap::Parser;
 use futures_util::stream::{self, StreamExt};
 use futures_util::SinkExt;
 use k256::ecdsa::{RecoveryId, SigningKey};
-use privacy_core::commitment_tree::frontier::{FrontierTree, CMX_CONFIRM_MAX_BATCH};
+use privacy_core::commitment_tree::frontier::{
+    CmxConfirmWitnessInput, FrontierTree, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX,
+};
 use privacy_core::commitment_tree::frozen::{
     fr_from_be_bytes, fr_to_be_bytes, fr_to_le_hex, FrozenImt,
 };
@@ -42,6 +44,7 @@ use privacy_core::ethereum::{
     decode_swap_joined_log,
     decode_unshielded_log,
     encode_update_root_calldata,
+    encode_update_roots_calldata,
     note_added_topic0_alternatives,
     note_confirmed_topic0_hex,
     root_updated_topic0_hex,
@@ -58,6 +61,7 @@ use privacy_core::ethereum::{
     BundleActionCiphertexts,
     DecodedShieldPoolCreated,
     PrivacyCallArgs,
+    RootUpdateArgs,
 };
 use privacy_core::types::{OrchardIndexBatch, OrchardIndexedAbiNote, OrchardStoredBundle};
 use reqwest::Client;
@@ -189,13 +193,23 @@ struct Cli {
         default_value_t = 15
     )]
     crank_interval_secs: u64,
+    /// Maximum unchanged CmxConfirm proofs folded into one `updateRoots`
+    /// transaction. Each proof handles up to 8 queued commitments; valid range
+    /// is 1..=4, so one transaction confirms at most 32 leaves.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_MAX_PROOFS_PER_TX",
+        default_value_t = 4usize
+    )]
+    crank_max_proofs_per_tx: usize,
     /// Hard gas cap for `updateRoot` (Groth16 verify + up to 8 confirms) and
-    /// `syncBatchModel` (32 Poseidon folds). Every exact transaction is first
-    /// estimated and padded; the signer fails closed above this cap.
+    /// `updateRoots` (RLC verify + up to 32 confirms), and `syncBatchModel`
+    /// (32 Poseidon folds). Every exact transaction is first estimated and
+    /// padded; the signer fails closed above this cap.
     #[arg(
         long,
         env = "PRIVACYBTC_INDEXER_CRANK_GAS_LIMIT",
-        default_value_t = 2_000_000u64
+        default_value_t = 4_000_000u64
     )]
     gas_limit_update_root: u64,
     /// Safety margin applied to the exact crank `eth_estimateGas`, in basis
@@ -1517,6 +1531,11 @@ async fn main() -> Result<()> {
                 "--crank requires PRIVACYBTC_INDEXER_CRANK_GAS_LIMIT > 0"
             ));
         }
+        if !(1..=CMX_CONFIRM_MAX_PROOFS_PER_TX).contains(&cli.crank_max_proofs_per_tx) {
+            return Err(anyhow!(
+                "PRIVACYBTC_INDEXER_CRANK_MAX_PROOFS_PER_TX must be 1..={CMX_CONFIRM_MAX_PROOFS_PER_TX}"
+            ));
+        }
         if cli.crank_gas_margin_bps > MAX_CRANK_GAS_MARGIN_BPS {
             return Err(anyhow!(
                 "PRIVACYBTC_INDEXER_CRANK_GAS_MARGIN_BPS must be <= {MAX_CRANK_GAS_MARGIN_BPS}"
@@ -1629,6 +1648,7 @@ async fn main() -> Result<()> {
                         prover_url: cli.crank_prover_url.clone(),
                         prover_api_token: cli.crank_prover_api_token.clone().unwrap_or_default(),
                         interval_secs: cli.crank_interval_secs,
+                        max_proofs_per_tx: cli.crank_max_proofs_per_tx,
                         gas_limit_cap: cli.gas_limit_update_root,
                         gas_margin_bps: cli.crank_gas_margin_bps,
                         allowed_pools: parse_address_set(
@@ -1854,6 +1874,7 @@ struct CrankConfig {
     prover_url: String,
     prover_api_token: String,
     interval_secs: u64,
+    max_proofs_per_tx: usize,
     gas_limit_cap: u64,
     gas_margin_bps: u64,
     allowed_pools: HashSet<String>,
@@ -1902,10 +1923,10 @@ fn unix_seconds() -> u64 {
 ///      `pendingCmxCount`). Pools on the pre-batch implementation are skipped.
 ///   2. If the pool is a freshly-upgraded legacy pool (`confirmedRoot == 0`),
 ///      submit the one-time `syncBatchModel()` migration.
-///   3. Otherwise, take the next `j <= CMX_CONFIRM_MAX_BATCH` locally-indexed
-///      leaves at the chain watermark, plan the batch with the shared
-///      `FrontierTree` (byte-identical to the on-chain IMT), request a
-///      `cmxconfirm_evm` proof from the prover service, and submit `updateRoot`.
+///   3. Otherwise, take up to `8 * max_proofs_per_tx` locally-indexed leaves at
+///      the chain watermark, plan consecutive unchanged-circuit segments with
+///      the shared `FrontierTree`, request their proofs concurrently, and submit
+///      `updateRoots`. A single-segment tail retains the `updateRoot` fallback.
 ///
 /// The chain is the source of truth for the watermark: local state is only used
 /// for the leaf values (which the contract itself cross-checks — the queue
@@ -1927,13 +1948,16 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
     let mut tx_budget = HourlyTxBudget::new(cfg.max_tx_per_hour);
 
     println!(
-        "[crank] updateRoot crank ON (prover={}, interval={}s, account=0x{})",
+        "[crank] root crank ON (prover={}, interval={}s, max_proofs_per_tx={}, max_leaves_per_tx={}, account=0x{})",
         cfg.prover_url,
         cfg.interval_secs,
+        cfg.max_proofs_per_tx,
+        CMX_CONFIRM_MAX_BATCH * cfg.max_proofs_per_tx,
         hex::encode(cfg.signer.address)
     );
 
     loop {
+        let mut made_progress = false;
         let pools: Vec<AppContext> = { reg.pools.read().await.values().cloned().collect() };
         for ctx in pools {
             let pool = ctx.contract_address.clone();
@@ -1976,7 +2000,7 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
                 )
                 .await
                 {
-                    Ok(true) => {}
+                    Ok(true) => made_progress = true,
                     Ok(false) => eprintln!("[crank][{label}] syncBatchModel reverted"),
                     Err(e) => eprintln!("[crank][{label}] syncBatchModel failed: {e:#}"),
                 }
@@ -1998,7 +2022,8 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
             // 3. Local leaves at the chain watermark.
             let (leaves, local_len) = {
                 let s = ctx.state.read().await;
-                let take = (chain_pending as usize).min(CMX_CONFIRM_MAX_BATCH);
+                let take =
+                    (chain_pending as usize).min(CMX_CONFIRM_MAX_BATCH * cfg.max_proofs_per_tx);
                 let end = ((chain_count as usize) + take).min(s.cmx_ordered.len());
                 let leaves: Vec<[u8; 32]> = s
                     .cmx_ordered
@@ -2051,55 +2076,113 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
                 continue;
             }
 
-            // 4. Plan the batch (on a clone — commit only after on-chain success),
-            //    prove, and submit.
+            // 4. Plan consecutive unchanged-circuit segments on a clone (commit
+            //    only after aggregate on-chain success), prove all segments
+            //    concurrently, and submit one updateRoot/updateRoots transaction.
             let mut planned = frontier.clone();
-            let input = planned.plan_batch(&leaves);
-            let j = input.batch_size();
+            let inputs = planned.plan_batches(&leaves, cfg.max_proofs_per_tx);
+            let total_j: u64 = inputs.iter().map(CmxConfirmWitnessInput::batch_size).sum();
             println!(
-                "[crank][{label}] confirming batch j={j} at count {chain_count} (chain pending {chain_pending})"
+                "[crank][{label}] confirming {} proof segment(s), leaves={total_j}, count={chain_count}, chain_pending={chain_pending}",
+                inputs.len()
             );
 
-            let proof = match prove_cmxconfirm(
-                &prover_http,
-                &cfg.prover_url,
-                &cfg.prover_api_token,
-                &input,
-            )
-            .await
-            {
-                Ok(p) => p,
+            let proof_results = stream::iter(inputs.clone().into_iter().enumerate())
+                .map(|(segment, input)| {
+                    let http = prover_http.clone();
+                    let prover_url = cfg.prover_url.clone();
+                    let prover_api_token = cfg.prover_api_token.clone();
+                    async move {
+                        prove_cmxconfirm(&http, &prover_url, &prover_api_token, &input)
+                            .await
+                            .with_context(|| format!("proof segment {}", segment + 1))
+                    }
+                })
+                .buffered(inputs.len())
+                .collect::<Vec<_>>()
+                .await;
+            let proofs: Vec<Vec<u8>> = match proof_results.into_iter().collect::<Result<Vec<_>>>() {
+                Ok(proofs) => proofs,
                 Err(e) => {
-                    eprintln!("[crank][{label}] proof generation failed: {e:#}");
+                    eprintln!("[crank][{label}] concurrent proof generation failed: {e:#}");
                     continue;
                 }
             };
-            let calldata = encode_update_root_calldata(
-                &input.new_root_be(),
-                &input.new_frontier_commit_be(),
-                j,
-                &proof,
-            );
-            match submit_crank_tx(&rpc, &cfg, &mut tx_budget, &pool, &calldata, "updateRoot").await
-            {
+            let (calldata, method) = match encode_crank_root_calldata(&inputs, &proofs) {
+                Ok(encoded) => encoded,
+                Err(e) => {
+                    eprintln!("[crank][{label}] aggregate calldata build failed: {e:#}");
+                    continue;
+                }
+            };
+            match submit_crank_tx(&rpc, &cfg, &mut tx_budget, &pool, &calldata, method).await {
                 Ok(true) => {
+                    let final_input = inputs.last().expect("non-empty root update plan");
                     println!(
-                        "[crank][{label}] updateRoot confirmed: count {chain_count} → {} root={}",
-                        chain_count + j,
-                        hex::encode(input.new_root_be())
+                        "[crank][{label}] {method} confirmed: count {chain_count} → {} root={}",
+                        chain_count + total_j,
+                        hex::encode(final_input.new_root_be())
                     );
                     *frontier = planned;
+                    made_progress = true;
                 }
                 Ok(false) => {
                     // Raced by another cranker or state changed under us — the next
                     // tick re-reads chain state and replans.
-                    eprintln!("[crank][{label}] updateRoot reverted (raced?); will replan");
+                    eprintln!("[crank][{label}] {method} reverted (raced?); will replan");
                 }
-                Err(e) => eprintln!("[crank][{label}] updateRoot submit failed: {e:#}"),
+                Err(e) => eprintln!("[crank][{label}] {method} submit failed: {e:#}"),
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(cfg.interval_secs.max(1))).await;
+        if made_progress {
+            // Re-read the chain immediately while a backlog remains. This removes
+            // the fixed interval from the hot path without pipelining dependent
+            // root transactions or nonces.
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_secs(cfg.interval_secs.max(1))).await;
+        }
     }
+}
+
+fn encode_crank_root_calldata(
+    inputs: &[CmxConfirmWitnessInput],
+    proofs: &[Vec<u8>],
+) -> Result<(Vec<u8>, &'static str)> {
+    if inputs.is_empty()
+        || inputs.len() > CMX_CONFIRM_MAX_PROOFS_PER_TX
+        || inputs.len() != proofs.len()
+    {
+        return Err(anyhow!(
+            "root update plan/proof cardinality must match in 1..={CMX_CONFIRM_MAX_PROOFS_PER_TX}"
+        ));
+    }
+    if proofs.iter().any(|proof| proof.len() != 256) {
+        return Err(anyhow!("each CmxConfirm proof must be exactly 256 bytes"));
+    }
+    if inputs.len() == 1 {
+        let input = &inputs[0];
+        return Ok((
+            encode_update_root_calldata(
+                &input.new_root_be(),
+                &input.new_frontier_commit_be(),
+                input.batch_size(),
+                &proofs[0],
+            ),
+            "updateRoot",
+        ));
+    }
+    let updates: Vec<RootUpdateArgs> = inputs
+        .iter()
+        .zip(proofs)
+        .map(|(input, proof)| RootUpdateArgs {
+            new_root: input.new_root_be(),
+            new_frontier_commit: input.new_frontier_commit_be(),
+            j: input.batch_size(),
+            proof: proof.clone(),
+        })
+        .collect();
+    Ok((encode_update_roots_calldata(&updates), "updateRoots"))
 }
 
 /// POST the circom witness input to the prover's `/cmxconfirm/prove`; returns the
@@ -2128,7 +2211,14 @@ async fn prove_cmxconfirm(
         proof_hex: String,
     }
     let out: ProveResponse = serde_json::from_str(&body).context("prover response JSON")?;
-    hex::decode(out.proof_hex.trim_start_matches("0x")).context("proof hex")
+    let proof = hex::decode(out.proof_hex.trim_start_matches("0x")).context("proof hex")?;
+    if proof.len() != 256 {
+        return Err(anyhow!(
+            "prover returned {} proof bytes; expected 256",
+            proof.len()
+        ));
+    }
+    Ok(proof)
 }
 
 /// Simulate (`eth_call`), estimate and submit one crank transaction, then wait
@@ -6011,13 +6101,15 @@ mod tests {
     use super::{
         advance_cursor, beacon_words_match, classify_selector, crank_gas_limit,
         decode_orchard_bundle_from_log_data, eip1967_beacon_slot, encode_confirm_receipt_calldata,
-        factory_log_matches, getlogs_window_end, is_getlogs_range_error, normalize_hex_0x,
-        parse_address_set, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
-        require_admin, require_relayer, rlp_bytes, rlp_list, rlp_uint, Cli, EthLog, HourlyTxBudget,
-        RpcClient, MAX_CRANK_GAS_MARGIN_BPS,
+        encode_crank_root_calldata, factory_log_matches, getlogs_window_end,
+        is_getlogs_range_error, normalize_hex_0x, parse_address_set, parse_bytes32_strict,
+        parse_tx_meta, perc20_deployed_topic0, require_admin, require_relayer, rlp_bytes, rlp_list,
+        rlp_uint, Cli, EthLog, HourlyTxBudget, RpcClient, MAX_CRANK_GAS_MARGIN_BPS,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use clap::CommandFactory;
+    use privacy_core::commitment_tree::frontier::{FrontierTree, CMX_CONFIRM_MAX_PROOFS_PER_TX};
+    use privacy_core::ethereum::{update_root_selector, update_roots_selector};
     use privacy_core::types::OrchardStoredBundle;
     use sha3::{Digest, Keccak256};
     use std::sync::Arc;
@@ -6056,6 +6148,42 @@ mod tests {
                 "PRIVACYBTC_INDEXER_CRANK_GAS_MARGIN_BPS"
             ))
         );
+        let max_proofs = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "crank_max_proofs_per_tx")
+            .expect("crank max proofs CLI argument");
+        assert_eq!(
+            max_proofs.get_env(),
+            Some(std::ffi::OsStr::new(
+                "PRIVACYBTC_INDEXER_CRANK_MAX_PROOFS_PER_TX"
+            ))
+        );
+    }
+
+    #[test]
+    fn crank_calldata_keeps_single_fallback_and_uses_rlc_for_multiple_segments() {
+        let leaves = [[1u8; 32]; 9];
+        let mut tree = FrontierTree::new();
+        let inputs = tree.plan_batches(&leaves, CMX_CONFIRM_MAX_PROOFS_PER_TX);
+        let proofs = vec![vec![0x11; 256], vec![0x22; 256]];
+
+        let (single, method) =
+            encode_crank_root_calldata(&inputs[..1], &proofs[..1]).expect("single calldata");
+        assert_eq!(method, "updateRoot");
+        assert_eq!(&single[..4], &update_root_selector());
+
+        let (aggregate, method) =
+            encode_crank_root_calldata(&inputs, &proofs).expect("aggregate calldata");
+        assert_eq!(method, "updateRoots");
+        assert_eq!(&aggregate[..4], &update_roots_selector());
+    }
+
+    #[test]
+    fn crank_calldata_rejects_missing_or_malformed_proofs() {
+        let mut tree = FrontierTree::new();
+        let inputs = tree.plan_batches(&[[1u8; 32]; 9], 4);
+        assert!(encode_crank_root_calldata(&inputs, &[]).is_err());
+        assert!(encode_crank_root_calldata(&inputs, &[vec![0u8; 255], vec![0u8; 256]]).is_err());
     }
 
     #[test]
