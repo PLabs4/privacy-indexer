@@ -1894,7 +1894,7 @@ impl HourlyTxBudget {
         }
     }
 
-    fn try_take(&mut self, now_seconds: u64) -> bool {
+    fn prune(&mut self, now_seconds: u64) {
         while self
             .submitted_at
             .front()
@@ -1902,11 +1902,41 @@ impl HourlyTxBudget {
         {
             self.submitted_at.pop_front();
         }
+    }
+
+    fn retry_after_seconds(&mut self, now_seconds: u64) -> Option<u64> {
+        self.prune(now_seconds);
+        if (self.submitted_at.len() as u64) < self.limit {
+            return None;
+        }
+        self.submitted_at
+            .front()
+            .map(|at| at.saturating_add(3600).saturating_sub(now_seconds).max(1))
+    }
+
+    fn try_take(&mut self, now_seconds: u64) -> bool {
+        self.prune(now_seconds);
         if self.submitted_at.len() as u64 >= self.limit {
             return false;
         }
         self.submitted_at.push_back(now_seconds);
         true
+    }
+}
+
+/// `None` keeps the crank hot: a successful batch is followed by an immediate
+/// chain re-read so a non-empty queue drains continuously. Empty/no-progress
+/// passes use the normal poll interval, while an exhausted rolling budget sleeps
+/// exactly until its oldest slot becomes available.
+fn crank_next_delay_secs(
+    made_progress: bool,
+    budget_retry_after_secs: Option<u64>,
+    interval_secs: u64,
+) -> Option<u64> {
+    match budget_retry_after_secs {
+        Some(wait) => Some(wait.max(1)),
+        None if made_progress => None,
+        None => Some(interval_secs.max(1)),
     }
 }
 
@@ -1948,11 +1978,12 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
     let mut tx_budget = HourlyTxBudget::new(cfg.max_tx_per_hour);
 
     println!(
-        "[crank] root crank ON (prover={}, interval={}s, max_proofs_per_tx={}, max_leaves_per_tx={}, account=0x{})",
+        "[crank] root crank ON (prover={}, interval={}s, max_proofs_per_tx={}, max_leaves_per_tx={}, max_tx_per_hour={}, account=0x{})",
         cfg.prover_url,
         cfg.interval_secs,
         cfg.max_proofs_per_tx,
         CMX_CONFIRM_MAX_BATCH * cfg.max_proofs_per_tx,
+        cfg.max_tx_per_hour,
         hex::encode(cfg.signer.address)
     );
 
@@ -1964,6 +1995,12 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
             let label = pool[..10.min(pool.len())].to_string();
             if !cfg.allowed_pools.contains(&pool.to_lowercase()) {
                 continue;
+            }
+            if let Some(wait) = tx_budget.retry_after_seconds(unix_seconds()) {
+                println!(
+                    "[crank] rolling hourly transaction budget exhausted; retrying in {wait}s"
+                );
+                break;
             }
             match reg.verify_pool_current(&pool).await {
                 Ok(true) => {}
@@ -2134,13 +2171,17 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
                 Err(e) => eprintln!("[crank][{label}] {method} submit failed: {e:#}"),
             }
         }
-        if made_progress {
-            // Re-read the chain immediately while a backlog remains. This removes
-            // the fixed interval from the hot path without pipelining dependent
-            // root transactions or nonces.
-            tokio::task::yield_now().await;
-        } else {
-            tokio::time::sleep(std::time::Duration::from_secs(cfg.interval_secs.max(1))).await;
+        let budget_retry_after_secs = tx_budget.retry_after_seconds(unix_seconds());
+        match crank_next_delay_secs(made_progress, budget_retry_after_secs, cfg.interval_secs) {
+            None => {
+                // Re-read the chain immediately while a backlog remains. This
+                // removes the fixed interval from the hot path without
+                // pipelining dependent root transactions or nonces.
+                tokio::task::yield_now().await;
+            }
+            Some(delay) => {
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
         }
     }
 }
@@ -6100,15 +6141,18 @@ fn strip_0x(s: &str) -> &str {
 mod tests {
     use super::{
         advance_cursor, beacon_words_match, classify_selector, crank_gas_limit,
-        decode_orchard_bundle_from_log_data, eip1967_beacon_slot, encode_confirm_receipt_calldata,
-        encode_crank_root_calldata, factory_log_matches, getlogs_window_end,
-        is_getlogs_range_error, normalize_hex_0x, parse_address_set, parse_bytes32_strict,
-        parse_tx_meta, perc20_deployed_topic0, require_admin, require_relayer, rlp_bytes, rlp_list,
-        rlp_uint, Cli, EthLog, HourlyTxBudget, RpcClient, MAX_CRANK_GAS_MARGIN_BPS,
+        crank_next_delay_secs, decode_orchard_bundle_from_log_data, eip1967_beacon_slot,
+        encode_confirm_receipt_calldata, encode_crank_root_calldata, factory_log_matches,
+        getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, parse_address_set,
+        parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0, require_admin,
+        require_relayer, rlp_bytes, rlp_list, rlp_uint, Cli, EthLog, HourlyTxBudget, RpcClient,
+        MAX_CRANK_GAS_MARGIN_BPS,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use clap::CommandFactory;
-    use privacy_core::commitment_tree::frontier::{FrontierTree, CMX_CONFIRM_MAX_PROOFS_PER_TX};
+    use privacy_core::commitment_tree::frontier::{
+        FrontierTree, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX,
+    };
     use privacy_core::ethereum::{update_root_selector, update_roots_selector};
     use privacy_core::types::OrchardStoredBundle;
     use sha3::{Digest, Keccak256};
@@ -6158,10 +6202,22 @@ mod tests {
                 "PRIVACYBTC_INDEXER_CRANK_MAX_PROOFS_PER_TX"
             ))
         );
+        let hourly_budget = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "crank_max_tx_per_hour")
+            .expect("crank hourly budget CLI argument");
+        assert_eq!(
+            hourly_budget.get_env(),
+            Some(std::ffi::OsStr::new(
+                "PRIVACYBTC_INDEXER_CRANK_MAX_TX_PER_HOUR"
+            ))
+        );
     }
 
     #[test]
     fn crank_calldata_keeps_single_fallback_and_uses_rlc_for_multiple_segments() {
+        assert_eq!(CMX_CONFIRM_MAX_BATCH, 8);
+        assert_eq!(CMX_CONFIRM_MAX_PROOFS_PER_TX, 4);
         let leaves = [[1u8; 32]; 9];
         let mut tree = FrontierTree::new();
         let inputs = tree.plan_batches(&leaves, CMX_CONFIRM_MAX_PROOFS_PER_TX);
@@ -6410,6 +6466,28 @@ mod tests {
         assert!(!budget.try_take(30));
         assert!(budget.try_take(3610));
         assert!(!budget.try_take(3611));
+    }
+
+    #[test]
+    fn crank_hourly_budget_supports_four_hundred_transactions_and_precise_backoff() {
+        let mut budget = HourlyTxBudget::new(400);
+        for _ in 0..400 {
+            assert!(budget.try_take(10));
+        }
+        assert!(!budget.try_take(10));
+        assert_eq!(budget.retry_after_seconds(10), Some(3600));
+        assert_eq!(budget.retry_after_seconds(3609), Some(1));
+        assert_eq!(budget.retry_after_seconds(3610), None);
+        assert!(budget.try_take(3610));
+    }
+
+    #[test]
+    fn successful_crank_batches_stay_hot_until_the_budget_requires_backoff() {
+        assert_eq!(crank_next_delay_secs(true, None, 15), None);
+        assert_eq!(crank_next_delay_secs(false, None, 15), Some(15));
+        assert_eq!(crank_next_delay_secs(false, None, 0), Some(1));
+        assert_eq!(crank_next_delay_secs(true, Some(27), 15), Some(27));
+        assert_eq!(crank_next_delay_secs(false, Some(0), 15), Some(1));
     }
 
     #[test]
