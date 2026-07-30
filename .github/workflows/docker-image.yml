@@ -10,6 +10,8 @@ env:
 on:
   push:
     branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
   workflow_dispatch:
 
 concurrency:
@@ -17,7 +19,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test locked dependency graph
+        run: cargo test --locked
+
   build-push:
+    needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
