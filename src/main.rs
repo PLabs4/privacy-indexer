@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, Method, StatusCode},
@@ -22,9 +22,7 @@ use k256::ecdsa::{RecoveryId, SigningKey};
 use privacy_core::commitment_tree::frontier::{
     CmxConfirmWitnessInput, FrontierTree, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX,
 };
-use privacy_core::commitment_tree::frozen::{
-    fr_from_be_bytes, fr_to_be_bytes, fr_to_le_hex, FrozenImt,
-};
+use privacy_core::commitment_tree::frozen::fr_to_be_bytes;
 use privacy_core::commitment_tree::OrchardCommitmentTree;
 use privacy_core::ethereum::{
     bundle_actions_by_cmx,
@@ -450,10 +448,11 @@ struct SharedState {
     pending_tx_hashes: VecDeque<String>,
     /// Parsed `bundle()` calldata per tx (for OVK `out_ciphertext` + `cv_net_x`).
     bundle_out_cache: HashMap<String, HashMap<[u8; 32], BundleActionCiphertexts>>,
-    /// Compliance frozen-set (sorted Indexed Merkle Tree). `frozen.root()` is the
-    /// `rt_frozen` / `cmxFrozenRoot()` the prover and contract must agree on. Starts
-    /// as the empty-blacklist tree; admins freeze a `cmx` via `POST /frozen`.
-    frozen: FrozenImt,
+    /// Ordered feed of compliance blacklist leaf deltas, ingested from on-chain
+    /// `FrozenRootUpdated` events (frozen-tree-execution-plan PR2). The indexer no longer
+    /// maintains the Frozen IMT or serves witnesses — wallets pull this feed and rebuild the
+    /// tree locally. Append-only, in `(block_number, log_index)` order.
+    frozen_updates: Vec<FrozenUpdate>,
 }
 
 // ─── Signing (ETH transaction relay) ─────────────────────────────────────────
@@ -585,14 +584,6 @@ impl PoolBuilder {
             );
         }
 
-        // Rebuild the compliance frozen Indexed-MT by replaying frozen cmx in order.
-        let restored_frozen = FrozenImt::from_frozen_values(
-            &ck.frozen_cmx
-                .iter()
-                .filter_map(fr_from_be_bytes)
-                .collect::<Vec<_>>(),
-        );
-
         let shared = Arc::new(RwLock::new(SharedState {
             next_block: ck.next_block,
             latest_seq: ck.latest_seq,
@@ -615,7 +606,7 @@ impl PoolBuilder {
             pending_timeout_blocks: self.pending_timeout_blocks,
             pending_tx_hashes: ck.pending_tx_hashes,
             bundle_out_cache: HashMap::new(),
-            frozen: restored_frozen,
+            frozen_updates: ck.frozen_updates,
         }));
 
         let (batch_tx, _) = broadcast::channel::<BatchEnvelope>(256);
@@ -1681,8 +1672,8 @@ async fn main() -> Result<()> {
         .route("/pool_meta", get(get_pool_meta))
         .route("/shield/stats", get(get_shield_stats))
         .route("/frozen_root", get(get_frozen_root))
-        .route("/frozen_witness", get(get_frozen_witness))
-        .route("/frozen", post(post_frozen))
+        .route("/frozen_updates", get(get_frozen_updates))
+        .route("/frozen_leaves", get(get_frozen_leaves))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -1715,6 +1706,12 @@ fn perc20_deployed_topic0() -> String {
 
 fn shield_pool_deployed_topic0() -> String {
     event_topic0(b"ShieldPoolDeployed(address,address,address,uint256)")
+}
+
+/// topic0 of `FrozenRootUpdated(uint256 oldRoot, uint256 newRoot, uint256[] cmxChanged,
+/// bool[] isAdd)` — the compliance blacklist leaf-delta disclosure (frozen-tree-execution-plan).
+fn frozen_root_updated_topic0() -> String {
+    event_topic0(b"FrozenRootUpdated(uint256,uint256,uint256[],bool[])")
 }
 
 fn eip1967_beacon_slot() -> [u8; 32] {
@@ -3499,7 +3496,143 @@ struct FrozenRootResponse {
     frozen_count: usize,
 }
 
-/// `GET /frozen_root` — current compliance root for a pool's blacklist.
+// ─── Frozen leaf-delta feed (frozen-tree-execution-plan PR2) ──────────────────
+//
+// The indexer stays DUMB: it ingests `FrozenRootUpdated` events and appends the raw
+// leaf delta to an ordered per-pool feed. It does NOT rebuild a Frozen IMT or recompute
+// roots — that is the wallet's job (§2/§4). Wallets pull `GET /frozen_updates?since=cursor`
+// and replay the deltas to maintain their own tree, asserting `localRoot == cmxFrozenRoot()`
+// on-chain before proving. The `(block_number, log_index)` pair is the cursor and preserves
+// on-chain order. Reorg safety is intentionally NOT handled here: a reverted delta is caught
+// downstream by the wallet's `eth_call cmxFrozenRoot()` vs local-root check (fail-closed), so
+// do NOT add indexer-side reorg logic for this feature (see ENG-03/PRO-14 scope).
+
+/// One ingested `FrozenRootUpdated` leaf delta.
+#[derive(Clone, Serialize, Deserialize)]
+struct FrozenUpdate {
+    /// Cursor components (strictly increasing in on-chain order).
+    block_number: u64,
+    log_index: u64,
+    tx_hash: String,
+    /// `oldRoot` / `newRoot` as 0x big-endian 32-byte hex (the on-chain `uint256` words).
+    old_root_hex: String,
+    new_root_hex: String,
+    /// `cmx` leaves changed this update, 0x big-endian hex, in IMT-apply order.
+    cmx_changed_hex: Vec<String>,
+    /// Per-leaf op: `true` (=1) added, `false` (=0) removed. Same length as `cmx_changed_hex`.
+    is_add: Vec<bool>,
+}
+
+#[derive(Serialize)]
+struct FrozenUpdatesResponse {
+    /// Deltas strictly AFTER the requested cursor, in on-chain order.
+    updates: Vec<FrozenUpdate>,
+    /// Opaque cursor to pass as `since` next time (the last returned entry's cursor, or the
+    /// caller's `since` when nothing new). Format: `"<block>:<logIndex>"`.
+    cursor: String,
+}
+
+/// Decoded `FrozenRootUpdated(uint256,uint256,uint256[],bool[])` payload (all non-indexed,
+/// so the entire tuple lives in `log.data`).
+struct FrozenDelta {
+    old_root: [u8; 32],
+    new_root: [u8; 32],
+    cmx_changed: Vec<[u8; 32]>,
+    is_add: Vec<bool>,
+}
+
+/// Manually ABI-decode `FrozenRootUpdated` log `data` (head/tail dynamic-array encoding).
+/// Pinned to a `cast abi-encode` fixture in the unit tests below.
+fn decode_frozen_root_updated_log(data_hex: &str) -> Result<FrozenDelta> {
+    let bytes = hex::decode(data_hex.trim_start_matches("0x"))
+        .context("FrozenRootUpdated: data is not valid hex")?;
+    let word = |byte_off: usize| -> Result<[u8; 32]> {
+        bytes
+            .get(byte_off..byte_off + 32)
+            .map(|s| {
+                let mut w = [0u8; 32];
+                w.copy_from_slice(s);
+                w
+            })
+            .ok_or_else(|| anyhow!("FrozenRootUpdated: data too short at byte offset {byte_off}"))
+    };
+    // A 32-byte word → usize, rejecting absurd sizes (guards a malformed/huge length or offset).
+    let word_to_usize = |w: &[u8; 32]| -> Result<usize> {
+        if w[..24].iter().any(|&b| b != 0) {
+            bail!("FrozenRootUpdated: value exceeds usize");
+        }
+        Ok(u64::from_be_bytes(w[24..].try_into().unwrap()) as usize)
+    };
+    let read_array = |head_word_idx: usize| -> Result<Vec<[u8; 32]>> {
+        let off = word_to_usize(&word(head_word_idx * 32)?)?;
+        let len = word_to_usize(&word(off)?)?;
+        // Sanity bound: an update carries a small compliance delta, never megabytes.
+        if len > 100_000 {
+            bail!("FrozenRootUpdated: array length {len} implausibly large");
+        }
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            out.push(word(off + 32 + i * 32)?);
+        }
+        Ok(out)
+    };
+
+    let old_root = word(0)?;
+    let new_root = word(32)?;
+    let cmx_changed = read_array(2)?;
+    let is_add_words = read_array(3)?;
+    if cmx_changed.len() != is_add_words.len() {
+        bail!(
+            "FrozenRootUpdated: cmxChanged ({}) / isAdd ({}) length mismatch",
+            cmx_changed.len(),
+            is_add_words.len()
+        );
+    }
+    let is_add = is_add_words
+        .iter()
+        .map(|w| w.iter().any(|&b| b != 0))
+        .collect();
+    Ok(FrozenDelta {
+        old_root,
+        new_root,
+        cmx_changed,
+        is_add,
+    })
+}
+
+/// Replay the ingested delta feed into the current frozen leaf set (0x big-endian hex). Add
+/// inserts (idempotent); remove deletes. Ordering here is the most-recent-add order and is only
+/// cosmetic — the prover re-sorts the set when rebuilding the IMT (`frozen_populated_tree_root`).
+fn replay_frozen_set(updates: &[FrozenUpdate]) -> Vec<String> {
+    let mut set: Vec<String> = Vec::new();
+    for u in updates {
+        for (cmx, &add) in u.cmx_changed_hex.iter().zip(u.is_add.iter()) {
+            if add {
+                if !set.iter().any(|c| c == cmx) {
+                    set.push(cmx.clone());
+                }
+            } else {
+                set.retain(|c| c != cmx);
+            }
+        }
+    }
+    set
+}
+
+/// Latest `newRoot` disclosed on-chain (from the feed), or the all-zero placeholder if no
+/// update has been ingested yet. The AUTHORITATIVE root is always the pool's on-chain
+/// `cmxFrozenRoot()`; this is a feed-derived convenience.
+fn latest_frozen_root_hex(updates: &[FrozenUpdate]) -> String {
+    updates
+        .last()
+        .map(|u| u.new_root_hex.clone())
+        .unwrap_or_else(|| format!("0x{}", "00".repeat(32)))
+}
+
+/// `GET /frozen_root` — latest compliance root disclosed on-chain (feed-derived, PR2). The
+/// admin sets this via `setFrozenRoot`; the authoritative source is the pool's on-chain
+/// `cmxFrozenRoot()`. Returns the last ingested `newRoot` as 0x big-endian hex; `frozen_count`
+/// is the net leaf count after replaying the delta feed (adds − removes).
 async fn get_frozen_root(
     State(reg): State<PoolRegistry>,
     Query(q): Query<SimplePoolQuery>,
@@ -3507,88 +3640,82 @@ async fn get_frozen_root(
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let s = ctx.state.read().await;
     Ok(Json(FrozenRootResponse {
-        root_hex: fr_to_le_hex(s.frozen.root()),
-        frozen_count: s.frozen.len().saturating_sub(1),
+        root_hex: latest_frozen_root_hex(&s.frozen_updates),
+        frozen_count: replay_frozen_set(&s.frozen_updates).len(),
     }))
 }
 
 #[derive(Serialize)]
-struct FrozenWitnessResponse {
-    /// Bracketing low-leaf and its `next` pointer (LE hex).
-    low_val: String,
-    low_next_val: String,
-    /// 20 Merkle siblings + path bits (LE hex), matching `FrozenCmxNonMember`.
-    siblings: Vec<String>,
-    path_bits: Vec<String>,
-    /// The root this witness opens to (== `/frozen_root`).
+struct FrozenLeavesResponse {
+    /// Current frozen `cmx` set (`cm_old.x` values, 0x big-endian hex). Feed this directly to the
+    /// prover's `frozen_blacklist`; the prover re-sorts and rebuilds the Frozen IMT.
+    leaves: Vec<String>,
+    /// The latest on-chain `newRoot` these leaves SHOULD reproduce. The wallet MUST still read the
+    /// authoritative `cmxFrozenRoot()` from chain itself and pass it as `expected_frozen_root` so
+    /// the prover fail-closes on a stale/incorrect set — do NOT trust this value alone.
     root_hex: String,
+    count: usize,
 }
 
-/// `GET /frozen_witness?cmx=` — non-membership witness for `cmx`, or 409 if frozen.
-async fn get_frozen_witness(
+/// `GET /frozen_leaves?pool=` — the CURRENT compliance blacklist as a full leaf set (PR2, the
+/// simplified wallet path). The indexer replays its ingested `FrozenRootUpdated` deltas into the
+/// live set so the wallet can read it directly (no local tree). Safety still comes from the
+/// wallet passing the on-chain `cmxFrozenRoot()` as `expected_frozen_root`: the prover verifies
+/// `frozen_populated_tree_root(leaves) == cmxFrozenRoot()` and rejects a mismatch. The
+/// append-only `/frozen_updates` feed remains for auditing / trustless cold-start.
+async fn get_frozen_leaves(
     State(reg): State<PoolRegistry>,
-    Query(q): Query<NoteLookupQuery>,
-) -> Result<Json<FrozenWitnessResponse>, (StatusCode, String)> {
+    Query(q): Query<SimplePoolQuery>,
+) -> Result<Json<FrozenLeavesResponse>, (StatusCode, String)> {
     let ctx = reg.resolve(q.pool.as_deref()).await?;
-    let cmx_be = parse_hex32(&q.cmx)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx hex".to_owned()))?;
-    let cmx = fr_from_be_bytes(&cmx_be).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "cmx is not a canonical field element".to_owned(),
-        )
-    })?;
     let s = ctx.state.read().await;
-    let w = s.frozen.non_membership_witness(cmx).ok_or_else(|| {
-        (
-            StatusCode::CONFLICT,
-            "cmx is frozen; no non-membership witness".to_owned(),
-        )
-    })?;
-    Ok(Json(FrozenWitnessResponse {
-        low_val: fr_to_le_hex(w.low_val),
-        low_next_val: fr_to_le_hex(w.low_next_val),
-        siblings: w.siblings.iter().map(|f| fr_to_le_hex(*f)).collect(),
-        path_bits: w.path_bits.iter().map(|f| fr_to_le_hex(*f)).collect(),
-        root_hex: fr_to_le_hex(s.frozen.root()),
+    let leaves = replay_frozen_set(&s.frozen_updates);
+    Ok(Json(FrozenLeavesResponse {
+        count: leaves.len(),
+        root_hex: latest_frozen_root_hex(&s.frozen_updates),
+        leaves,
     }))
 }
 
 #[derive(Deserialize)]
-struct FreezeRequest {
-    /// `cmx` to freeze, big-endian hex (with or without `0x`).
-    cmx_hex: String,
+struct FrozenUpdatesQuery {
+    #[serde(default)]
+    pool: Option<String>,
+    /// Cursor `"<block>:<logIndex>"`; only deltas strictly after it are returned. Omit for all.
+    #[serde(default)]
+    since: Option<String>,
 }
 
-/// `POST /frozen` (admin) — freeze a `cmx`: splice it into the sorted IMT
-/// (update predecessor's `next` + append) and return the new root. Idempotent.
-async fn post_frozen(
+/// `GET /frozen_updates?pool=&since=cursor` — the compliance leaf-delta feed (PR2 main path).
+/// Wallets replay these deltas to maintain their local Frozen IMT, then assert
+/// `localRoot == cmxFrozenRoot()` on-chain before proving. The indexer stays dumb: it does not
+/// rebuild the tree or serve witnesses.
+async fn get_frozen_updates(
     State(reg): State<PoolRegistry>,
-    headers: HeaderMap,
-    Query(q): Query<SimplePoolQuery>,
-    Json(req): Json<FreezeRequest>,
-) -> Result<Json<FrozenRootResponse>, (StatusCode, String)> {
-    require_admin(&headers, reg.admin_token.as_ref())?;
+    Query(q): Query<FrozenUpdatesQuery>,
+) -> Result<Json<FrozenUpdatesResponse>, (StatusCode, String)> {
     let ctx = reg.resolve(q.pool.as_deref()).await?;
-    let cmx_be = parse_hex32(&req.cmx_hex)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx_hex".to_owned()))?;
-    let cmx = fr_from_be_bytes(&cmx_be).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "cmx is not a canonical field element".to_owned(),
-        )
-    })?;
-    let resp = {
-        let mut s = ctx.state.write().await;
-        s.frozen.insert(cmx); // no-op if already frozen or cmx == 0
-        let resp = FrozenRootResponse {
-            root_hex: fr_to_le_hex(s.frozen.root()),
-            frozen_count: s.frozen.len().saturating_sub(1),
-        };
-        ctx.persist.notify(&s); // persist the updated frozen set
-        resp
-    };
-    Ok(Json(resp))
+    // Parse the cursor into (block, logIndex); malformed/absent = from the beginning.
+    let after = q.since.as_deref().and_then(|s| {
+        let (b, l) = s.split_once(':')?;
+        Some((b.parse::<u64>().ok()?, l.parse::<u64>().ok()?))
+    });
+    let s = ctx.state.read().await;
+    let updates: Vec<FrozenUpdate> = s
+        .frozen_updates
+        .iter()
+        .filter(|u| match after {
+            Some((b, l)) => (u.block_number, u.log_index) > (b, l),
+            None => true,
+        })
+        .cloned()
+        .collect();
+    let cursor = updates
+        .last()
+        .map(|u| format!("{}:{}", u.block_number, u.log_index))
+        .or_else(|| q.since.clone())
+        .unwrap_or_default();
+    Ok(Json(FrozenUpdatesResponse { updates, cursor }))
 }
 
 async fn post_confirm(
@@ -3743,9 +3870,10 @@ struct IndexerCheckpoint {
     /// Tx hashes notified by relayer but not yet confirmed via WS event.
     #[serde(default)]
     pending_tx_hashes: Vec<String>,
-    /// Frozen `cmx` (BE hex) in insertion order — replayed to rebuild the frozen IMT.
+    /// Frozen leaf-delta feed ingested from `FrozenRootUpdated` events (PR2). Persisted verbatim
+    /// so the feed survives restarts and wallets can pull from any cursor.
     #[serde(default)]
-    frozen_cmx_hex: Vec<String>,
+    frozen_updates: Vec<FrozenUpdate>,
     /// Event-derived ERC20Shield aggregate accounting.
     #[serde(default)]
     shield_accounting: ShieldAccounting,
@@ -3759,7 +3887,7 @@ struct CheckpointData {
     latest_seq: u64,
     batches: VecDeque<BatchEnvelope>,
     pending_tx_hashes: VecDeque<String>,
-    frozen_cmx: Vec<[u8; 32]>,
+    frozen_updates: Vec<FrozenUpdate>,
     shield_accounting: ShieldAccounting,
 }
 
@@ -3796,19 +3924,6 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                 );
                 let batches = VecDeque::from(ck.batches);
                 let pending_tx_hashes = VecDeque::from(ck.pending_tx_hashes);
-                let frozen_cmx: Vec<[u8; 32]> = ck
-                    .frozen_cmx_hex
-                    .iter()
-                    .filter_map(|h| {
-                        let bytes = hex::decode(h.trim_start_matches("0x")).ok()?;
-                        if bytes.len() != 32 {
-                            return None;
-                        }
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&bytes);
-                        Some(arr)
-                    })
-                    .collect();
                 CheckpointData {
                     next_block: resumed,
                     cmx_ordered,
@@ -3816,7 +3931,7 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                     latest_seq: ck.latest_seq,
                     batches,
                     pending_tx_hashes,
-                    frozen_cmx,
+                    frozen_updates: ck.frozen_updates,
                     shield_accounting: ck.shield_accounting,
                 }
             }
@@ -3831,7 +3946,7 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                     latest_seq: 0,
                     batches: VecDeque::new(),
                     pending_tx_hashes: VecDeque::new(),
-                    frozen_cmx: vec![],
+                    frozen_updates: vec![],
                     shield_accounting: ShieldAccounting::default(),
                 }
             }
@@ -3843,7 +3958,7 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
             latest_seq: 0,
             batches: VecDeque::new(),
             pending_tx_hashes: VecDeque::new(),
-            frozen_cmx: vec![],
+            frozen_updates: vec![],
             shield_accounting: ShieldAccounting::default(),
         },
     }
@@ -3857,7 +3972,7 @@ fn save_checkpoint(
     latest_seq: u64,
     batches: &[BatchEnvelope],
     pending_tx_hashes: &[String],
-    frozen_cmx: &[[u8; 32]],
+    frozen_updates: &[FrozenUpdate],
     shield_accounting: ShieldAccounting,
 ) {
     let ck = IndexerCheckpoint {
@@ -3867,7 +3982,7 @@ fn save_checkpoint(
         latest_seq,
         batches: batches.to_vec(),
         pending_tx_hashes: pending_tx_hashes.to_vec(),
-        frozen_cmx_hex: frozen_cmx.iter().map(hex::encode).collect(),
+        frozen_updates: frozen_updates.to_vec(),
         shield_accounting,
     };
     if let Ok(json) = serde_json::to_string(&ck) {
@@ -3890,7 +4005,7 @@ struct CheckpointSnapshot {
     latest_seq: u64,
     batches: Vec<BatchEnvelope>,
     pending_tx_hashes: Vec<String>,
-    frozen_cmx: Vec<[u8; 32]>,
+    frozen_updates: Vec<FrozenUpdate>,
     shield_accounting: ShieldAccounting,
 }
 
@@ -3903,12 +4018,7 @@ impl CheckpointSnapshot {
             latest_seq: s.latest_seq,
             batches: s.batches.iter().cloned().collect(),
             pending_tx_hashes: s.pending_tx_hashes.iter().cloned().collect(),
-            frozen_cmx: s
-                .frozen
-                .frozen_values()
-                .into_iter()
-                .map(fr_to_be_bytes)
-                .collect(),
+            frozen_updates: s.frozen_updates.clone(),
             shield_accounting: s.shield_accounting,
         }
     }
@@ -3920,7 +4030,7 @@ impl CheckpointSnapshot {
             latest_seq: ck.latest_seq,
             batches: ck.batches.iter().cloned().collect(),
             pending_tx_hashes: ck.pending_tx_hashes.iter().cloned().collect(),
-            frozen_cmx: ck.frozen_cmx.clone(),
+            frozen_updates: ck.frozen_updates.clone(),
             shield_accounting: ck.shield_accounting,
         }
     }
@@ -4099,7 +4209,7 @@ impl StateBackend {
                     snap.latest_seq,
                     &snap.batches,
                     &snap.pending_tx_hashes,
-                    &snap.frozen_cmx,
+                    &snap.frozen_updates,
                     snap.shield_accounting,
                 );
                 Ok(())
@@ -4118,7 +4228,7 @@ fn empty_checkpoint(start_block: u64) -> CheckpointData {
         latest_seq: 0,
         batches: VecDeque::new(),
         pending_tx_hashes: VecDeque::new(),
-        frozen_cmx: vec![],
+        frozen_updates: vec![],
         shield_accounting: ShieldAccounting::default(),
     }
 }
@@ -4189,11 +4299,11 @@ async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnaps
         .execute(&mut *tx)
         .await
         .context("replace cmx_leaves")?;
-    sqlx::query("DELETE FROM frozen_cmx WHERE pool_address=$1")
+    sqlx::query("DELETE FROM frozen_updates WHERE pool_address=$1")
         .bind(pool_address)
         .execute(&mut *tx)
         .await
-        .context("replace frozen_cmx")?;
+        .context("replace frozen_updates")?;
 
     for (pos, cmx) in snap.cmx_ordered.iter().enumerate() {
         sqlx::query(
@@ -4208,19 +4318,20 @@ async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnaps
         .context("insert cmx_leaves")?;
     }
 
-    // Frozen-set leaves (append-only, insertion order) — mirrors cmx_leaves so the
-    // FrozenImt can be replayed on restart to recompute the same rt_frozen.
-    for (pos, cmx) in snap.frozen_cmx.iter().enumerate() {
+    // Frozen leaf-delta feed (append-only, on-chain order) — one JSON row per ingested
+    // `FrozenRootUpdated`, replayed by wallets to rebuild the Frozen IMT (PR2).
+    for (pos, upd) in snap.frozen_updates.iter().enumerate() {
+        let json = serde_json::to_string(upd).context("serialize frozen_update")?;
         sqlx::query(
-            "INSERT INTO frozen_cmx (pool_address, position, cmx_hex) VALUES ($1,$2,$3) \
+            "INSERT INTO frozen_updates (pool_address, position, update_json) VALUES ($1,$2,$3) \
              ON CONFLICT (pool_address, position) DO NOTHING",
         )
         .bind(pool_address)
         .bind(pos as i64)
-        .bind(hex::encode(cmx))
+        .bind(json)
         .execute(&mut *tx)
         .await
-        .context("insert frozen_cmx")?;
+        .context("insert frozen_updates")?;
     }
 
     for env in &snap.batches {
@@ -4315,16 +4426,17 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
             .unwrap_or_default();
     let pending_tx_hashes: VecDeque<String> = pend_rows.into_iter().map(|(h,)| h).collect();
 
-    // Frozen-set leaves in insertion order → replayed to rebuild the FrozenImt.
-    let frozen_rows: Vec<(String,)> =
-        sqlx::query_as("SELECT cmx_hex FROM frozen_cmx WHERE pool_address=$1 ORDER BY position")
-            .bind(pool_address)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-    let frozen_cmx: Vec<[u8; 32]> = frozen_rows
+    // Frozen leaf-delta feed in on-chain order → replayed by wallets to rebuild the Frozen IMT.
+    let frozen_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT update_json FROM frozen_updates WHERE pool_address=$1 ORDER BY position",
+    )
+    .bind(pool_address)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let frozen_updates: Vec<FrozenUpdate> = frozen_rows
         .iter()
-        .filter_map(|(h,)| parse_hex32(h))
+        .filter_map(|(j,)| serde_json::from_str(j).ok())
         .collect();
 
     let stats_row: Option<(String, String, String, String)> =
@@ -4347,8 +4459,8 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
         .unwrap_or_default();
 
     println!(
-        "[indexer] pg load: pool={} next_block={next_block} leaves={} pending={} frozen={} shielded={} unshielded={}",
-        &pool_address[..10.min(pool_address.len())], cmx_ordered.len(), pending_tx_hashes.len(), frozen_cmx.len(),
+        "[indexer] pg load: pool={} next_block={next_block} leaves={} pending={} frozen_updates={} shielded={} unshielded={}",
+        &pool_address[..10.min(pool_address.len())], cmx_ordered.len(), pending_tx_hashes.len(), frozen_updates.len(),
         shield_accounting.total_shielded_units, shield_accounting.total_unshielded_units
     );
     CheckpointData {
@@ -4358,7 +4470,7 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
         latest_seq,
         batches: VecDeque::new(),
         pending_tx_hashes,
-        frozen_cmx,
+        frozen_updates,
         shield_accounting,
     }
 }
@@ -4458,6 +4570,7 @@ async fn backfill_from_chain(ctx: &PollContext) {
     topic0s.push(normalize_hex_0x(&shield_completed_topic0_hex()));
     topic0s.push(normalize_hex_0x(&ctx.note_confirmed_topic0));
     topic0s.push(normalize_hex_0x(&root_updated_topic0_hex()));
+    topic0s.push(normalize_hex_0x(&frozen_root_updated_topic0()));
     topic0s.push(normalize_hex_0x(&shielded_topic0_hex()));
     topic0s.push(normalize_hex_0x(&unshielded_topic0_hex()));
 
@@ -4613,6 +4726,7 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
     topic0s.push(normalize_hex_0x(&shield_completed_topic0_hex()));
     topic0s.push(normalize_hex_0x(&ctx.note_confirmed_topic0));
     topic0s.push(normalize_hex_0x(&root_updated_topic0_hex()));
+    topic0s.push(normalize_hex_0x(&frozen_root_updated_topic0()));
     topic0s.push(normalize_hex_0x(&shielded_topic0_hex()));
     topic0s.push(normalize_hex_0x(&unshielded_topic0_hex()));
 
@@ -4860,6 +4974,7 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
         topics.push(norm_topic(&shield_completed_topic0_hex()));
         topics.push(norm_topic(&ctx.note_confirmed_topic0));
         topics.push(norm_topic(&root_updated_topic0_hex()));
+        topics.push(norm_topic(&frozen_root_updated_topic0()));
         topics.push(norm_topic(&shielded_topic0_hex()));
         topics.push(norm_topic(&unshielded_topic0_hex()));
     }
@@ -4987,6 +5102,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
     let sc = norm_topic(&shield_completed_topic0_hex());
     let nc = norm_topic(&ctx.note_confirmed_topic0);
     let ru = norm_topic(&root_updated_topic0_hex());
+    let fru = norm_topic(&frozen_root_updated_topic0());
     let shielded_topic = norm_topic(&shielded_topic0_hex());
     let unshielded_topic = norm_topic(&unshielded_topic0_hex());
 
@@ -5111,12 +5227,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         let seq_snap = state.latest_seq;
         let batches_snap: Vec<BatchEnvelope> = state.batches.iter().cloned().collect();
         let pending_snap: Vec<String> = state.pending_tx_hashes.iter().cloned().collect();
-        let frozen_snap: Vec<[u8; 32]> = state
-            .frozen
-            .frozen_values()
-            .into_iter()
-            .map(fr_to_be_bytes)
-            .collect();
+        let frozen_snap: Vec<FrozenUpdate> = state.frozen_updates.clone();
         let accounting_snap = state.shield_accounting;
         drop(state);
         ctx.backend.archive_batch(&envelope);
@@ -5128,7 +5239,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             latest_seq: seq_snap,
             batches: batches_snap,
             pending_tx_hashes: pending_snap,
-            frozen_cmx: frozen_snap,
+            frozen_updates: frozen_snap,
             shield_accounting: accounting_snap,
         });
     } else if t0.as_deref() == Some(nc.as_str()) {
@@ -5200,12 +5311,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 let next_block = state.next_block;
                 let batches_snap: Vec<BatchEnvelope> = state.batches.iter().cloned().collect();
                 let pending_snap: Vec<String> = state.pending_tx_hashes.iter().cloned().collect();
-                let frozen_snap: Vec<[u8; 32]> = state
-                    .frozen
-                    .frozen_values()
-                    .into_iter()
-                    .map(fr_to_be_bytes)
-                    .collect();
+                let frozen_snap: Vec<FrozenUpdate> = state.frozen_updates.clone();
                 let accounting_snap = state.shield_accounting;
                 drop(state);
                 ctx.backend.archive_batch(&envelope);
@@ -5217,7 +5323,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                     latest_seq: seq_snap,
                     batches: batches_snap,
                     pending_tx_hashes: pending_snap,
-                    frozen_cmx: frozen_snap,
+                    frozen_updates: frozen_snap,
                     shield_accounting: accounting_snap,
                 });
                 return Ok(());
@@ -5245,6 +5351,38 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 ctx.persist.notify(&state);
             }
             Err(e) => eprintln!("[indexer] RootUpdated decode FAILED: {e}"),
+        }
+    } else if t0.as_deref() == Some(fru.as_str()) {
+        // ── FrozenRootUpdated (compliance leaf delta) ────────────────────────
+        // Append the disclosed delta to the per-pool feed (frozen-tree-execution-plan PR2).
+        // Dedup on (tx_hash, log_index) via the existing event_id set so a re-scan is idempotent.
+        if !state.seen_event_ids.insert(event_id.clone()) {
+            return Ok(());
+        }
+        match decode_frozen_root_updated_log(&log.data) {
+            Ok(d) => {
+                let upd = FrozenUpdate {
+                    block_number,
+                    log_index,
+                    tx_hash: normalize_hex_0x(&log.transaction_hash),
+                    old_root_hex: format!("0x{}", hex::encode(d.old_root)),
+                    new_root_hex: format!("0x{}", hex::encode(d.new_root)),
+                    cmx_changed_hex: d
+                        .cmx_changed
+                        .iter()
+                        .map(|c| format!("0x{}", hex::encode(c)))
+                        .collect(),
+                    is_add: d.is_add,
+                };
+                println!(
+                    "[indexer] frozen root updated: new_root={} delta={} (block={block_number} logIndex={log_index})",
+                    upd.new_root_hex,
+                    upd.cmx_changed_hex.len()
+                );
+                state.frozen_updates.push(upd);
+                ctx.persist.notify(&state);
+            }
+            Err(e) => eprintln!("[indexer] FrozenRootUpdated decode FAILED: {e}"),
         }
     } else if t0.as_deref() == Some(sc.as_str()) {
         // ── ShieldCompleted ──────────────────────────────────────────────────
@@ -6145,9 +6283,91 @@ mod tests {
         encode_confirm_receipt_calldata, encode_crank_root_calldata, factory_log_matches,
         getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, parse_address_set,
         parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0, require_admin,
-        require_relayer, rlp_bytes, rlp_list, rlp_uint, Cli, EthLog, HourlyTxBudget, RpcClient,
-        MAX_CRANK_GAS_MARGIN_BPS,
+        decode_frozen_root_updated_log, frozen_root_updated_topic0, replay_frozen_set,
+        require_relayer, rlp_bytes, rlp_list, rlp_uint, Cli, EthLog, FrozenUpdate, HourlyTxBudget,
+        RpcClient, MAX_CRANK_GAS_MARGIN_BPS,
     };
+
+    fn frozen_update(cmx: &[&str], is_add: &[bool]) -> FrozenUpdate {
+        FrozenUpdate {
+            block_number: 1,
+            log_index: 0,
+            tx_hash: "0x".into(),
+            old_root_hex: "0x00".into(),
+            new_root_hex: "0x00".into(),
+            cmx_changed_hex: cmx.iter().map(|s| s.to_string()).collect(),
+            is_add: is_add.to_vec(),
+        }
+    }
+
+    #[test]
+    fn replay_frozen_set_applies_adds_and_removes() {
+        // add A,B → remove A → re-add A: current set = {B, A}, idempotent, order = most-recent add.
+        let feed = vec![
+            frozen_update(&["0xaa", "0xbb"], &[true, true]),
+            frozen_update(&["0xaa"], &[false]),
+            frozen_update(&["0xaa", "0xbb"], &[true, true]), // re-add A; B already present (idempotent)
+        ];
+        assert_eq!(replay_frozen_set(&feed), vec!["0xbb".to_string(), "0xaa".to_string()]);
+
+        // remove-all → empty
+        let feed2 = vec![
+            frozen_update(&["0xaa"], &[true]),
+            frozen_update(&["0xaa"], &[false]),
+        ];
+        assert!(replay_frozen_set(&feed2).is_empty());
+    }
+
+    #[test]
+    fn frozen_root_updated_topic0_matches_signature() {
+        // `cast keccak "FrozenRootUpdated(uint256,uint256,uint256[],bool[])"`
+        assert_eq!(
+            frozen_root_updated_topic0(),
+            "0x16a94787314fdde3719186ed905c70ca4372c384e73a2af4c9c12c511e892dc2"
+        );
+    }
+
+    #[test]
+    fn decode_frozen_root_updated_from_cast_fixture() {
+        // Ground truth from:
+        // cast abi-encode "x(uint256,uint256,uint256[],bool[])" 0x1111 0x1234 "[10,20]" "[true,false]"
+        let data = "0x\
+0000000000000000000000000000000000000000000000000000000000001111\
+0000000000000000000000000000000000000000000000000000000000001234\
+0000000000000000000000000000000000000000000000000000000000000080\
+00000000000000000000000000000000000000000000000000000000000000e0\
+0000000000000000000000000000000000000000000000000000000000000002\
+000000000000000000000000000000000000000000000000000000000000000a\
+0000000000000000000000000000000000000000000000000000000000000014\
+0000000000000000000000000000000000000000000000000000000000000002\
+0000000000000000000000000000000000000000000000000000000000000001\
+0000000000000000000000000000000000000000000000000000000000000000";
+        let d = decode_frozen_root_updated_log(data).expect("decode fixture");
+        assert_eq!(d.old_root[31], 0x11);
+        assert_eq!(d.old_root[30], 0x11);
+        assert_eq!(d.new_root[31], 0x34);
+        assert_eq!(d.new_root[30], 0x12);
+        assert_eq!(d.cmx_changed.len(), 2);
+        assert_eq!(d.cmx_changed[0][31], 10);
+        assert_eq!(d.cmx_changed[1][31], 20);
+        assert_eq!(d.is_add, vec![true, false]);
+    }
+
+    #[test]
+    fn decode_frozen_root_updated_empty_delta() {
+        // cast abi-encode "x(uint256,uint256,uint256[],bool[])" 0x1 0x2 "[]" "[]"
+        let data = "0x\
+0000000000000000000000000000000000000000000000000000000000000001\
+0000000000000000000000000000000000000000000000000000000000000002\
+0000000000000000000000000000000000000000000000000000000000000080\
+00000000000000000000000000000000000000000000000000000000000000a0\
+0000000000000000000000000000000000000000000000000000000000000000\
+0000000000000000000000000000000000000000000000000000000000000000";
+        let d = decode_frozen_root_updated_log(data).expect("decode empty");
+        assert_eq!(d.new_root[31], 0x02);
+        assert!(d.cmx_changed.is_empty());
+        assert!(d.is_add.is_empty());
+    }
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use clap::CommandFactory;
     use privacy_core::commitment_tree::frontier::{
