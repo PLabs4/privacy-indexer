@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     net::SocketAddr,
-    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -10,7 +10,9 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
-    http::{HeaderMap, Method, StatusCode},
+    http::{HeaderMap, Method, Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
@@ -95,6 +97,9 @@ const EVM_EMPTY_IMT_ROOT: [u8; 32] = [
 /// replayed by the startup backfill), and the prefix root is computed from the SAME
 /// local tree that serves `/merkle_path`, so the two stay mutually consistent.
 fn http_root_hex(state: &SharedState) -> Option<String> {
+    if state.tree_out_of_order {
+        return None;
+    }
     if state.confirmed_count > 0 {
         // Prefix root at the confirmed watermark (LE bytes, consistent with /merkle_path).
         // `None` here means the local tree has fewer leaves than the chain has confirmed
@@ -399,6 +404,12 @@ struct BatchEnvelope {
 
 struct SharedState {
     next_block: u64,
+    /// Last fully scanned Monad-finalized block and its canonical hash.
+    ///
+    /// Older checkpoints have neither field; startup performs a full finalized
+    /// rebuild and writes them before incremental scanning resumes.
+    last_finalized_block: Option<u64>,
+    last_finalized_block_hash: Option<String>,
     latest_seq: u64,
     /// Dedup set for Phase 1 (NoteAdded) events.
     seen_event_ids: HashSet<String>,
@@ -555,6 +566,8 @@ impl PoolBuilder {
         if ck.latest_seq == 0 {
             backend.reset_archive();
         }
+        let persist_paused = Arc::new(AtomicBool::new(false));
+        let backend_write_lock = Arc::new(tokio::sync::Mutex::new(()));
         let (persist_tx, persist_rx) = tokio::sync::watch::channel(std::sync::Arc::new(
             CheckpointSnapshot::from_checkpoint_data(&ck),
         ));
@@ -562,8 +575,13 @@ impl PoolBuilder {
             backend.clone(),
             contract_address.to_string(),
             persist_rx,
+            Arc::clone(&persist_paused),
+            Arc::clone(&backend_write_lock),
         ));
-        let persist = Persist { tx: persist_tx };
+        let persist = Persist {
+            tx: persist_tx,
+            paused: Arc::clone(&persist_paused),
+        };
 
         // Rebuild Poseidon tree from checkpoint.
         let mut restored_tree = OrchardCommitmentTree::new();
@@ -586,6 +604,8 @@ impl PoolBuilder {
 
         let shared = Arc::new(RwLock::new(SharedState {
             next_block: ck.next_block,
+            last_finalized_block: ck.last_finalized_block,
+            last_finalized_block_hash: ck.last_finalized_block_hash,
             latest_seq: ck.latest_seq,
             seen_event_ids: HashSet::new(),
             confirm_seen_ids: HashSet::new(),
@@ -593,7 +613,9 @@ impl PoolBuilder {
             accounting_seen_ids: HashSet::new(),
             shield_accounting: ck.shield_accounting,
             last_leaf_key: None,
-            tree_out_of_order: false,
+            // Startup state is untrusted until the persisted finalized cursor
+            // has been checked and the finalized replay completes.
+            tree_out_of_order: true,
             batches: ck.batches,
             max_batches: self.max_batches,
             tree: restored_tree,
@@ -626,6 +648,10 @@ impl PoolBuilder {
             start_block,
             ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
             backend: backend.clone(),
+            backend_write_lock,
+            rebuild_generation: Arc::new(RwLock::new(None)),
+            rebuild_mutations: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            broadcast_paused: Arc::new(AtomicBool::new(false)),
         };
         let addr_label = contract_address.to_string();
         tokio::spawn(async move {
@@ -1375,6 +1401,9 @@ struct ConfirmResponse {
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     next_block: u64,
+    canonical: bool,
+    last_finalized_block: Option<u64>,
+    last_finalized_block_hash: Option<String>,
     latest_seq: u64,
     cached_batches: usize,
     pending_notes: usize,
@@ -1680,6 +1709,10 @@ async fn main() -> Result<()> {
             Duration::from_secs(30),
         ))
         .layer(build_cors_layer())
+        .layer(middleware::from_fn_with_state(
+            registry.clone(),
+            canonical_api_gate,
+        ))
         .with_state(registry);
 
     println!("privacybtc-indexer listening on http://{bind}");
@@ -1768,7 +1801,7 @@ async fn pool_discovery_task(
 ) {
     let mut from = start_block;
     loop {
-        if let Ok(head) = rpc.block_number().await {
+        if let Ok((head, _)) = rpc.finalized_block().await {
             let mut lo = from;
             while lo <= head {
                 let hi = getlogs_window_end(lo, head, rpc.getlogs_span());
@@ -2378,8 +2411,57 @@ fn require_relayer(
 
 // ─── HTTP handlers ────────────────────────────────────────────────────────────
 
-async fn healthz() -> &'static str {
-    "ok"
+fn canonical_guard(tree_out_of_order: bool) -> Result<(), (StatusCode, String)> {
+    if tree_out_of_order {
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "indexer canonical finalized replay is not ready".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn require_canonical_context(
+    ctx: &AppContext,
+) -> Result<(), (StatusCode, String)> {
+    canonical_guard(ctx.state.read().await.tree_out_of_order)
+}
+
+async fn canonical_api_gate(
+    State(reg): State<PoolRegistry>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if path == "/status" || path == "/healthz" {
+        return next.run(request).await;
+    }
+    let contexts: Vec<AppContext> = reg.pools.read().await.values().cloned().collect();
+    for ctx in contexts {
+        if let Err(error) = require_canonical_context(&ctx).await {
+            return error.into_response();
+        }
+    }
+    next.run(request).await
+}
+
+async fn healthz(
+    State(reg): State<PoolRegistry>,
+) -> Result<&'static str, (StatusCode, String)> {
+    let contexts: Vec<AppContext> = reg.pools.read().await.values().cloned().collect();
+    for ctx in contexts {
+        require_canonical_context(&ctx).await.map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "pool {} canonical finalized replay is not ready",
+                    ctx.contract_address
+                ),
+            )
+        })?;
+    }
+    Ok("ok")
 }
 
 /// `GET /pools` — list the pools currently being watched, the primary pool, and any known
@@ -2565,6 +2647,9 @@ async fn status(
     let local_tree_root_hex = s.tree.latest_root().map(hex::encode);
     Ok(Json(StatusResponse {
         next_block: s.next_block,
+        canonical: !s.tree_out_of_order,
+        last_finalized_block: s.last_finalized_block,
+        last_finalized_block_hash: s.last_finalized_block_hash.clone(),
         latest_seq: s.latest_seq,
         cached_batches: s.batches.len(),
         pending_notes: s.pending_notes.len(),
@@ -2584,7 +2669,7 @@ async fn get_batches(
 ) -> Result<Json<Vec<BatchEnvelope>>, (StatusCode, String)> {
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let after = q.after_seq.unwrap_or(0);
-    let out = collect_batches_since(&ctx, after).await;
+    let out = collect_batches_since(&ctx, after).await?;
     Ok(Json(out))
 }
 
@@ -2592,9 +2677,13 @@ async fn get_batches(
 /// from the in-memory ring; anything older than the ring's front (evicted) is
 /// loaded from the persistent backend, so full-history scans never silently
 /// miss notes regardless of `--max-batches-in-memory`.
-async fn collect_batches_since(ctx: &AppContext, after: u64) -> Vec<BatchEnvelope> {
+async fn collect_batches_since(
+    ctx: &AppContext,
+    after: u64,
+) -> Result<Vec<BatchEnvelope>, (StatusCode, String)> {
     let (ring, ring_front, latest_seq) = {
         let s = ctx.state.read().await;
+        canonical_guard(s.tree_out_of_order)?;
         let ring: Vec<BatchEnvelope> = s
             .batches
             .iter()
@@ -2610,14 +2699,17 @@ async fn collect_batches_since(ctx: &AppContext, after: u64) -> Vec<BatchEnvelop
         _ => None,
     };
     let Some(before) = missing_before else {
-        return ring;
+        return Ok(ring);
     };
     let mut out = ctx
         .backend
         .load_archived_batches(&ctx.contract_address, after, before)
         .await;
     out.extend(ring);
-    out
+    // A cursor mismatch may be detected while the archive query is in flight.
+    // Recheck before returning any historical rows.
+    require_canonical_context(ctx).await?;
+    Ok(out)
 }
 
 /// SSE endpoint: streams BatchEnvelopes to the client as they arrive.
@@ -2649,7 +2741,7 @@ async fn get_batches_stream(
 
     // Collect historical batches (seq > after_seq), including archived ones the
     // in-memory ring has already evicted.
-    let historical: Vec<BatchEnvelope> = collect_batches_since(&ctx, after_seq).await;
+    let historical: Vec<BatchEnvelope> = collect_batches_since(&ctx, after_seq).await?;
     let max_hist_seq = historical.last().map(|b| b.seq).unwrap_or(after_seq);
 
     // Build SSE event from a BatchEnvelope.
@@ -2666,6 +2758,7 @@ async fn get_batches_stream(
         .filter(move |b| futures_util::future::ready(b.seq > max_hist_seq))
         .map(to_event);
 
+    require_canonical_context(&ctx).await?;
     Ok(Sse::new(hist_stream.chain(live_stream)).keep_alive(KeepAlive::default()))
 }
 
@@ -2675,6 +2768,12 @@ async fn get_root(
 ) -> Result<Json<RootResponse>, (StatusCode, String)> {
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let s = ctx.state.read().await;
+    if s.tree_out_of_order {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "indexer canonical cursor is not verified".to_owned(),
+        ));
+    }
     Ok(Json(RootResponse {
         root_hex: http_root_hex(&s),
         tree_size: s.tree.size(),
@@ -2701,6 +2800,12 @@ async fn get_note(
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx hex".to_owned()))?;
 
     let s = ctx.state.read().await;
+    if s.tree_out_of_order {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "indexer canonical cursor is not verified".to_owned(),
+        ));
+    }
     for batch in s.batches.iter().rev() {
         for note in &batch.batch.abi_notes {
             if note.cmx == cmx {
@@ -2746,6 +2851,7 @@ async fn get_tx(
     for ctx in contexts {
         let pool_lc = ctx.contract_address.to_lowercase();
         let s = ctx.state.read().await;
+        canonical_guard(s.tree_out_of_order)?;
         for batch in s.batches.iter() {
             for note in &batch.batch.abi_notes {
                 if normalize_hex_0x(&note.tx_hash).to_lowercase() == want && seen.insert(note.cmx) {
@@ -2994,9 +3100,10 @@ async fn get_txs(
     for ctx in &contexts {
         let pool_lc = ctx.contract_address.to_lowercase();
         let batches: Vec<BatchEnvelope> = if full_history {
-            collect_batches_since(ctx, 0).await
+            collect_batches_since(ctx, 0).await?
         } else {
             let s = ctx.state.read().await;
+            canonical_guard(s.tree_out_of_order)?;
             // seq starts at 1; a ring front seq > 1 means this pool evicted batches.
             if s.batches.front().map(|b| b.seq).unwrap_or(1) > 1 {
                 ring_has_older = true;
@@ -3144,6 +3251,9 @@ async fn get_txs(
         }
     }
 
+    for ctx in &contexts {
+        require_canonical_context(ctx).await?;
+    }
     Ok(Json(TxsListResponse {
         items,
         next_before_block,
@@ -3289,12 +3399,14 @@ async fn get_swap_leg(
             )
         })?;
     match receipt {
-        Some((success, logs)) => {
+        Some(receipt) => {
             out["mined"] = true.into();
-            out["tx_success"] = success.into();
+            out["tx_success"] = receipt.success.into();
+            out["block_number"] = receipt.block_number.into();
+            out["block_hash"] = receipt.block_hash.clone().into();
             let want_init = swap_initiated_topic0_hex().to_lowercase();
             let want_join = swap_joined_topic0_hex().to_lowercase();
-            for log in &logs {
+            for log in &receipt.logs {
                 let Some(topics) = &log.topics else { continue };
                 let Some(t0) = topics.first() else { continue };
                 let t0 = t0.to_lowercase();
@@ -3337,10 +3449,16 @@ async fn get_swap(
     let swap_id = parse_hex32(&q.swap_id)
         .ok_or((StatusCode::BAD_REQUEST, "invalid swap_id hex".to_owned()))?;
     let coordinator = normalize_hex_0x(&q.coordinator).to_lowercase();
-    let latest = rpc
-        .block_number()
+    let finalized = rpc
+        .finalized_block()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("eth_blockNumber: {e:#}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("eth_getBlockByNumber(finalized): {e:#}"),
+            )
+        })?
+        .0;
     let topic0s = vec![
         swap_initiated_topic0_hex(),
         swap_joined_topic0_hex(),
@@ -3350,13 +3468,21 @@ async fn get_swap(
     let mut logs = rpc
         .fetch_logs_topic0_or_with_topic1(
             q.from_block.unwrap_or(0),
-            latest,
+            finalized,
             &coordinator,
             &topic0s,
             &hex32_0x(&swap_id),
         )
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("eth_getLogs: {e:#}")))?;
+    rpc.validate_canonical_logs(&logs)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("canonical log validation: {e:#}"),
+            )
+        })?;
     if logs.is_empty() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -3457,6 +3583,12 @@ async fn get_merkle_path(
     let _ = q.checkpoint;
 
     let s = ctx.state.read().await;
+    if s.tree_out_of_order {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "indexer canonical cursor is not verified".to_owned(),
+        ));
+    }
     let &position = s
         .cmx_to_position
         .get(&cmx)
@@ -3860,6 +3992,10 @@ async fn post_notify_tx(
 struct IndexerCheckpoint {
     next_block: u64,
     #[serde(default)]
+    last_finalized_block: Option<u64>,
+    #[serde(default)]
+    last_finalized_block_hash: Option<String>,
+    #[serde(default)]
     cmx_leaves_hex: Vec<String>,
     #[serde(default)]
     active_root_hex: Option<String>,
@@ -3882,6 +4018,8 @@ struct IndexerCheckpoint {
 /// Loaded result from a checkpoint file.
 struct CheckpointData {
     next_block: u64,
+    last_finalized_block: Option<u64>,
+    last_finalized_block_hash: Option<String>,
     cmx_ordered: Vec<[u8; 32]>,
     active_root: Option<[u8; 32]>,
     latest_seq: u64,
@@ -3926,6 +4064,10 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                 let pending_tx_hashes = VecDeque::from(ck.pending_tx_hashes);
                 CheckpointData {
                     next_block: resumed,
+                    last_finalized_block: ck.last_finalized_block,
+                    last_finalized_block_hash: ck
+                        .last_finalized_block_hash
+                        .and_then(|hash| normalize_block_hash(&hash).ok()),
                     cmx_ordered,
                     active_root,
                     latest_seq: ck.latest_seq,
@@ -3941,6 +4083,8 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                 );
                 CheckpointData {
                     next_block: start_block,
+                    last_finalized_block: None,
+                    last_finalized_block_hash: None,
                     cmx_ordered: vec![],
                     active_root: None,
                     latest_seq: 0,
@@ -3953,6 +4097,8 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
         },
         Err(_) => CheckpointData {
             next_block: start_block,
+            last_finalized_block: None,
+            last_finalized_block_hash: None,
             cmx_ordered: vec![],
             active_root: None,
             latest_seq: 0,
@@ -3967,6 +4113,8 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
 fn save_checkpoint(
     path: &str,
     next_block: u64,
+    last_finalized_block: Option<u64>,
+    last_finalized_block_hash: Option<&str>,
     cmx_ordered: &[[u8; 32]],
     active_root: Option<[u8; 32]>,
     latest_seq: u64,
@@ -3974,9 +4122,11 @@ fn save_checkpoint(
     pending_tx_hashes: &[String],
     frozen_updates: &[FrozenUpdate],
     shield_accounting: ShieldAccounting,
-) {
+) -> Result<()> {
     let ck = IndexerCheckpoint {
         next_block,
+        last_finalized_block,
+        last_finalized_block_hash: last_finalized_block_hash.map(str::to_owned),
         cmx_leaves_hex: cmx_ordered.iter().map(hex::encode).collect(),
         active_root_hex: active_root.map(hex::encode),
         latest_seq,
@@ -3985,12 +4135,11 @@ fn save_checkpoint(
         frozen_updates: frozen_updates.to_vec(),
         shield_accounting,
     };
-    if let Ok(json) = serde_json::to_string(&ck) {
-        let tmp = format!("{path}.tmp");
-        if std::fs::write(&tmp, &json).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
-    }
+    let json = serde_json::to_string(&ck).context("serialize indexer checkpoint")?;
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, &json).with_context(|| format!("write checkpoint {tmp}"))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replace checkpoint {path}"))?;
+    Ok(())
 }
 
 // ─── State backend (JSON file | PostgreSQL) ───────────────────────────────────
@@ -4000,6 +4149,8 @@ fn save_checkpoint(
 #[derive(Clone, Default)]
 struct CheckpointSnapshot {
     next_block: u64,
+    last_finalized_block: Option<u64>,
+    last_finalized_block_hash: Option<String>,
     cmx_ordered: Vec<[u8; 32]>,
     active_root: Option<[u8; 32]>,
     latest_seq: u64,
@@ -4013,6 +4164,8 @@ impl CheckpointSnapshot {
     fn from_state(s: &SharedState) -> Self {
         Self {
             next_block: s.next_block,
+            last_finalized_block: s.last_finalized_block,
+            last_finalized_block_hash: s.last_finalized_block_hash.clone(),
             cmx_ordered: s.cmx_ordered.clone(),
             active_root: s.active_root,
             latest_seq: s.latest_seq,
@@ -4025,6 +4178,8 @@ impl CheckpointSnapshot {
     fn from_checkpoint_data(ck: &CheckpointData) -> Self {
         Self {
             next_block: ck.next_block,
+            last_finalized_block: ck.last_finalized_block,
+            last_finalized_block_hash: ck.last_finalized_block_hash.clone(),
             cmx_ordered: ck.cmx_ordered.clone(),
             active_root: ck.active_root,
             latest_seq: ck.latest_seq,
@@ -4038,6 +4193,32 @@ impl CheckpointSnapshot {
 
 /// Where persisted state lives. `Json` is per-pool (its own file); `Pgsql` is one shared
 /// connection pool with every row keyed by `pool_address`.
+#[derive(Clone, Debug)]
+enum NoteArchiveMutation {
+    Upsert(BatchEnvelope),
+    Confirm {
+        cmx: [u8; 32],
+        position: u64,
+    },
+    ShieldAmount {
+        cmx: [u8; 32],
+        amount: u64,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "record_type", rename_all = "snake_case")]
+enum JsonNoteArchiveUpdate {
+    Confirm {
+        cmx_hex: String,
+        position: u64,
+    },
+    ShieldAmount {
+        cmx_hex: String,
+        amount: u64,
+    },
+}
+
 #[derive(Clone)]
 enum StateBackend {
     Json(Option<String>),
@@ -4052,22 +4233,140 @@ impl StateBackend {
         format!("{state_path}.batches.jsonl")
     }
 
-    /// Durably record one freshly emitted batch envelope.
-    ///
-    /// PG mode is a no-op here: `pg_save` already upserts every note row into the
-    /// `notes` table (keyed by cmx, never deleted on ring eviction), which is the
-    /// source `load_archived_batches` reconstructs envelopes from.
-    fn archive_batch(&self, env: &BatchEnvelope) {
-        if let StateBackend::Json(Some(path)) = self {
-            if let Ok(line) = serde_json::to_string(env) {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(Self::json_archive_path(path))
-                {
-                    let _ = writeln!(f, "{line}");
+    fn json_rebuild_archive_path(state_path: &str) -> String {
+        format!("{state_path}.batches.rebuild.jsonl")
+    }
+
+    fn append_json_line<T: Serialize>(path: &str, value: &T) -> Result<()> {
+        use std::io::Write;
+        let line = serde_json::to_string(value).context("serialize note archive record")?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open note archive {path}"))?;
+        writeln!(file, "{line}").with_context(|| format!("append note archive {path}"))
+    }
+
+    /// Persist note-history mutations. During a full finalized replay they are
+    /// written to an isolated staging generation; ordinary catch-up writes the
+    /// canonical archive directly.
+    async fn apply_note_mutations(
+        &self,
+        pool_address: &str,
+        rebuild_generation: Option<&str>,
+        mutations: &[NoteArchiveMutation],
+    ) -> Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let archive_path = if rebuild_generation.is_some() {
+                    Self::json_rebuild_archive_path(path)
+                } else {
+                    Self::json_archive_path(path)
+                };
+                for mutation in mutations {
+                    match mutation {
+                        NoteArchiveMutation::Upsert(env) => {
+                            Self::append_json_line(&archive_path, env)?;
+                        }
+                        NoteArchiveMutation::Confirm { cmx, position } => {
+                            Self::append_json_line(
+                                &archive_path,
+                                &JsonNoteArchiveUpdate::Confirm {
+                                    cmx_hex: hex::encode(cmx),
+                                    position: *position,
+                                },
+                            )?;
+                        }
+                        NoteArchiveMutation::ShieldAmount { cmx, amount } => {
+                            Self::append_json_line(
+                                &archive_path,
+                                &JsonNoteArchiveUpdate::ShieldAmount {
+                                    cmx_hex: hex::encode(cmx),
+                                    amount: *amount,
+                                },
+                            )?;
+                        }
+                    }
                 }
+                Ok(())
+            }
+            StateBackend::Json(None) => Ok(()),
+            StateBackend::Pgsql(pool) => {
+                pg_apply_note_mutations(
+                    pool,
+                    pool_address,
+                    rebuild_generation,
+                    mutations,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn begin_canonical_rebuild(
+        &self,
+        pool_address: &str,
+        generation: &str,
+    ) -> Result<()> {
+        match self {
+            StateBackend::Json(Some(path)) => {
+                std::fs::write(Self::json_rebuild_archive_path(path), [])
+                    .with_context(|| format!("initialize rebuild archive for {pool_address}"))?;
+                Ok(())
+            }
+            StateBackend::Json(None) => Ok(()),
+            StateBackend::Pgsql(pool) => {
+                pg_begin_canonical_rebuild(pool, pool_address, generation).await
+            }
+        }
+    }
+
+    async fn finish_canonical_rebuild(
+        &self,
+        pool_address: &str,
+        generation: &str,
+        snap: &CheckpointSnapshot,
+    ) -> Result<()> {
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let rebuild_path = Self::json_rebuild_archive_path(path);
+                let staged_raw = std::fs::read_to_string(&rebuild_path)
+                    .with_context(|| format!("read staged note archive for {pool_address}"))?;
+                let staged_notes =
+                    decode_json_note_archive(&staged_raw, pool_address).len();
+                if staged_notes != snap.cmx_ordered.len() {
+                    return Err(anyhow!(
+                        "canonical note activation mismatch: staged={staged_notes}, tree_leaves={}",
+                        snap.cmx_ordered.len()
+                    ));
+                }
+                save_checkpoint(
+                    path,
+                    snap.next_block,
+                    snap.last_finalized_block,
+                    snap.last_finalized_block_hash.as_deref(),
+                    &snap.cmx_ordered,
+                    snap.active_root,
+                    snap.latest_seq,
+                    &snap.batches,
+                    &snap.pending_tx_hashes,
+                    &snap.frozen_updates,
+                    snap.shield_accounting,
+                )?;
+                std::fs::rename(
+                    rebuild_path,
+                    Self::json_archive_path(path),
+                )
+                .with_context(|| format!("activate finalized note archive for {pool_address}"))?;
+                Ok(())
+            }
+            StateBackend::Json(None) => Ok(()),
+            StateBackend::Pgsql(pool) => {
+                pg_finish_canonical_rebuild(pool, pool_address, generation, snap).await
             }
         }
     }
@@ -4078,6 +4377,7 @@ impl StateBackend {
     fn reset_archive(&self) {
         if let StateBackend::Json(Some(path)) = self {
             let _ = std::fs::remove_file(Self::json_archive_path(path));
+            let _ = std::fs::remove_file(Self::json_rebuild_archive_path(path));
         }
     }
 
@@ -4096,19 +4396,10 @@ impl StateBackend {
                     Ok(r) => r,
                     Err(_) => return Vec::new(),
                 };
-                let mut out: Vec<BatchEnvelope> = Vec::new();
-                let mut seen: HashSet<u64> = HashSet::new();
-                for line in raw.lines() {
-                    // Tolerate a torn final line from a crash mid-append.
-                    let Ok(env) = serde_json::from_str::<BatchEnvelope>(line) else {
-                        continue;
-                    };
-                    if env.seq > after_seq && env.seq < before_seq && seen.insert(env.seq) {
-                        out.push(env);
-                    }
-                }
-                out.sort_by_key(|e| e.seq);
-                out
+                decode_json_note_archive(&raw, pool_address)
+                    .into_iter()
+                    .filter(|env| env.seq > after_seq && env.seq < before_seq)
+                    .collect()
             }
             StateBackend::Json(None) => Vec::new(),
             StateBackend::Pgsql(pool) => {
@@ -4204,6 +4495,8 @@ impl StateBackend {
                 save_checkpoint(
                     path,
                     snap.next_block,
+                    snap.last_finalized_block,
+                    snap.last_finalized_block_hash.as_deref(),
                     &snap.cmx_ordered,
                     snap.active_root,
                     snap.latest_seq,
@@ -4211,8 +4504,7 @@ impl StateBackend {
                     &snap.pending_tx_hashes,
                     &snap.frozen_updates,
                     snap.shield_accounting,
-                );
-                Ok(())
+                )
             }
             StateBackend::Json(None) => Ok(()),
             StateBackend::Pgsql(pool) => pg_save(pool, pool_address, snap).await,
@@ -4220,9 +4512,51 @@ impl StateBackend {
     }
 }
 
+fn decode_json_note_archive(raw: &str, pool_address: &str) -> Vec<BatchEnvelope> {
+    let mut by_cmx: HashMap<[u8; 32], BatchEnvelope> = HashMap::new();
+    for line in raw.lines() {
+        // Tolerate a torn final line from a crash mid-append and legacy archives
+        // that contain plain BatchEnvelope records only.
+        if let Ok(env) = serde_json::from_str::<BatchEnvelope>(line) {
+            for note in &env.batch.abi_notes {
+                let mut single = env.clone();
+                single.pool_address = Some(pool_address.to_string());
+                single.batch.abi_notes = vec![note.clone()];
+                by_cmx.insert(note.cmx, single);
+            }
+            continue;
+        }
+        let Ok(update) = serde_json::from_str::<JsonNoteArchiveUpdate>(line) else {
+            continue;
+        };
+        match update {
+            JsonNoteArchiveUpdate::Confirm { cmx_hex, position } => {
+                if let Some(env) = parse_hex32(&cmx_hex).and_then(|cmx| by_cmx.get_mut(&cmx)) {
+                    if let Some(note) = env.batch.abi_notes.first_mut() {
+                        note.cmx_position = Some(position);
+                        note.is_confirmed = true;
+                    }
+                }
+            }
+            JsonNoteArchiveUpdate::ShieldAmount { cmx_hex, amount } => {
+                if let Some(env) = parse_hex32(&cmx_hex).and_then(|cmx| by_cmx.get_mut(&cmx)) {
+                    if let Some(note) = env.batch.abi_notes.first_mut() {
+                        note.shield_amount_sats = Some(amount);
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<BatchEnvelope> = by_cmx.into_values().collect();
+    out.sort_by_key(|env| env.seq);
+    out
+}
+
 fn empty_checkpoint(start_block: u64) -> CheckpointData {
     CheckpointData {
         next_block: start_block,
+        last_finalized_block: None,
+        last_finalized_block_hash: None,
         cmx_ordered: vec![],
         active_root: None,
         latest_seq: 0,
@@ -4238,16 +4572,23 @@ fn empty_checkpoint(start_block: u64) -> CheckpointData {
 #[derive(Clone)]
 struct Persist {
     tx: tokio::sync::watch::Sender<std::sync::Arc<CheckpointSnapshot>>,
+    paused: Arc<AtomicBool>,
 }
 
 impl Persist {
     fn notify(&self, s: &SharedState) {
+        if self.paused.load(AtomicOrdering::Acquire) {
+            return;
+        }
         let _ = self
             .tx
             .send(std::sync::Arc::new(CheckpointSnapshot::from_state(s)));
     }
     /// Persist an already-built snapshot (for sites that dropped the lock first).
     fn notify_owned(&self, snap: CheckpointSnapshot) {
+        if self.paused.load(AtomicOrdering::Acquire) {
+            return;
+        }
         let _ = self.tx.send(std::sync::Arc::new(snap));
     }
 }
@@ -4257,69 +4598,328 @@ async fn persist_task(
     backend: StateBackend,
     pool_address: String,
     mut rx: tokio::sync::watch::Receiver<std::sync::Arc<CheckpointSnapshot>>,
+    paused: Arc<AtomicBool>,
+    backend_write_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     let short = pool_address[..10.min(pool_address.len())].to_string();
     while rx.changed().await.is_ok() {
         let snap = rx.borrow_and_update().clone();
+        if paused.load(AtomicOrdering::Acquire) {
+            continue;
+        }
+        let _write_guard = backend_write_lock.lock().await;
+        if paused.load(AtomicOrdering::Acquire) {
+            continue;
+        }
         if let Err(e) = backend.save(&pool_address, &snap).await {
             eprintln!("[indexer][{short}] persist failed: {e:#}");
         }
     }
 }
 
-const NOTES_UPSERT: &str = "\
-INSERT INTO notes (pool_address, cmx_hex, seq, block_number, tx_hash, log_index, position, \
-  enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, nf_old_hex, ack_hash_hex, \
-  shield_amount_sats, is_confirmed) \
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
-ON CONFLICT (pool_address, cmx_hex) DO UPDATE SET \
-  seq=$3, block_number=$4, tx_hash=$5, log_index=$6, position=$7, enc_ciphertext_hex=$8, \
-  epk_hex=$9, out_ciphertext_hex=$10, cv_net_x_hex=$11, nf_old_hex=$12, ack_hash_hex=$13, \
-  shield_amount_sats=$14, is_confirmed=$15";
+#[derive(Clone, Debug)]
+struct ArchivedNoteRow {
+    seq: u64,
+    note: OrchardIndexedAbiNote,
+}
 
-async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnapshot) -> Result<()> {
-    let mut tx = pool.begin().await.context("pg begin")?;
+#[derive(Default)]
+struct CompactedNoteMutations {
+    upserts: Vec<ArchivedNoteRow>,
+    confirmations: Vec<([u8; 32], u64)>,
+    shield_amounts: Vec<([u8; 32], u64)>,
+}
 
+fn compact_note_mutations(mutations: &[NoteArchiveMutation]) -> CompactedNoteMutations {
+    let mut upserts: HashMap<[u8; 32], ArchivedNoteRow> = HashMap::new();
+    let mut confirmations: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut shield_amounts: HashMap<[u8; 32], u64> = HashMap::new();
+    for mutation in mutations {
+        match mutation {
+            NoteArchiveMutation::Upsert(env) => {
+                for note in &env.batch.abi_notes {
+                    upserts.insert(
+                        note.cmx,
+                        ArchivedNoteRow {
+                            seq: env.seq,
+                            note: note.clone(),
+                        },
+                    );
+                }
+            }
+            NoteArchiveMutation::Confirm { cmx, position } => {
+                confirmations.insert(*cmx, *position);
+            }
+            NoteArchiveMutation::ShieldAmount { cmx, amount } => {
+                shield_amounts.insert(*cmx, *amount);
+            }
+        }
+    }
+    let mut upserts: Vec<ArchivedNoteRow> = upserts.into_values().collect();
+    upserts.sort_by_key(|row| row.seq);
+    let mut confirmations: Vec<([u8; 32], u64)> = confirmations.into_iter().collect();
+    confirmations.sort_by_key(|(cmx, _)| *cmx);
+    let mut shield_amounts: Vec<([u8; 32], u64)> = shield_amounts.into_iter().collect();
+    shield_amounts.sort_by_key(|(cmx, _)| *cmx);
+    CompactedNoteMutations {
+        upserts,
+        confirmations,
+        shield_amounts,
+    }
+}
+
+const NOTE_COLUMNS: &str = "\
+pool_address, cmx_hex, seq, block_number, tx_hash, log_index, position, \
+enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, nf_old_hex, ack_hash_hex, \
+shield_amount_sats, is_confirmed";
+
+const NOTE_UPDATE_FROM_EXCLUDED: &str = "\
+seq=EXCLUDED.seq, block_number=EXCLUDED.block_number, tx_hash=EXCLUDED.tx_hash, \
+log_index=EXCLUDED.log_index, position=EXCLUDED.position, \
+enc_ciphertext_hex=EXCLUDED.enc_ciphertext_hex, epk_hex=EXCLUDED.epk_hex, \
+out_ciphertext_hex=EXCLUDED.out_ciphertext_hex, cv_net_x_hex=EXCLUDED.cv_net_x_hex, \
+nf_old_hex=EXCLUDED.nf_old_hex, ack_hash_hex=EXCLUDED.ack_hash_hex, \
+shield_amount_sats=EXCLUDED.shield_amount_sats, is_confirmed=EXCLUDED.is_confirmed";
+
+async fn pg_bulk_upsert_notes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pool_address: &str,
+    rebuild_generation: Option<&str>,
+    rows: &[ArchivedNoteRow],
+) -> Result<()> {
+    for chunk in rows.chunks(250) {
+        let prefix = if rebuild_generation.is_some() {
+            format!(
+                "INSERT INTO notes_rebuild (pool_address, rebuild_generation, {}) ",
+                NOTE_COLUMNS.trim_start_matches("pool_address, ")
+            )
+        } else {
+            format!("INSERT INTO notes ({NOTE_COLUMNS}) ")
+        };
+        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(prefix);
+        query.push_values(chunk, |mut row_builder, row| {
+            let note = &row.note;
+            row_builder.push_bind(pool_address);
+            if let Some(generation) = rebuild_generation {
+                row_builder.push_bind(generation);
+            }
+            row_builder
+                .push_bind(hex::encode(note.cmx))
+                .push_bind(row.seq as i64)
+                .push_bind(note.block_number as i64)
+                .push_bind(&note.tx_hash)
+                .push_bind(note.log_index as i64)
+                .push_bind(note.cmx_position.map(|position| position as i64))
+                .push_bind(hex::encode(&note.enc_ciphertext))
+                .push_bind(hex::encode(note.epk))
+                .push_bind(hex::encode(&note.out_ciphertext))
+                .push_bind(note.cv_net_x.map(hex::encode))
+                .push_bind(hex::encode(note.nf_old))
+                .push_bind(hex::encode(note.ack_hash))
+                .push_bind(note.shield_amount_sats.map(|amount| amount as i64))
+                .push_bind(note.is_confirmed);
+        });
+        if rebuild_generation.is_some() {
+            query.push(
+                " ON CONFLICT (pool_address, rebuild_generation, cmx_hex) DO UPDATE SET ",
+            );
+        } else {
+            query.push(" ON CONFLICT (pool_address, cmx_hex) DO UPDATE SET ");
+        }
+        query.push(NOTE_UPDATE_FROM_EXCLUDED);
+        query
+            .build()
+            .execute(&mut **tx)
+            .await
+            .context("bulk upsert note archive")?;
+    }
+    Ok(())
+}
+
+async fn pg_apply_note_mutations(
+    pool: &sqlx::PgPool,
+    pool_address: &str,
+    rebuild_generation: Option<&str>,
+    mutations: &[NoteArchiveMutation],
+) -> Result<()> {
+    let compacted = compact_note_mutations(mutations);
+    let mut tx = pool.begin().await.context("begin note archive transaction")?;
+    pg_bulk_upsert_notes(
+        &mut tx,
+        pool_address,
+        rebuild_generation,
+        &compacted.upserts,
+    )
+    .await?;
+
+    if !compacted.confirmations.is_empty() {
+        let cmx_values: Vec<String> = compacted
+            .confirmations
+            .iter()
+            .map(|(cmx, _)| hex::encode(cmx))
+            .collect();
+        let positions: Vec<i64> = compacted
+            .confirmations
+            .iter()
+            .map(|(_, position)| *position as i64)
+            .collect();
+        let affected = if let Some(generation) = rebuild_generation {
+            sqlx::query(
+                "UPDATE notes_rebuild AS n \
+                 SET position=u.position, is_confirmed=TRUE \
+                 FROM UNNEST($3::text[], $4::bigint[]) AS u(cmx_hex, position) \
+                 WHERE n.pool_address=$1 AND n.rebuild_generation=$2 AND n.cmx_hex=u.cmx_hex",
+            )
+            .bind(pool_address)
+            .bind(generation)
+            .bind(&cmx_values)
+            .bind(&positions)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE notes AS n \
+                 SET position=u.position, is_confirmed=TRUE \
+                 FROM UNNEST($2::text[], $3::bigint[]) AS u(cmx_hex, position) \
+                 WHERE n.pool_address=$1 AND n.cmx_hex=u.cmx_hex",
+            )
+            .bind(pool_address)
+            .bind(&cmx_values)
+            .bind(&positions)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        };
+        if affected != compacted.confirmations.len() as u64 {
+            return Err(anyhow!(
+                "note confirmation archive mismatch: expected {} row(s), updated {affected}",
+                compacted.confirmations.len()
+            ));
+        }
+    }
+
+    if !compacted.shield_amounts.is_empty() {
+        let cmx_values: Vec<String> = compacted
+            .shield_amounts
+            .iter()
+            .map(|(cmx, _)| hex::encode(cmx))
+            .collect();
+        let amounts: Vec<i64> = compacted
+            .shield_amounts
+            .iter()
+            .map(|(_, amount)| *amount as i64)
+            .collect();
+        let affected = if let Some(generation) = rebuild_generation {
+            sqlx::query(
+                "UPDATE notes_rebuild AS n \
+                 SET shield_amount_sats=u.amount \
+                 FROM UNNEST($3::text[], $4::bigint[]) AS u(cmx_hex, amount) \
+                 WHERE n.pool_address=$1 AND n.rebuild_generation=$2 AND n.cmx_hex=u.cmx_hex",
+            )
+            .bind(pool_address)
+            .bind(generation)
+            .bind(&cmx_values)
+            .bind(&amounts)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE notes AS n \
+                 SET shield_amount_sats=u.amount \
+                 FROM UNNEST($2::text[], $3::bigint[]) AS u(cmx_hex, amount) \
+                 WHERE n.pool_address=$1 AND n.cmx_hex=u.cmx_hex",
+            )
+            .bind(pool_address)
+            .bind(&cmx_values)
+            .bind(&amounts)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        };
+        if affected != compacted.shield_amounts.len() as u64 {
+            return Err(anyhow!(
+                "shield amount archive mismatch: expected {} row(s), updated {affected}",
+                compacted.shield_amounts.len()
+            ));
+        }
+    }
+    tx.commit().await.context("commit note archive transaction")
+}
+
+async fn pg_begin_canonical_rebuild(
+    pool: &sqlx::PgPool,
+    pool_address: &str,
+    generation: &str,
+) -> Result<()> {
+    if generation.is_empty() {
+        return Err(anyhow!("canonical rebuild generation must not be empty"));
+    }
+    sqlx::query("DELETE FROM notes_rebuild WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(pool)
+        .await
+        .context("clear stale note rebuild generations")?;
+    Ok(())
+}
+
+async fn pg_save_snapshot_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pool_address: &str,
+    snap: &CheckpointSnapshot,
+) -> Result<()> {
     sqlx::query(
-        "INSERT INTO indexer_meta (pool_address, next_block, active_root_hex, latest_seq, updated_at) \
-         VALUES ($1,$2,$3,$4, now()) \
-         ON CONFLICT (pool_address) DO UPDATE SET next_block=$2, active_root_hex=$3, latest_seq=$4, updated_at=now()",
+        "INSERT INTO indexer_meta \
+           (pool_address, next_block, active_root_hex, latest_seq, last_finalized_block, last_finalized_block_hash, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6, now()) \
+         ON CONFLICT (pool_address) DO UPDATE SET \
+           next_block=$2, active_root_hex=$3, latest_seq=$4, \
+           last_finalized_block=$5, last_finalized_block_hash=$6, updated_at=now()",
     )
     .bind(pool_address)
     .bind(snap.next_block as i64)
     .bind(snap.active_root.map(hex::encode))
     .bind(snap.latest_seq as i64)
-    .execute(&mut *tx).await.context("upsert indexer_meta")?;
+    .bind(snap.last_finalized_block.map(|block| block as i64))
+    .bind(&snap.last_finalized_block_hash)
+    .execute(&mut **tx)
+    .await
+    .context("upsert indexer_meta")?;
 
-    // These are derived rows. Replace the per-pool snapshot so a repaired
-    // backfill cannot leave stale leaves in PostgreSQL and resurrect a bad root
-    // on the next restart.
     sqlx::query("DELETE FROM cmx_leaves WHERE pool_address=$1")
         .bind(pool_address)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("replace cmx_leaves")?;
     sqlx::query("DELETE FROM frozen_updates WHERE pool_address=$1")
         .bind(pool_address)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("replace frozen_updates")?;
 
-    for (pos, cmx) in snap.cmx_ordered.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO cmx_leaves (pool_address, position, cmx_hex) VALUES ($1,$2,$3) \
-             ON CONFLICT (pool_address, position) DO NOTHING",
-        )
-        .bind(pool_address)
-        .bind(pos as i64)
-        .bind(hex::encode(cmx))
-        .execute(&mut *tx)
-        .await
-        .context("insert cmx_leaves")?;
+    for (chunk_number, chunk) in snap.cmx_ordered.chunks(1_000).enumerate() {
+        let base = chunk_number * 1_000;
+        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "INSERT INTO cmx_leaves (pool_address, position, cmx_hex) ",
+        );
+        query.push_values(chunk.iter().enumerate(), |mut row, (offset, cmx)| {
+            row.push_bind(pool_address)
+                .push_bind((base + offset) as i64)
+                .push_bind(hex::encode(cmx));
+        });
+        query
+            .build()
+            .execute(&mut **tx)
+            .await
+            .context("bulk insert cmx_leaves")?;
     }
 
     // Frozen leaf-delta feed (append-only, on-chain order) — one JSON row per ingested
-    // `FrozenRootUpdated`, replayed by wallets to rebuild the Frozen IMT (PR2).
+    // `FrozenRootUpdated`, replayed by wallets to rebuild the Frozen IMT (PR2). Note persistence
+    // moved out of the snapshot in origin's canonical-rebuild refactor (`pg_load` leaves batches
+    // empty and `backfill_from_chain` re-derives notes from the finalized chain), so this function
+    // no longer inlines a notes upsert.
     for (pos, upd) in snap.frozen_updates.iter().enumerate() {
         let json = serde_json::to_string(upd).context("serialize frozen_update")?;
         sqlx::query(
@@ -4329,49 +4929,29 @@ async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnaps
         .bind(pool_address)
         .bind(pos as i64)
         .bind(json)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("insert frozen_updates")?;
     }
 
-    for env in &snap.batches {
-        for n in &env.batch.abi_notes {
-            sqlx::query(NOTES_UPSERT)
-                .bind(pool_address)
-                .bind(hex::encode(n.cmx))
-                .bind(env.seq as i64)
-                .bind(n.block_number as i64)
-                .bind(&n.tx_hash)
-                .bind(n.log_index as i64)
-                .bind(n.cmx_position.map(|p| p as i64))
-                .bind(hex::encode(&n.enc_ciphertext))
-                .bind(hex::encode(n.epk))
-                .bind(hex::encode(&n.out_ciphertext))
-                .bind(n.cv_net_x.map(hex::encode))
-                .bind(hex::encode(n.nf_old))
-                .bind(hex::encode(n.ack_hash))
-                .bind(n.shield_amount_sats.map(|v| v as i64))
-                .bind(n.is_confirmed)
-                .execute(&mut *tx)
-                .await
-                .context("upsert notes")?;
-        }
-    }
-
     sqlx::query("DELETE FROM pending_tx WHERE pool_address=$1")
         .bind(pool_address)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("clear pending_tx")?;
-    for h in &snap.pending_tx_hashes {
-        sqlx::query(
-            "INSERT INTO pending_tx (pool_address, tx_hash) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-        )
-        .bind(pool_address)
-        .bind(h)
-        .execute(&mut *tx)
-        .await
-        .context("insert pending_tx")?;
+    for chunk in snap.pending_tx_hashes.chunks(1_000) {
+        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "INSERT INTO pending_tx (pool_address, tx_hash) ",
+        );
+        query.push_values(chunk, |mut row, hash| {
+            row.push_bind(pool_address).push_bind(hash);
+        });
+        query
+            .push(" ON CONFLICT DO NOTHING")
+            .build()
+            .execute(&mut **tx)
+            .await
+            .context("bulk insert pending_tx")?;
     }
 
     sqlx::query(
@@ -4386,27 +4966,104 @@ async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnaps
     .bind(snap.shield_accounting.total_shielded_wei.to_string())
     .bind(snap.shield_accounting.total_unshielded_units.to_string())
     .bind(snap.shield_accounting.total_unshielded_wei.to_string())
-    .execute(&mut *tx).await.context("upsert shield_pool_stats")?;
-
-    tx.commit().await.context("pg commit")?;
+    .execute(&mut **tx)
+    .await
+    .context("upsert shield_pool_stats")?;
     Ok(())
 }
 
+async fn pg_finish_canonical_rebuild(
+    pool: &sqlx::PgPool,
+    pool_address: &str,
+    generation: &str,
+    snap: &CheckpointSnapshot,
+) -> Result<()> {
+    let mut tx = pool.begin().await.context("begin canonical rebuild activation")?;
+    let staged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM notes_rebuild \
+         WHERE pool_address=$1 AND rebuild_generation=$2",
+    )
+    .bind(pool_address)
+    .bind(generation)
+    .fetch_one(&mut *tx)
+    .await
+    .context("count staged canonical notes")?;
+    if staged as usize != snap.cmx_ordered.len() {
+        return Err(anyhow!(
+            "canonical note activation mismatch: staged={staged}, tree_leaves={}",
+            snap.cmx_ordered.len()
+        ));
+    }
+
+    sqlx::query("DELETE FROM notes WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear previous canonical notes")?;
+    let inserted = sqlx::query(
+        "INSERT INTO notes \
+           (pool_address, cmx_hex, seq, block_number, tx_hash, log_index, position, \
+            enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, nf_old_hex, \
+            ack_hash_hex, shield_amount_sats, is_confirmed) \
+         SELECT pool_address, cmx_hex, seq, block_number, tx_hash, log_index, position, \
+            enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, nf_old_hex, \
+            ack_hash_hex, shield_amount_sats, is_confirmed \
+         FROM notes_rebuild \
+         WHERE pool_address=$1 AND rebuild_generation=$2",
+    )
+    .bind(pool_address)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await
+    .context("activate staged canonical notes")?
+    .rows_affected();
+    if inserted != staged as u64 {
+        return Err(anyhow!(
+            "canonical note activation mismatch: staged={staged}, inserted={inserted}"
+        ));
+    }
+
+    pg_save_snapshot_tx(&mut tx, pool_address, snap).await?;
+    sqlx::query("DELETE FROM notes_rebuild WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear activated note staging rows")?;
+    tx.commit()
+        .await
+        .context("commit canonical rebuild activation")
+}
+
+async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnapshot) -> Result<()> {
+    let mut tx = pool.begin().await.context("pg begin")?;
+    pg_save_snapshot_tx(&mut tx, pool_address, snap).await?;
+    tx.commit().await.context("pg commit")
+}
+
 /// Load scan scalars + tree leaves + pending txs from PG. Batches are intentionally left
-/// empty: `backfill_from_chain` rebuilds them (and the tree) from chain on startup, then
-/// persistence re-populates the `notes` table.
+/// empty: `backfill_from_chain` rebuilds them (and the tree) from the finalized chain;
+/// staged canonical-note activation preserves full history beyond the in-memory ring.
 async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> CheckpointData {
-    let meta: Option<(i64, Option<String>, i64)> = sqlx::query_as(
-        "SELECT next_block, active_root_hex, latest_seq FROM indexer_meta WHERE pool_address=$1",
+    let meta: Option<(i64, Option<String>, i64, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT next_block, active_root_hex, latest_seq, last_finalized_block, last_finalized_block_hash \
+         FROM indexer_meta WHERE pool_address=$1",
     )
     .bind(pool_address)
     .fetch_optional(pool)
     .await
     .ok()
     .flatten();
-    let (nb, active_root_hex, latest_seq) = meta
-        .map(|(n, a, l)| (n as u64, a, l as u64))
-        .unwrap_or((start_block, None, 0));
+    let (nb, active_root_hex, latest_seq, last_finalized_block, last_finalized_block_hash) = meta
+        .map(|(n, a, l, finalized, hash)| {
+            (
+                n as u64,
+                a,
+                l as u64,
+                finalized.map(|block| block as u64),
+                hash.and_then(|value| normalize_block_hash(&value).ok()),
+            )
+        })
+        .unwrap_or((start_block, None, 0, None, None));
     let next_block = nb.max(start_block);
     let active_root = active_root_hex.as_deref().and_then(parse_hex32);
 
@@ -4465,6 +5122,8 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
     );
     CheckpointData {
         next_block,
+        last_finalized_block,
+        last_finalized_block_hash,
         cmx_ordered,
         active_root,
         latest_seq,
@@ -4537,28 +5196,200 @@ struct PollContext {
     /// Persistent backend: batch envelopes are archived here as they are emitted
     /// so `/batches` can serve history after in-memory ring eviction.
     backend: StateBackend,
+    /// Serializes snapshot writes with staged note-history activation. Combined
+    /// with `Persist::paused`, this prevents an old coalesced snapshot from
+    /// overwriting the just-activated finalized rebuild.
+    backend_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Active full-rebuild generation. `None` during ordinary finalized catch-up.
+    rebuild_generation: Arc<RwLock<Option<String>>>,
+    /// Per-getLogs-window note mutations. This bounds rebuild memory while
+    /// avoiding a PostgreSQL round-trip for every historical event.
+    rebuild_mutations: Arc<tokio::sync::Mutex<Vec<NoteArchiveMutation>>>,
+    /// Incremental replay buffers SSE publication until its terminal finalized
+    /// hash check succeeds, preventing partial/non-canonical history leakage.
+    broadcast_paused: Arc<AtomicBool>,
+}
+
+impl PollContext {
+    async fn begin_canonical_rebuild(&self, generation: &str) -> Result<()> {
+        self.persist.paused.store(true, AtomicOrdering::Release);
+        *self.rebuild_generation.write().await = Some(generation.to_string());
+        self.rebuild_mutations.lock().await.clear();
+        let _write_guard = self.backend_write_lock.lock().await;
+        self.backend
+            .begin_canonical_rebuild(&self.contract_address, generation)
+            .await
+    }
+
+    async fn archive_note_mutation(&self, mutation: NoteArchiveMutation) -> Result<()> {
+        let generation = self.rebuild_generation.read().await.clone();
+        if generation.is_some() {
+            self.rebuild_mutations.lock().await.push(mutation);
+            return Ok(());
+        }
+        let _write_guard = self.backend_write_lock.lock().await;
+        self.backend
+            .apply_note_mutations(&self.contract_address, None, &[mutation])
+            .await
+    }
+
+    async fn flush_rebuild_note_mutations(&self) -> Result<()> {
+        let generation = self
+            .rebuild_generation
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("no active canonical rebuild generation"))?;
+        let mutations = {
+            let mut buffered = self.rebuild_mutations.lock().await;
+            std::mem::take(&mut *buffered)
+        };
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        let _write_guard = self.backend_write_lock.lock().await;
+        self.backend
+            .apply_note_mutations(
+                &self.contract_address,
+                Some(&generation),
+                &mutations,
+            )
+            .await
+    }
+
+    async fn finish_canonical_rebuild(
+        &self,
+        generation: &str,
+        snap: &CheckpointSnapshot,
+    ) -> Result<()> {
+        self.flush_rebuild_note_mutations().await?;
+        let _write_guard = self.backend_write_lock.lock().await;
+        self.backend
+            .finish_canonical_rebuild(&self.contract_address, generation, snap)
+            .await
+    }
+
+    async fn mark_canonical_rebuild_ready(&self) {
+        *self.rebuild_generation.write().await = None;
+        self.persist.paused.store(false, AtomicOrdering::Release);
+    }
+
+    async fn mark_canonical_unready(&self) {
+        self.shared.write().await.tree_out_of_order = true;
+    }
+
+    async fn broadcast_batches_after(&self, after_seq: u64) {
+        if self.broadcast_paused.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        let batches = {
+            let state = self.shared.read().await;
+            if state.tree_out_of_order {
+                return;
+            }
+            state
+                .batches
+                .iter()
+                .filter(|batch| batch.seq > after_seq)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for batch in batches {
+            self.batch_tx.send(batch).ok();
+        }
+    }
 }
 
 /// Rebuild the commitment tree from chain via `eth_getLogs`, in on-chain order.
 ///
-/// This is the source of truth: it scans `[start_block, head]` in chunks and
+/// This is the source of truth: it scans `[start_block, finalized_head]` in chunks and
 /// replays every pool event through `process_single_log`, so leaf positions and
 /// the root always match the contract — even if a prior checkpoint was empty,
-/// partial, or corrupt. The live WS subscription then continues from the head.
-/// (Relayer `/notify_tx` covers any tx landing in the brief gap before the
-/// subscription is active; the next restart's backfill reconciles regardless.)
-async fn backfill_from_chain(ctx: &PollContext) {
+/// partial, or corrupt. WebSocket notifications are wake-up hints; only the
+/// canonical finalized replay is authoritative.
+async fn persisted_finalized_cursor_matches(
+    ctx: &PollContext,
+    current_finalized_head: u64,
+) -> Result<bool> {
+    let (block, expected_hash) = {
+        let state = ctx.shared.read().await;
+        (
+            state.last_finalized_block,
+            state.last_finalized_block_hash.clone(),
+        )
+    };
+    match (block, expected_hash) {
+        (None, None) => Ok(true),
+        (Some(block), Some(expected_hash)) if block <= current_finalized_head => {
+            let canonical = ctx.rpc.block_hash(block).await?;
+            Ok(canonical == expected_hash)
+        }
+        (Some(_), Some(_)) => Ok(false),
+        _ => Ok(false),
+    }
+}
+
+async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
     let _ingest = ctx.ingest_lock.lock().await;
     let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
-    let head = match ctx.rpc.block_number().await {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("[indexer][{label}] backfill skipped: block_number failed: {e:#}");
-            return;
-        }
-    };
+    let (head, finalized_hash) = ctx
+        .rpc
+        .finalized_block()
+        .await
+        .context("resolve finalized head for backfill")?;
+    if !persisted_finalized_cursor_matches(ctx, head).await? {
+        let mut state = ctx.shared.write().await;
+        state.tree_out_of_order = true;
+        drop(state);
+        eprintln!(
+            "[indexer][{label}] persisted finalized cursor is not canonical; \
+             refusing automatic mutation of persisted derived history"
+        );
+        return Err(anyhow!(
+            "persisted finalized cursor mismatch; manual recovery from a reviewed checkpoint is required"
+        ));
+    }
+    let generation = format!(
+        "{head:x}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    ctx.begin_canonical_rebuild(&generation).await?;
     if head < ctx.start_block {
-        return;
+        let mut state = ctx.shared.write().await;
+        // A legacy checkpoint may contain derived state but no finalized
+        // marker. A finalized head below the configured deployment block
+        // proves there are no canonical pool events to retain.
+        state.tree = OrchardCommitmentTree::new();
+        state.cmx_to_position.clear();
+        state.cmx_ordered.clear();
+        state.seen_event_ids.clear();
+        state.confirm_seen_ids.clear();
+        state.shield_seen_ids.clear();
+        state.accounting_seen_ids.clear();
+        state.shield_accounting = ShieldAccounting::default();
+        state.last_leaf_key = None;
+        state.batches.clear();
+        state.latest_seq = 0;
+        state.pending_notes.clear();
+        state.confirmed_cmx.clear();
+        state.confirmed_count = 0;
+        state.active_root = None;
+        state.next_block = ctx.start_block;
+        state.last_finalized_block = Some(head);
+        state.last_finalized_block_hash = Some(finalized_hash);
+        // Remain fail-closed until the empty canonical snapshot and archive are
+        // durably activated.
+        state.tree_out_of_order = true;
+        let snap = CheckpointSnapshot::from_state(&state);
+        drop(state);
+        ctx.finish_canonical_rebuild(&generation, &snap).await?;
+        ctx.shared.write().await.tree_out_of_order = false;
+        ctx.mark_canonical_rebuild_ready().await;
+        return Ok(());
     }
 
     // Every pool event topic0 the live path understands (NoteAdded variants,
@@ -4578,6 +5409,9 @@ async fn backfill_from_chain(ctx: &PollContext) {
     // if the restored checkpoint was partial/corrupt. (pending_tx_hashes kept.)
     {
         let mut s = ctx.shared.write().await;
+        // Public root endpoints fail closed until the complete finalized replay
+        // and its terminal block-hash check have both succeeded.
+        s.tree_out_of_order = true;
         s.tree = OrchardCommitmentTree::new();
         s.cmx_to_position.clear();
         s.cmx_ordered.clear();
@@ -4587,7 +5421,6 @@ async fn backfill_from_chain(ctx: &PollContext) {
         s.accounting_seen_ids.clear();
         s.shield_accounting = ShieldAccounting::default();
         s.last_leaf_key = None;
-        s.tree_out_of_order = false;
         s.batches.clear();
         s.latest_seq = 0;
         s.pending_notes.clear();
@@ -4595,10 +5428,6 @@ async fn backfill_from_chain(ctx: &PollContext) {
         s.confirmed_count = 0;
         s.active_root = None;
     }
-    // Sequence numbers restart from 0; drop the old archive so it cannot serve
-    // stale envelopes under re-issued seqs.
-    ctx.backend.reset_archive();
-
     println!(
         "[indexer][{label}] backfill: scanning logs [{}, {head}]…",
         ctx.start_block
@@ -4613,6 +5442,10 @@ async fn backfill_from_chain(ctx: &PollContext) {
             .await
         {
             Ok(mut logs) => {
+                ctx.rpc
+                    .validate_canonical_logs(&logs)
+                    .await
+                    .with_context(|| format!("canonical log validation [{from},{to}]"))?;
                 // Ensure strict on-chain order: (blockNumber, logIndex).
                 logs.sort_by(|a, b| {
                     let ka = (
@@ -4627,10 +5460,13 @@ async fn backfill_from_chain(ctx: &PollContext) {
                 });
                 for log in logs {
                     total += 1;
-                    if let Err(e) = process_single_log(ctx, log).await {
-                        eprintln!("[indexer][{label}] backfill log error: {e:#}");
-                    }
+                    process_single_log(ctx, log)
+                        .await
+                        .with_context(|| format!("backfill log processing [{from},{to}]"))?;
                 }
+                ctx.flush_rebuild_note_mutations()
+                    .await
+                    .with_context(|| format!("stage finalized notes [{from},{to}]"))?;
             }
             Err(e) if to > from && is_getlogs_range_error(&e) => {
                 // Provider rejected the window size: shrink and retry the same
@@ -4639,23 +5475,39 @@ async fn backfill_from_chain(ctx: &PollContext) {
                 continue;
             }
             Err(e) => {
-                eprintln!("[indexer][{label}] backfill getLogs [{from},{to}] failed: {e:#}");
+                return Err(e).with_context(|| format!("backfill getLogs [{from},{to}]"));
             }
         }
         from = to + 1;
     }
 
-    // Persist the rebuilt tree. The cursor advances only TO the scanned head
-    // (not past it) so the head block stays inside the next replay window in
-    // case its logs were not yet fully visible to getLogs.
+    let canonical_hash = ctx.rpc.block_hash(head).await?;
+    if canonical_hash != finalized_hash {
+        return Err(anyhow!(
+            "finalized head changed during backfill at block {head}: \
+             before={finalized_hash} after={canonical_hash}"
+        ));
+    }
+
+    // A finalized block is complete. Keep every derived endpoint fail-closed
+    // until the full note staging generation and scan snapshot are atomically
+    // activated.
     let mut s = ctx.shared.write().await;
-    s.next_block = s.next_block.max(head);
+    s.next_block = advance_cursor(ctx.start_block, head);
+    s.last_finalized_block = Some(head);
+    s.last_finalized_block_hash = Some(finalized_hash);
     let tree_size = s.cmx_ordered.len();
-    ctx.persist.notify(&s);
+    let snap = CheckpointSnapshot::from_state(&s);
     drop(s);
+    ctx.finish_canonical_rebuild(&generation, &snap).await?;
+    ctx.shared.write().await.tree_out_of_order = false;
+    ctx.mark_canonical_rebuild_ready().await;
     println!(
-        "[indexer][{label}] backfill complete: {total} log(s), tree_size={tree_size}, next_block={head}"
+        "[indexer][{label}] finalized backfill complete: {total} log(s), \
+         tree_size={tree_size}, next_block={}",
+        advance_cursor(ctx.start_block, head)
     );
+    Ok(())
 }
 
 /// How often the incremental gap-filler polls the chain to reconcile logs the WebSocket
@@ -4669,21 +5521,39 @@ fn advance_cursor(current: u64, head: u64) -> u64 {
 }
 
 /// Incremental gap-filler. Scans `eth_getLogs` from the persisted `next_block` up to the
-/// current chain head and replays any logs the live WebSocket missed, WITHOUT resetting the
-/// tree. `process_single_log` dedups atomically by `(tx_hash, log_index)` under the state
-/// write lock, so overlap with WS-delivered logs is a no-op.
+/// current finalized head and replays any logs the live WebSocket hinted at, WITHOUT
+/// resetting the tree. `process_single_log` dedups atomically by `(tx_hash, log_index)`
+/// under the state write lock.
 ///
 /// This is the durability backstop for `run_ws_subscription`: some providers' WS endpoints
 /// (notably several Monad ones) silently drop `eth_subscribe` logs or go quiet after a
 /// reconnect, which used to leave a permanent gap between the one-shot startup backfill and
 /// live streaming. Polling forward on an interval lets the indexer self-heal and keep
-/// `next_block` advancing toward chain head instead of freezing.
+/// `next_block` advancing toward the finalized head instead of freezing.
 async fn catchup_from_chain(ctx: &PollContext) {
     let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
-    let head = match ctx.rpc.block_number().await {
-        Ok(h) => h,
+    let (head, finalized_hash) = match ctx.rpc.finalized_block().await {
+        Ok(value) => value,
         Err(_) => return, // transient RPC error — retry next tick from the same cursor
     };
+    match persisted_finalized_cursor_matches(ctx, head).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let mut state = ctx.shared.write().await;
+            state.tree_out_of_order = true;
+            ctx.persist.notify(&state);
+            drop(state);
+            eprintln!(
+                "[indexer][{label}] canonical cursor mismatch detected; \
+                 index-derived roots are disabled pending reviewed recovery"
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!("[indexer][{label}] cursor hash check failed closed: {e:#}");
+            return;
+        }
+    }
     // Hold the ingest lock for the WHOLE pass so live WS appends of newer
     // blocks cannot interleave with this ordered replay of older ones.
     let _ingest = ctx.ingest_lock.lock().await;
@@ -4692,18 +5562,52 @@ async fn catchup_from_chain(ctx: &PollContext) {
         return; // already caught up
     }
 
+    let starting_seq = ctx.shared.read().await.latest_seq;
+    ctx.broadcast_paused
+        .store(true, AtomicOrdering::Release);
     let total = match replay_range(ctx, from, head).await {
         Ok(n) => n,
-        Err(()) => return, // getLogs failed mid-range; next tick retries from the same cursor
+        Err(()) => {
+            // A prior window may already have mutated derived state. Never
+            // expose that partial pass; the dirty path performs a full staged
+            // rebuild on the next tick.
+            ctx.mark_canonical_unready().await;
+            ctx.broadcast_paused
+                .store(false, AtomicOrdering::Release);
+            return;
+        }
     };
 
-    // Advance the cursor only TO the head, not past it: the head block's logs
-    // may not have been fully visible to getLogs yet, so it stays in the next
-    // window (dedup makes the overlap a no-op).
+    let canonical_hash = match ctx.rpc.block_hash(head).await {
+        Ok(hash) if hash == finalized_hash => hash,
+        Ok(hash) => {
+            eprintln!(
+                "[indexer][{label}] finalized head hash changed during catchup at block {head}: \
+                 before={finalized_hash} after={hash}; cursor not advanced"
+            );
+            ctx.mark_canonical_unready().await;
+            ctx.broadcast_paused
+                .store(false, AtomicOrdering::Release);
+            return;
+        }
+        Err(e) => {
+            eprintln!("[indexer][{label}] finalized head recheck failed: {e:#}");
+            ctx.mark_canonical_unready().await;
+            ctx.broadcast_paused
+                .store(false, AtomicOrdering::Release);
+            return;
+        }
+    };
+
     let mut s = ctx.shared.write().await;
-    s.next_block = s.next_block.max(head);
+    s.next_block = advance_cursor(s.next_block, head);
+    s.last_finalized_block = Some(head);
+    s.last_finalized_block_hash = Some(canonical_hash);
     ctx.persist.notify(&s);
     drop(s);
+    ctx.broadcast_paused
+        .store(false, AtomicOrdering::Release);
+    ctx.broadcast_batches_after(starting_seq).await;
     if total > 0 {
         println!(
             "[indexer][{label}] catchup: reconciled {total} log(s) up to block {head}, next_block={}",
@@ -4740,6 +5644,12 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
             .await
         {
             Ok(mut logs) => {
+                if let Err(e) = ctx.rpc.validate_canonical_logs(&logs).await {
+                    eprintln!(
+                        "[indexer][{label}] canonical log validation [{lo},{hi}] failed: {e:#}"
+                    );
+                    return Err(());
+                }
                 logs.sort_by(|a, b| {
                     let ka = (
                         parse_hex_u64(&a.block_number).unwrap_or(0),
@@ -4754,9 +5664,9 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
                 for log in logs {
                     if let Err(e) = process_single_log(ctx, log).await {
                         eprintln!("[indexer][{label}] replay log error: {e:#}");
-                    } else {
-                        total += 1;
+                        return Err(());
                     }
+                    total += 1;
                 }
                 if hi == u64::MAX {
                     break;
@@ -4778,6 +5688,33 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
     Ok(total)
 }
 
+fn is_watched_pool_log(ctx: &PollContext, log: &EthLog) -> bool {
+    if normalize_hex_0x(&log.address).to_lowercase()
+        != normalize_hex_0x(&ctx.contract_address).to_lowercase()
+    {
+        return false;
+    }
+    let Some(topic0) = log
+        .topics
+        .as_ref()
+        .and_then(|topics| topics.first())
+        .map(|topic| norm_topic(topic))
+    else {
+        return false;
+    };
+    note_added_topic0_alternatives()
+        .iter()
+        .any(|topic| norm_topic(topic) == topic0)
+        || [
+            norm_topic(&shield_completed_topic0_hex()),
+            norm_topic(&ctx.note_confirmed_topic0),
+            norm_topic(&root_updated_topic0_hex()),
+            norm_topic(&shielded_topic0_hex()),
+            norm_topic(&unshielded_topic0_hex()),
+        ]
+        .contains(&topic0)
+}
+
 /// Ingest a live WS log while preserving strict on-chain ordering.
 ///
 /// The pushed log is used ONLY as a wake-up signal + coverage marker — it is
@@ -4797,9 +5734,22 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
 /// never does, leave the cursor untouched and let the periodic catchup replay
 /// the window in order later.
 async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
+    if log.removed {
+        return Err(anyhow!(
+            "removed WS log {}:{} rejected",
+            log.transaction_hash,
+            log.log_index
+        ));
+    }
     let _ingest = ctx.ingest_lock.lock().await;
     let block_number = parse_hex_u64(&log.block_number)
         .with_context(|| format!("invalid blockNumber: {}", log.block_number))?;
+    let (finalized_head, finalized_hash) = ctx.rpc.finalized_block().await?;
+    if block_number > finalized_head {
+        // Monad publishes Voted logs before finalization. The push remains a
+        // wake-up hint only; periodic catch-up will ingest it once finalized.
+        return Ok(());
+    }
     let event_id = format!("{}:{}", log.transaction_hash, log.log_index);
 
     let covered = |s: &SharedState| {
@@ -4818,16 +5768,51 @@ async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         }
         let cursor = { ctx.shared.read().await.next_block };
         let from = cursor.min(block_number);
-        if replay_range(ctx, from, block_number).await.is_ok() {
-            let mut s = ctx.shared.write().await;
-            if covered(&s) {
-                // Cursor moves to B (not past it): later same-block pushes
-                // trigger a cheap dedup-only replay of B, never a skip.
-                s.next_block = s.next_block.max(block_number);
-                ctx.persist.notify(&s);
-                return Ok(());
+        let starting_seq = ctx.shared.read().await.latest_seq;
+        ctx.broadcast_paused
+            .store(true, AtomicOrdering::Release);
+        if replay_range(ctx, from, block_number).await.is_err() {
+            ctx.mark_canonical_unready().await;
+            ctx.broadcast_paused
+                .store(false, AtomicOrdering::Release);
+            return Err(anyhow!(
+                "canonical replay failed while ingesting WS hint {event_id}"
+            ));
+        }
+        match ctx.rpc.block_hash(finalized_head).await {
+            Ok(hash) if hash == finalized_hash => {}
+            Ok(hash) => {
+                ctx.mark_canonical_unready().await;
+                ctx.broadcast_paused
+                    .store(false, AtomicOrdering::Release);
+                return Err(anyhow!(
+                    "finalized boundary changed during WS replay: head={finalized_head}, \
+                     before={finalized_hash}, after={hash}"
+                ));
+            }
+            Err(error) => {
+                ctx.mark_canonical_unready().await;
+                ctx.broadcast_paused
+                    .store(false, AtomicOrdering::Release);
+                return Err(error).context("recheck finalized boundary during WS replay");
             }
         }
+        let mut s = ctx.shared.write().await;
+        if covered(&s) {
+            // Cursor moves to B (not past it): later same-block pushes trigger
+            // a cheap dedup-only replay of B, never a skip.
+            s.next_block = s.next_block.max(block_number);
+            ctx.persist.notify(&s);
+            drop(s);
+            ctx.broadcast_paused
+                .store(false, AtomicOrdering::Release);
+            ctx.broadcast_batches_after(starting_seq).await;
+            return Ok(());
+        }
+        drop(s);
+        ctx.broadcast_paused
+            .store(false, AtomicOrdering::Release);
+        ctx.broadcast_batches_after(starting_seq).await;
         // getLogs has not caught up with the WS push yet.
         tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
     }
@@ -4835,20 +5820,33 @@ async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         "[indexer] WS log {event_id} (block {block_number}) still not visible via eth_getLogs; \
          deferring to the periodic catchup"
     );
-    Ok(())
+    Err(anyhow!(
+        "WS hint {event_id} was not visible through canonical eth_getLogs"
+    ))
 }
 
 /// WebSocket event-driven loop.
 ///
 /// 1. Subscribe: `eth_subscribe logs` on the contract address.
-/// 2. Process each incoming log immediately — no block polling.
+/// 2. Treat each incoming log as a hint; ingest only via finalized canonical replay.
 /// 3. On disconnect: recover any pending tx hashes via receipt lookup, then resubscribe.
 /// 4. Also listens for recover_trigger signals from post_notify_tx for immediate recovery.
 /// 5. A concurrent `catchup_from_chain` task reconciles anything the WS silently dropped.
 async fn run_event_loop(ctx: PollContext) -> Result<()> {
     // Rebuild the commitment tree from chain so the indexer matches on-chain state
     // (correct leaf positions / root) even after restarts or a partial checkpoint.
-    backfill_from_chain(&ctx).await;
+    loop {
+        match backfill_from_chain(&ctx).await {
+            Ok(()) => break,
+            Err(e) => {
+                eprintln!(
+                    "[indexer][{}] finalized startup backfill failed closed: {e:#}; retrying in 5s",
+                    &ctx.contract_address[..10.min(ctx.contract_address.len())]
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
     // On every startup, recover any pending txs persisted in the checkpoint.
     recover_pending_txs(&ctx).await;
 
@@ -4870,7 +5868,9 @@ async fn run_event_loop(ctx: PollContext) -> Result<()> {
                     eprintln!(
                         "[indexer] commitment tree flagged out-of-order — rebuilding from chain"
                     );
-                    backfill_from_chain(&ctx_catchup).await;
+                    if let Err(e) = backfill_from_chain(&ctx_catchup).await {
+                        eprintln!("[indexer] finalized rebuild failed closed: {e:#}");
+                    }
                 } else {
                     catchup_from_chain(&ctx_catchup).await;
                 }
@@ -4918,22 +5918,70 @@ async fn recover_pending_txs(ctx: &PollContext) {
     );
     for tx_hash in hashes {
         match ctx.rpc.get_transaction_receipt_logs(&tx_hash).await {
-            Ok(Some((success, logs))) => {
-                if success {
-                    println!("[indexer] recovering tx {tx_hash}: {} log(s)", logs.len());
-                    for log in logs {
+            Ok(Some(receipt)) => {
+                let finalized = match ctx.rpc.finalized_block().await {
+                    Ok(value) => value,
+                    Err(e) => {
+                        eprintln!(
+                            "[indexer] cannot finalize pending tx {tx_hash}: finalized head failed: {e:#}"
+                        );
+                        continue;
+                    }
+                };
+                if receipt.block_number > finalized.0 {
+                    println!(
+                        "[indexer] tx {tx_hash} is mined at {} but not finalized (head={}); keeping pending",
+                        receipt.block_number, finalized.0
+                    );
+                    continue;
+                }
+                let canonical = match ctx.rpc.block_hash(receipt.block_number).await {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        eprintln!(
+                            "[indexer] cannot verify receipt block for {tx_hash}: {e:#}"
+                        );
+                        continue;
+                    }
+                };
+                if canonical != receipt.block_hash {
+                    eprintln!(
+                        "[indexer] receipt block hash mismatch for {tx_hash} at {}: receipt={} canonical={canonical}; keeping pending",
+                        receipt.block_number, receipt.block_hash
+                    );
+                    continue;
+                }
+                if receipt.success {
+                    println!(
+                        "[indexer] recovering finalized tx {tx_hash}: {} log(s)",
+                        receipt.logs.len()
+                    );
+                    let mut replayed = true;
+                    for log in receipt
+                        .logs
+                        .into_iter()
+                        .filter(|log| is_watched_pool_log(ctx, log))
+                    {
                         // Ordered ingest: gap-fills any earlier dropped logs first,
                         // so recovered logs cannot be appended out of order.
                         if let Err(e) = ingest_ws_log(ctx, log).await {
                             eprintln!("[indexer] recover log error for {tx_hash}: {e:#}");
+                            replayed = false;
+                            break;
                         }
                     }
+                    if !replayed {
+                        // The canonical replay is incomplete. Keep the tx in the
+                        // durable queue so a later finalized rebuild can retry it.
+                        continue;
+                    }
                 } else {
-                    eprintln!("[indexer] tx {tx_hash} reverted — removing from pending queue");
+                    eprintln!(
+                        "[indexer] tx {tx_hash} finalized reverted — removing from pending queue"
+                    );
                 }
-                // Receipt exists (mined, success or revert) — always remove from queue.
-                // process_single_log already removes it on log processing; this handles
-                // the case where the tx reverted (no logs) or emitted no watched events.
+                // Only a canonical finalized receipt (success or revert) can leave
+                // the recovery queue.
                 let mut s = ctx.shared.write().await;
                 s.pending_tx_hashes.retain(|h| h != &tx_hash);
             }
@@ -5136,8 +6184,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         let d = match decode_note_added_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[indexer] NoteAdded decode FAILED: {e}");
-                return Ok(());
+                return Err(anyhow!("NoteAdded decode failed: {e}"));
             }
         };
         // Monotonicity guard: an append-only tree must receive leaves in exact
@@ -5229,11 +6276,19 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         let pending_snap: Vec<String> = state.pending_tx_hashes.iter().cloned().collect();
         let frozen_snap: Vec<FrozenUpdate> = state.frozen_updates.clone();
         let accounting_snap = state.shield_accounting;
+        let state_last_finalized_block = state.last_finalized_block;
+        let state_last_finalized_block_hash = state.last_finalized_block_hash.clone();
+        let canonical_ready = !state.tree_out_of_order;
         drop(state);
-        ctx.backend.archive_batch(&envelope);
-        ctx.batch_tx.send(envelope).ok();
+        ctx.archive_note_mutation(NoteArchiveMutation::Upsert(envelope.clone()))
+            .await?;
+        if canonical_ready && !ctx.broadcast_paused.load(AtomicOrdering::Acquire) {
+            ctx.batch_tx.send(envelope).ok();
+        }
         ctx.persist.notify_owned(CheckpointSnapshot {
             next_block,
+            last_finalized_block: state_last_finalized_block,
+            last_finalized_block_hash: state_last_finalized_block_hash,
             cmx_ordered: cmx_snap,
             active_root: root_snap,
             latest_seq: seq_snap,
@@ -5247,88 +6302,66 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         if !state.confirm_seen_ids.insert(event_id) {
             return Ok(());
         }
-        if let Ok((cmx, new_root, position)) =
+        let (cmx, new_root, position) =
             decode_note_confirmed_log(log.topics.as_deref().unwrap_or(&[]), &log.data)
-        {
-            state.pending_notes.remove(&cmx);
-            state.confirmed_cmx.insert(cmx);
-            state.active_root = Some(new_root);
-            // Batch-update watermark: this leaf is now folded into confirmedRoot.
-            state.confirmed_count = state.confirmed_count.max(position.saturating_add(1));
+                .map_err(|e| anyhow!("NoteConfirmed decode failed: {e}"))?;
+        state.pending_notes.remove(&cmx);
+        state.confirmed_cmx.insert(cmx);
+        state.active_root = Some(new_root);
+        state.confirmed_count = state.confirmed_count.max(position.saturating_add(1));
 
-            // Find the shield/transfer note in batches history and mark it confirmed.
-            let maybe_note: Option<OrchardIndexedAbiNote> = {
-                let found = state
-                    .batches
-                    .iter()
-                    .rev()
-                    .flat_map(|env| env.batch.abi_notes.iter())
-                    .find(|n| n.cmx == cmx)
-                    .cloned();
-                if let Some(mut note) = found {
-                    note.is_confirmed = true;
-                    note.cmx_position = Some(position);
-                    println!(
-                        "[indexer] note confirmed: cmx={} pos={}",
-                        hex::encode(cmx),
-                        position
-                    );
-                    Some(note)
-                } else {
-                    println!(
-                        "[indexer] NoteConfirmed cmx={} not found in batches, skipping re-emit",
-                        hex::encode(cmx)
-                    );
-                    None
-                }
-            };
+        let maybe_note = state
+            .batches
+            .iter()
+            .rev()
+            .flat_map(|env| env.batch.abi_notes.iter())
+            .find(|note| note.cmx == cmx)
+            .cloned()
+            .map(|mut note| {
+                note.is_confirmed = true;
+                note.cmx_position = Some(position);
+                note
+            });
+        state.tree.checkpoint(block_number);
 
-            // Add a tree checkpoint so /merkle_path works after this confirmation.
-            state.tree.checkpoint(block_number);
-
-            if let Some(note) = maybe_note {
-                let seq = state.latest_seq.saturating_add(1);
-                state.latest_seq = seq;
-                let batch = OrchardIndexBatch {
+        let envelope = maybe_note.map(|note| {
+            let seq = state.latest_seq.saturating_add(1);
+            state.latest_seq = seq;
+            BatchEnvelope {
+                seq,
+                pool_address: Some(ctx.contract_address.clone()),
+                batch: OrchardIndexBatch {
                     from_block: block_number,
                     to_block: block_number,
                     abi_notes: vec![note],
                     bundles: vec![],
                     latest_root: state.tree.latest_root(),
-                };
-                let envelope = BatchEnvelope {
-                    seq,
-                    pool_address: Some(ctx.contract_address.clone()),
-                    batch,
-                };
-                state.batches.push_back(envelope.clone());
-                while state.batches.len() > state.max_batches {
-                    state.batches.pop_front();
-                }
-                let cmx_snap = state.cmx_ordered.clone();
-                let root_snap = state.active_root;
-                let seq_snap = state.latest_seq;
-                let next_block = state.next_block;
-                let batches_snap: Vec<BatchEnvelope> = state.batches.iter().cloned().collect();
-                let pending_snap: Vec<String> = state.pending_tx_hashes.iter().cloned().collect();
-                let frozen_snap: Vec<FrozenUpdate> = state.frozen_updates.clone();
-                let accounting_snap = state.shield_accounting;
-                drop(state);
-                ctx.backend.archive_batch(&envelope);
-                ctx.batch_tx.send(envelope).ok();
-                ctx.persist.notify_owned(CheckpointSnapshot {
-                    next_block,
-                    cmx_ordered: cmx_snap,
-                    active_root: root_snap,
-                    latest_seq: seq_snap,
-                    batches: batches_snap,
-                    pending_tx_hashes: pending_snap,
-                    frozen_updates: frozen_snap,
-                    shield_accounting: accounting_snap,
-                });
-                return Ok(());
+                },
+            }
+        });
+        if let Some(envelope) = &envelope {
+            state.batches.push_back(envelope.clone());
+            while state.batches.len() > state.max_batches {
+                state.batches.pop_front();
             }
         }
+        let canonical_ready = !state.tree_out_of_order;
+        let snap = CheckpointSnapshot::from_state(&state);
+        drop(state);
+
+        if let Some(envelope) = &envelope {
+            ctx.archive_note_mutation(NoteArchiveMutation::Upsert(envelope.clone()))
+                .await?;
+        }
+        ctx.archive_note_mutation(NoteArchiveMutation::Confirm { cmx, position })
+            .await?;
+        if canonical_ready && !ctx.broadcast_paused.load(AtomicOrdering::Acquire) {
+            if let Some(envelope) = envelope {
+                ctx.batch_tx.send(envelope).ok();
+            }
+        }
+        ctx.persist.notify_owned(snap);
+        return Ok(());
     } else if t0.as_deref() == Some(ru.as_str()) {
         // ── RootUpdated (batch confirm) ──────────────────────────────────────
         // One verified `updateRoot` batch: authoritative watermark advance. The
@@ -5350,7 +6383,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 );
                 ctx.persist.notify(&state);
             }
-            Err(e) => eprintln!("[indexer] RootUpdated decode FAILED: {e}"),
+            Err(e) => return Err(anyhow!("RootUpdated decode failed: {e}")),
         }
     } else if t0.as_deref() == Some(fru.as_str()) {
         // ── FrozenRootUpdated (compliance leaf delta) ────────────────────────
@@ -5391,42 +6424,59 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         if !state.shield_seen_ids.insert(event_id) {
             return Ok(());
         }
-        if let Ok((cmx, amt)) =
+        let (cmx, raw_amount) =
             decode_shield_completed_log(log.topics.as_deref().unwrap_or(&[]), &log.data)
-        {
-            let maybe_note = state
-                .batches
-                .iter()
-                .rev()
-                .flat_map(|env| env.batch.abi_notes.iter())
-                .find(|n| n.cmx == cmx && n.tx_hash == log.transaction_hash)
-                .cloned();
-            if let Some(mut note) = maybe_note {
-                note.shield_amount_sats = u64::try_from(amt).ok();
-                let seq = state.latest_seq.saturating_add(1);
-                state.latest_seq = seq;
-                let batch = OrchardIndexBatch {
+                .map_err(|e| anyhow!("ShieldCompleted decode failed: {e}"))?;
+        let amount =
+            u64::try_from(raw_amount).context("ShieldCompleted amount exceeds u64")?;
+        let maybe_note = state
+            .batches
+            .iter()
+            .rev()
+            .flat_map(|env| env.batch.abi_notes.iter())
+            .find(|note| note.cmx == cmx && note.tx_hash == log.transaction_hash)
+            .cloned()
+            .map(|mut note| {
+                note.shield_amount_sats = Some(amount);
+                note
+            });
+        let envelope = maybe_note.map(|note| {
+            let seq = state.latest_seq.saturating_add(1);
+            state.latest_seq = seq;
+            BatchEnvelope {
+                seq,
+                pool_address: Some(ctx.contract_address.clone()),
+                batch: OrchardIndexBatch {
                     from_block: block_number,
                     to_block: block_number,
                     abi_notes: vec![note],
                     bundles: vec![],
                     latest_root: state.tree.latest_root(),
-                };
-                let envelope = BatchEnvelope {
-                    seq,
-                    pool_address: Some(ctx.contract_address.clone()),
-                    batch,
-                };
-                state.batches.push_back(envelope.clone());
-                while state.batches.len() > state.max_batches {
-                    state.batches.pop_front();
-                }
-                drop(state);
-                ctx.backend.archive_batch(&envelope);
-                ctx.batch_tx.send(envelope).ok();
-                return Ok(());
+                },
+            }
+        });
+        if let Some(envelope) = &envelope {
+            state.batches.push_back(envelope.clone());
+            while state.batches.len() > state.max_batches {
+                state.batches.pop_front();
             }
         }
+        let canonical_ready = !state.tree_out_of_order;
+        let snap = CheckpointSnapshot::from_state(&state);
+        drop(state);
+        if let Some(envelope) = &envelope {
+            ctx.archive_note_mutation(NoteArchiveMutation::Upsert(envelope.clone()))
+                .await?;
+        }
+        ctx.archive_note_mutation(NoteArchiveMutation::ShieldAmount { cmx, amount })
+            .await?;
+        if canonical_ready && !ctx.broadcast_paused.load(AtomicOrdering::Acquire) {
+            if let Some(envelope) = envelope {
+                ctx.batch_tx.send(envelope).ok();
+            }
+        }
+        ctx.persist.notify_owned(snap);
+        return Ok(());
     } else if t0.as_deref() == Some(shielded_topic.as_str()) {
         // ── Shielded accounting ───────────────────────────────────────────────
         if state.accounting_seen_ids.contains(&event_id) {
@@ -5446,7 +6496,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 state.next_block = block_number.saturating_add(1).max(state.next_block);
                 ctx.persist.notify(&state);
             }
-            Err(e) => eprintln!("[indexer] Shielded decode FAILED: {e}"),
+            Err(e) => return Err(anyhow!("Shielded decode failed: {e}")),
         }
     } else if t0.as_deref() == Some(unshielded_topic.as_str()) {
         // ── Unshielded accounting ─────────────────────────────────────────────
@@ -5467,7 +6517,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 state.next_block = block_number.saturating_add(1).max(state.next_block);
                 ctx.persist.notify(&state);
             }
-            Err(e) => eprintln!("[indexer] Unshielded decode FAILED: {e}"),
+            Err(e) => return Err(anyhow!("Unshielded decode failed: {e}")),
         }
     }
 
@@ -5597,11 +6647,63 @@ impl RpcClient {
         effective
     }
 
-    async fn block_number(&self) -> Result<u64> {
-        let hex_num: String = self
-            .rpc_call("eth_blockNumber", serde_json::json!([]))
-            .await?;
-        parse_hex_u64(&hex_num).context("invalid eth_blockNumber")
+    /// Monad's authoritative event boundary. `eth_blockNumber` and ordinary
+    /// `latest` data can describe a Voted block that is still reversible; state
+    /// derived by the indexer only advances through this finalized header.
+    async fn finalized_block(&self) -> Result<(u64, String)> {
+        #[derive(Deserialize)]
+        struct BlockHeader {
+            number: String,
+            hash: String,
+        }
+        let header: Option<BlockHeader> = self
+            .rpc_call(
+                "eth_getBlockByNumber",
+                serde_json::json!(["finalized", false]),
+            )
+            .await
+            .context("eth_getBlockByNumber(finalized)")?;
+        let header = header.ok_or_else(|| anyhow!("RPC returned no finalized block"))?;
+        let number =
+            parse_hex_u64(&header.number).context("invalid finalized block number")?;
+        let hash = normalize_block_hash(&header.hash).context("invalid finalized block hash")?;
+        Ok((number, hash))
+    }
+
+    async fn block_hash(&self, block: u64) -> Result<String> {
+        #[derive(Deserialize)]
+        struct BlockHeader {
+            hash: String,
+        }
+        let tag = format!("0x{block:x}");
+        let header: Option<BlockHeader> = self
+            .rpc_call("eth_getBlockByNumber", serde_json::json!([tag, false]))
+            .await
+            .with_context(|| format!("eth_getBlockByNumber({tag})"))?;
+        let header = header.ok_or_else(|| anyhow!("RPC returned no block {block}"))?;
+        normalize_block_hash(&header.hash)
+            .with_context(|| format!("invalid hash for block {block}"))
+    }
+
+    /// Verify that every fetched log belongs to the provider's canonical block
+    /// at that height. Finalized scans should never encounter `removed=true` or
+    /// a hash mismatch; either condition fails the whole window closed.
+    async fn validate_canonical_logs(&self, logs: &[EthLog]) -> Result<()> {
+        let mut canonical: HashMap<u64, String> = HashMap::new();
+        for log in logs {
+            let block = parse_hex_u64(&log.block_number)
+                .with_context(|| format!("invalid log blockNumber {}", log.block_number))?;
+            let expected = match canonical.get(&block) {
+                Some(hash) => hash.clone(),
+                None => {
+                    let hash = self.block_hash(block).await?;
+                    canonical.insert(block, hash.clone());
+                    hash
+                }
+            };
+            validate_log_against_canonical(log, block, &expected)?;
+        }
+        Ok(())
     }
 
     async fn get_transaction_count(&self, address: &str) -> Result<u64> {
@@ -5731,17 +6833,21 @@ impl RpcClient {
     async fn get_transaction_receipt_logs(
         &self,
         tx_hash: &str,
-    ) -> Result<Option<(bool, Vec<EthLog>)>> {
+    ) -> Result<Option<ReceiptWithLogs>> {
         #[derive(Deserialize)]
         struct ReceiptLog {
             #[serde(default)]
             address: String,
             #[serde(rename = "blockNumber")]
             block_number: String,
+            #[serde(default, rename = "blockHash")]
+            block_hash: Option<String>,
             #[serde(rename = "transactionHash")]
             transaction_hash: String,
             #[serde(rename = "logIndex")]
             log_index: String,
+            #[serde(default)]
+            removed: bool,
             #[serde(default)]
             topics: Option<Vec<String>>,
             data: String,
@@ -5750,27 +6856,43 @@ impl RpcClient {
         struct Receipt {
             /// "0x1" = success, "0x0" = revert. None if legacy pre-Byzantium.
             status: Option<String>,
+            #[serde(rename = "blockNumber")]
+            block_number: String,
+            #[serde(rename = "blockHash")]
+            block_hash: String,
             logs: Vec<ReceiptLog>,
         }
         let hash = normalize_hex_0x(tx_hash);
         let receipt: Option<Receipt> = self
             .rpc_call("eth_getTransactionReceipt", serde_json::json!([hash]))
             .await?;
-        Ok(receipt.map(|r| {
-            let success = r.status.as_deref().unwrap_or("0x1") == "0x1";
-            let logs = r
-                .logs
-                .into_iter()
-                .map(|l| EthLog {
-                    address: l.address,
-                    block_number: l.block_number,
-                    transaction_hash: l.transaction_hash,
-                    log_index: l.log_index,
-                    topics: l.topics,
-                    data: l.data,
-                })
-                .collect();
-            (success, logs)
+        let Some(r) = receipt else {
+            return Ok(None);
+        };
+        let success = r.status.as_deref().unwrap_or("0x1") == "0x1";
+        let block_number =
+            parse_hex_u64(&r.block_number).context("invalid receipt blockNumber")?;
+        let block_hash =
+            normalize_block_hash(&r.block_hash).context("invalid receipt blockHash")?;
+        let logs = r
+            .logs
+            .into_iter()
+            .map(|l| EthLog {
+                address: l.address,
+                block_number: l.block_number,
+                block_hash: l.block_hash,
+                transaction_hash: l.transaction_hash,
+                log_index: l.log_index,
+                removed: l.removed,
+                topics: l.topics,
+                data: l.data,
+            })
+            .collect();
+        Ok(Some(ReceiptWithLogs {
+            success,
+            block_number,
+            block_hash,
+            logs,
         }))
     }
 
@@ -5832,7 +6954,7 @@ impl RpcClient {
         // Prefer the shield-pool genesis event (carries scale + underlying).
         let shield_filter = serde_json::json!({
             "fromBlock": "0x0",
-            "toBlock":   "latest",
+            "toBlock":   "finalized",
             "address":   addr,
             "topics":    [shield_pool_created_topic0_hex(), topic1],
         });
@@ -5840,6 +6962,7 @@ impl RpcClient {
             .rpc_call("eth_getLogs", serde_json::json!([shield_filter]))
             .await
             .context("eth_getLogs (ShieldPoolCreated metadata) failed")?;
+        self.validate_canonical_logs(&logs).await?;
         if let Some(l) = logs.first() {
             if let Some(topics) = l.topics.as_ref() {
                 if let Ok(d) = decode_shield_pool_created_log(topics, &l.data) {
@@ -5850,7 +6973,7 @@ impl RpcClient {
         // Fall back to issuer genesis (name/symbol/decimals only).
         let issuer_filter = serde_json::json!({
             "fromBlock": "0x0",
-            "toBlock":   "latest",
+            "toBlock":   "finalized",
             "address":   addr,
             "topics":    [perc20_created_topic0(), topic1],
         });
@@ -5858,6 +6981,7 @@ impl RpcClient {
             .rpc_call("eth_getLogs", serde_json::json!([issuer_filter]))
             .await
             .context("eth_getLogs (Perc20Created metadata) failed")?;
+        self.validate_canonical_logs(&logs).await?;
         if let Some(l) = logs.first() {
             if let Some(meta) = PoolMeta::try_from_perc20_created(&addr, &l.data) {
                 return Ok(Some(meta));
@@ -5888,6 +7012,7 @@ impl RpcClient {
             .with_context(|| {
                 format!("eth_getLogs (trusted factory {factory}) [{from_block},{to_block}]")
             })?;
+        self.validate_canonical_logs(&logs).await?;
         let mut out = Vec::new();
         for l in logs {
             if normalize_hex_0x(&l.address).to_lowercase()
@@ -5932,7 +7057,7 @@ impl RpcClient {
     ) -> Result<bool> {
         let filter = serde_json::json!({
             "fromBlock": "0x0",
-            "toBlock":   "latest",
+            "toBlock":   "finalized",
             "address":   normalize_hex_0x(factory),
             "topics":    [event_topic, address_to_topic(pool)],
         });
@@ -5940,6 +7065,7 @@ impl RpcClient {
             .rpc_call("eth_getLogs", serde_json::json!([filter]))
             .await
             .with_context(|| format!("eth_getLogs deployment proof failed for pool {pool}"))?;
+        self.validate_canonical_logs(&logs).await?;
         Ok(logs
             .iter()
             .any(|log| factory_log_matches(log, factory, event_topic, pool)))
@@ -6179,6 +7305,13 @@ fn rlp_list(items: Vec<Vec<u8>>) -> Vec<u8> {
 
 // ─── Log parsing ─────────────────────────────────────────────────────────────
 
+struct ReceiptWithLogs {
+    success: bool,
+    block_number: u64,
+    block_hash: String,
+    logs: Vec<EthLog>,
+}
+
 #[derive(Debug, Deserialize)]
 struct EthLog {
     /// Contract address that emitted this log.
@@ -6186,10 +7319,14 @@ struct EthLog {
     address: String,
     #[serde(rename = "blockNumber")]
     block_number: String,
+    #[serde(default, rename = "blockHash")]
+    block_hash: Option<String>,
     #[serde(rename = "transactionHash")]
     transaction_hash: String,
     #[serde(rename = "logIndex")]
     log_index: String,
+    #[serde(default)]
+    removed: bool,
     /// Indexed topics: topics[0] = event signature hash, topics[1..] = indexed params.
     #[serde(default)]
     topics: Option<Vec<String>>,
@@ -6236,6 +7373,50 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
+fn normalize_block_hash(s: &str) -> Result<String> {
+    let hash = parse_hex32(s).ok_or_else(|| anyhow!("block hash must be exactly bytes32"))?;
+    Ok(format!("0x{}", hex::encode(hash)))
+}
+
+fn validate_log_against_canonical(
+    log: &EthLog,
+    expected_block: u64,
+    expected_hash: &str,
+) -> Result<()> {
+    if log.removed {
+        return Err(anyhow!(
+            "removed log {}:{} appeared in finalized scan",
+            log.transaction_hash,
+            log.log_index
+        ));
+    }
+    let block = parse_hex_u64(&log.block_number)
+        .with_context(|| format!("invalid log blockNumber {}", log.block_number))?;
+    if block != expected_block {
+        return Err(anyhow!(
+            "log block mismatch: log={block} expected={expected_block}"
+        ));
+    }
+    let log_hash = log
+        .block_hash
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow!(
+                "log {}:{} has no blockHash",
+                log.transaction_hash,
+                log.log_index
+            )
+        })
+        .and_then(normalize_block_hash)?;
+    let expected_hash = normalize_block_hash(expected_hash)?;
+    if log_hash != expected_hash {
+        return Err(anyhow!(
+            "canonical hash mismatch at block {block}: log={log_hash} rpc={expected_hash}"
+        ));
+    }
+    Ok(())
+}
+
 fn parse_bytes32_strict(name: &str, value: &str) -> Result<[u8; 32]> {
     parse_hex32(value)
         .ok_or_else(|| anyhow!("{name} must be exactly one 0x-prefixed bytes32 value"))
@@ -6278,14 +7459,18 @@ fn strip_0x(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_cursor, beacon_words_match, classify_selector, crank_gas_limit,
-        crank_next_delay_secs, decode_orchard_bundle_from_log_data, eip1967_beacon_slot,
+        advance_cursor, beacon_words_match, canonical_guard, classify_selector,
+        compact_note_mutations, crank_gas_limit, crank_next_delay_secs,
+        decode_frozen_root_updated_log, decode_json_note_archive,
+        decode_orchard_bundle_from_log_data, eip1967_beacon_slot,
         encode_confirm_receipt_calldata, encode_crank_root_calldata, factory_log_matches,
-        getlogs_window_end, is_getlogs_range_error, normalize_hex_0x, parse_address_set,
-        parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0, require_admin,
-        decode_frozen_root_updated_log, frozen_root_updated_topic0, replay_frozen_set,
-        require_relayer, rlp_bytes, rlp_list, rlp_uint, Cli, EthLog, FrozenUpdate, HourlyTxBudget,
-        RpcClient, MAX_CRANK_GAS_MARGIN_BPS,
+        frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
+        normalize_hex_0x, parse_address_set, parse_bytes32_strict, parse_tx_meta,
+        perc20_deployed_topic0, pg_apply_note_mutations, pg_begin_canonical_rebuild,
+        pg_finish_canonical_rebuild, replay_frozen_set, require_admin, require_relayer,
+        rlp_bytes, rlp_list, rlp_uint, validate_log_against_canonical, BatchEnvelope,
+        CheckpointSnapshot, Cli, EthLog, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
+        JsonNoteArchiveUpdate, NoteArchiveMutation, RpcClient, MAX_CRANK_GAS_MARGIN_BPS,
     };
 
     fn frozen_update(cmx: &[&str], is_add: &[bool]) -> FrozenUpdate {
@@ -6374,7 +7559,9 @@ mod tests {
         FrontierTree, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX,
     };
     use privacy_core::ethereum::{update_root_selector, update_roots_selector};
-    use privacy_core::types::OrchardStoredBundle;
+    use privacy_core::types::{
+        OrchardIndexBatch, OrchardIndexedAbiNote, OrchardStoredBundle,
+    };
     use sha3::{Digest, Keccak256};
     use std::sync::Arc;
 
@@ -6636,8 +7823,10 @@ mod tests {
         let make_log = |address: String, event: String| EthLog {
             address,
             block_number: "0x1".into(),
+            block_hash: Some(format!("0x{}", "aa".repeat(32))),
             transaction_hash: format!("0x{}", "33".repeat(32)),
             log_index: "0x0".into(),
+            removed: false,
             topics: Some(vec![event, super::address_to_topic(&pool)]),
             data: "0x".into(),
         };
@@ -6659,6 +7848,258 @@ mod tests {
             &topic0,
             &pool
         ));
+    }
+
+    #[test]
+    fn finalized_log_validation_requires_canonical_hash_and_rejects_removed() {
+        let canonical = format!("0x{}", "aa".repeat(32));
+        let mut log = EthLog {
+            address: format!("0x{}", "11".repeat(20)),
+            block_number: "0x2a".into(),
+            block_hash: Some(canonical.clone()),
+            transaction_hash: format!("0x{}", "22".repeat(32)),
+            log_index: "0x0".into(),
+            removed: false,
+            topics: None,
+            data: "0x".into(),
+        };
+        assert!(validate_log_against_canonical(&log, 42, &canonical).is_ok());
+        log.block_hash = Some(format!("0x{}", "bb".repeat(32)));
+        assert!(validate_log_against_canonical(&log, 42, &canonical).is_err());
+        log.block_hash = Some(canonical.clone());
+        log.removed = true;
+        assert!(validate_log_against_canonical(&log, 42, &canonical).is_err());
+        log.removed = false;
+        log.block_hash = None;
+        assert!(validate_log_against_canonical(&log, 42, &canonical).is_err());
+    }
+
+    #[test]
+    fn checkpoint_schema_accepts_legacy_and_roundtrips_finalized_cursor() {
+        let legacy: IndexerCheckpoint =
+            serde_json::from_str(r#"{"next_block":7}"#).expect("legacy checkpoint");
+        assert_eq!(legacy.last_finalized_block, None);
+        assert_eq!(legacy.last_finalized_block_hash, None);
+
+        let hash = format!("0x{}", "ab".repeat(32));
+        let current: IndexerCheckpoint = serde_json::from_value(serde_json::json!({
+            "next_block": 43,
+            "last_finalized_block": 42,
+            "last_finalized_block_hash": hash.clone(),
+        }))
+        .expect("current checkpoint");
+        assert_eq!(current.last_finalized_block, Some(42));
+        assert_eq!(
+            current.last_finalized_block_hash.as_deref(),
+            Some(hash.as_str())
+        );
+    }
+
+    fn sample_note_envelope(cmx_byte: u8, seq: u64) -> BatchEnvelope {
+        let note = OrchardIndexedAbiNote {
+            block_number: 100 + seq,
+            tx_hash: format!("0x{}", format!("{:02x}", cmx_byte).repeat(32)),
+            log_index: seq,
+            cmx: [cmx_byte; 32],
+            enc_ciphertext: vec![1, 2, 3],
+            epk: [2u8; 32],
+            out_ciphertext: vec![4, 5],
+            cv_net_x: Some([3u8; 32]),
+            nf_old: [4u8; 32],
+            ack_hash: [5u8; 32],
+            cmx_position: None,
+            shield_amount_sats: None,
+            is_confirmed: false,
+        };
+        BatchEnvelope {
+            seq,
+            pool_address: Some(format!("0x{}", "11".repeat(20))),
+            batch: OrchardIndexBatch {
+                from_block: note.block_number,
+                to_block: note.block_number,
+                abi_notes: vec![note],
+                bundles: vec![],
+                latest_root: None,
+            },
+        }
+    }
+
+    #[test]
+    fn canonical_guard_fails_closed_during_rebuild_or_cursor_mismatch() {
+        assert!(canonical_guard(false).is_ok());
+        assert_eq!(
+            canonical_guard(true).unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn rebuild_note_mutations_keep_full_rows_and_compact_updates() {
+        let first = sample_note_envelope(0x11, 1);
+        let mut latest = first.clone();
+        latest.seq = 2;
+        latest.batch.abi_notes[0].block_number = 102;
+        let mutations = vec![
+            NoteArchiveMutation::Upsert(first),
+            NoteArchiveMutation::Upsert(latest),
+            NoteArchiveMutation::Confirm {
+                cmx: [0x11; 32],
+                position: 7,
+            },
+            NoteArchiveMutation::ShieldAmount {
+                cmx: [0x11; 32],
+                amount: 99,
+            },
+            NoteArchiveMutation::Upsert(sample_note_envelope(0x22, 3)),
+        ];
+        let compacted = compact_note_mutations(&mutations);
+        assert_eq!(compacted.upserts.len(), 2);
+        let row = compacted
+            .upserts
+            .iter()
+            .find(|row| row.note.cmx == [0x11; 32])
+            .unwrap();
+        assert_eq!(row.seq, 2, "latest row for one cmx must win");
+        assert_eq!(compacted.confirmations, vec![([0x11; 32], 7)]);
+        assert_eq!(compacted.shield_amounts, vec![([0x11; 32], 99)]);
+    }
+
+    #[test]
+    fn json_note_archive_applies_late_confirmation_and_amount_updates() {
+        let pool = format!("0x{}", "11".repeat(20));
+        let env = sample_note_envelope(0x33, 9);
+        let records = [
+            serde_json::to_string(&env).unwrap(),
+            serde_json::to_string(&JsonNoteArchiveUpdate::Confirm {
+                cmx_hex: hex::encode([0x33; 32]),
+                position: 12,
+            })
+            .unwrap(),
+            serde_json::to_string(&JsonNoteArchiveUpdate::ShieldAmount {
+                cmx_hex: hex::encode([0x33; 32]),
+                amount: 500,
+            })
+            .unwrap(),
+            "{torn".to_string(),
+        ]
+        .join("\n");
+        let decoded = decode_json_note_archive(&records, &pool);
+        assert_eq!(decoded.len(), 1);
+        let note = &decoded[0].batch.abi_notes[0];
+        assert_eq!(note.cmx_position, Some(12));
+        assert!(note.is_confirmed);
+        assert_eq!(note.shield_amount_sats, Some(500));
+        assert_eq!(decoded[0].pool_address.as_deref(), Some(pool.as_str()));
+    }
+
+    async fn clear_pg_rebuild_test_pool(pool: &sqlx::PgPool, pool_address: &str) {
+        for statement in [
+            "DELETE FROM notes_rebuild WHERE pool_address=$1",
+            "DELETE FROM notes WHERE pool_address=$1",
+            "DELETE FROM cmx_leaves WHERE pool_address=$1",
+            "DELETE FROM pending_tx WHERE pool_address=$1",
+            "DELETE FROM frozen_updates WHERE pool_address=$1",
+            "DELETE FROM shield_pool_stats WHERE pool_address=$1",
+            "DELETE FROM indexer_meta WHERE pool_address=$1",
+        ] {
+            sqlx::query(statement)
+                .bind(pool_address)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pg_canonical_note_rebuild_swaps_full_history_when_database_is_configured() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let pool_address = format!("0x{}", "ee".repeat(20));
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
+
+        // Seed one stale Voted/reorg note in the canonical table.
+        pg_apply_note_mutations(
+            &pool,
+            &pool_address,
+            None,
+            &[NoteArchiveMutation::Upsert(sample_note_envelope(0xaa, 1))],
+        )
+        .await
+        .unwrap();
+
+        let generation = "integration-generation";
+        pg_begin_canonical_rebuild(&pool, &pool_address, generation)
+            .await
+            .unwrap();
+        pg_apply_note_mutations(
+            &pool,
+            &pool_address,
+            Some(generation),
+            &[
+                NoteArchiveMutation::Upsert(sample_note_envelope(0xbb, 2)),
+                NoteArchiveMutation::Confirm {
+                    cmx: [0xbb; 32],
+                    position: 0,
+                },
+                NoteArchiveMutation::ShieldAmount {
+                    cmx: [0xbb; 32],
+                    amount: 77,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Intentionally leave the finite in-memory ring empty: activation must
+        // source full history from staging, not CheckpointSnapshot::batches.
+        let snap = CheckpointSnapshot {
+            next_block: 102,
+            last_finalized_block: Some(101),
+            last_finalized_block_hash: Some(format!("0x{}", "cc".repeat(32))),
+            cmx_ordered: vec![[0xbb; 32]],
+            latest_seq: 2,
+            ..CheckpointSnapshot::default()
+        };
+        pg_finish_canonical_rebuild(&pool, &pool_address, generation, &snap)
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, Option<i64>, bool, Option<i64>)> = sqlx::query_as(
+            "SELECT cmx_hex, position, is_confirmed, shield_amount_sats \
+             FROM notes WHERE pool_address=$1",
+        )
+        .bind(&pool_address)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(hex::encode([0xbb; 32]), Some(0), true, Some(77))]
+        );
+        let staged: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM notes_rebuild WHERE pool_address=$1",
+        )
+        .bind(&pool_address)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(staged, 0);
+        let cursor: (i64, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT next_block, last_finalized_block, last_finalized_block_hash \
+             FROM indexer_meta WHERE pool_address=$1",
+        )
+        .bind(&pool_address)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cursor.0, 102);
+        assert_eq!(cursor.1, Some(101));
+        assert_eq!(cursor.2, snap.last_finalized_block_hash);
+
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
     }
 
     #[test]
