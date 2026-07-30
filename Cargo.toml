@@ -10,7 +10,7 @@ name = "privacy-indexer"
 path = "src/main.rs"
 
 [dependencies]
-privacy-core = "0.1.6"
+privacy-core = { git = "https://github.com/PLabs4/privacy-core.git", rev = "30e2411c24c332e0633cf433456e25a51bd4b881" }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
