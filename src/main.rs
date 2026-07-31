@@ -63,7 +63,7 @@ use privacy_core::ethereum::{
     PrivacyCallArgs,
     RootUpdateArgs,
 };
-use privacy_core::types::{OrchardIndexBatch, OrchardIndexedAbiNote, OrchardStoredBundle};
+use privacy_core::types::{OrchardIndexBatch, OrchardIndexedAbiNote};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
@@ -144,13 +144,6 @@ struct Cli {
     /// --pools-registry). The first pool added (CLI or runtime) becomes primary.
     #[arg(long)]
     contract_address: Vec<String>,
-    /// `PrivacyBTC.sol` compatible logs: `NoteAdded`, `ShieldCompleted`, `NoteConfirmed`
-    /// (topic0 OR filter). Default: on.
-    #[arg(long, default_value_t = true)]
-    privacybtc_abi_logs: bool,
-    /// Legacy_TOPIC0: log `data` = single ABI `bytes` UTF-8 JSON [`OrchardStoredBundle`].
-    #[arg(long)]
-    legacy_bundle_topic0: Option<String>,
     #[arg(
         long,
         env = "PRIVACYBTC_INDEXER_BIND",
@@ -159,9 +152,6 @@ struct Cli {
     bind: String,
     #[arg(long, default_value_t = 512)]
     max_batches_in_memory: usize,
-    /// Number of blocks before a pending note expires (default ≈ 200 blocks).
-    #[arg(long, default_value_t = 200)]
-    pending_timeout_blocks: u64,
     /// Path to a JSON file for persisting the last scanned block height.
     /// If the file exists on startup, `next_block` is restored from it (never
     /// going below --start-block). Updated after every successful scan chunk.
@@ -170,8 +160,8 @@ struct Cli {
     /// First block to scan when no checkpoint exists; resume never goes below this.
     #[arg(long, env = "PRIVACYBTC_START_BLOCK", default_value_t = 0)]
     start_block: u64,
-    /// Hex-encoded secp256k1 private key for the indexer's signing account.
-    /// Required to relay Phase 2 confirmations on-chain and for the --crank task.
+    /// Hex-encoded secp256k1 private key for the indexer's crank signing account.
+    /// Required when --crank is enabled.
     #[arg(long, env = "PRIVACYBTC_INDEXER_SIGNER_KEY")]
     signer_key: Option<String>,
     /// Run the permissionless `updateRoot` crank: watch every pool's pending cmx
@@ -251,7 +241,7 @@ struct Cli {
     /// This is release-bound and therefore intentionally has no default.
     #[arg(long, env = "PRIVACYBTC_INDEXER_EXPECTED_VERIFIER_SET_ID")]
     expected_verifier_set_id: String,
-    /// Gas price in wei for confirmation and crank transactions. Default: 1 Gwei.
+    /// Gas price in wei for crank transactions. Default: 1 Gwei.
     /// Networks with a higher minimum gas price must set this explicitly.
     #[arg(
         long,
@@ -259,9 +249,6 @@ struct Cli {
         default_value_t = 1_000_000_000u64
     )]
     gas_price: u64,
-    /// Gas limit for confirmReceipt transactions. Default: 100_000.
-    #[arg(long, default_value_t = 100_000u64)]
-    gas_limit_confirm: u64,
     /// Override `NoteConfirmed(bytes32,bytes32)` topic0 (default: canonical hash).
     #[arg(long)]
     confirm_topic0: Option<String>,
@@ -361,15 +348,6 @@ fn parse_bool_flag(s: &str) -> Result<bool, String> {
 
 // ─── Domain types ────────────────────────────────────────────────────────────
 
-/// Tracks a note submitted in Phase 1 but not yet confirmed by the receiver.
-#[derive(Debug, Clone)]
-struct PendingNote {
-    /// keccak256(sharedSecret) submitted by the sender.
-    ack_hash: [u8; 32],
-    /// Ethereum block number when the note was submitted (Phase 1).
-    submitted_block: u64,
-}
-
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct ShieldAccounting {
     total_shielded_units: u128,
@@ -440,8 +418,6 @@ struct SharedState {
     /// Kept in sync with every `tree.append` call; serialised into the checkpoint
     /// so the tree can be rebuilt from scratch on restart without re-scanning.
     cmx_ordered: Vec<[u8; 32]>,
-    /// cmx → pending note info (Phase 1 submitted, Phase 2 not yet confirmed).
-    pending_notes: HashMap<[u8; 32], PendingNote>,
     /// Confirmed cmx set (Phase 2 complete).
     confirmed_cmx: HashSet<[u8; 32]>,
     /// Batch-update watermark: number of leaves folded into the on-chain
@@ -453,7 +429,6 @@ struct SharedState {
     /// Latest confirmed Orchard commitment tree root.
     /// Updated only when a NoteConfirmed event is processed (Phase 2).
     active_root: Option<[u8; 32]>,
-    pending_timeout_blocks: u64,
     /// Tx hashes submitted by the relayer but whose events haven't been received
     /// via WebSocket yet. On WS reconnect, these are recovered via receipt lookup.
     pending_tx_hashes: VecDeque<String>,
@@ -473,11 +448,10 @@ struct SignerConfig {
     address: [u8; 20],
     chain_id: u64,
     gas_price: u64,
-    gas_limit: u64,
 }
 
 impl SignerConfig {
-    fn from_hex_key(hex_key: &str, chain_id: u64, gas_price: u64, gas_limit: u64) -> Result<Self> {
+    fn from_hex_key(hex_key: &str, chain_id: u64, gas_price: u64) -> Result<Self> {
         let key_bytes = hex::decode(strip_0x(hex_key)).context("invalid signer key hex")?;
         let signing_key =
             SigningKey::from_slice(&key_bytes).map_err(|e| anyhow!("invalid signing key: {e}"))?;
@@ -487,7 +461,6 @@ impl SignerConfig {
             address,
             chain_id,
             gas_price,
-            gas_limit,
         })
     }
 }
@@ -497,8 +470,6 @@ impl SignerConfig {
 #[derive(Clone)]
 struct AppContext {
     state: Arc<RwLock<SharedState>>,
-    signer: Option<Arc<SignerConfig>>,
-    rpc: RpcClient,
     contract_address: String,
     persist: Persist,
     batch_tx: broadcast::Sender<BatchEnvelope>,
@@ -515,16 +486,12 @@ struct AppContext {
 struct PoolBuilder {
     rpc: RpcClient,
     wss_url: String,
-    signer: Option<Arc<SignerConfig>>,
     pg_pool: Option<sqlx::PgPool>,
     state_file_base: Option<String>,
     /// When true, derive a unique JSON state file per pool from `state_file_base`.
     /// Always true once multiple pools exist or a runtime registry is enabled.
     derive_state_file: bool,
     max_batches: usize,
-    pending_timeout_blocks: u64,
-    privacybtc_abi_logs: bool,
-    legacy_bundle_topic0: Option<String>,
     note_confirmed_topic0: String,
 }
 
@@ -548,14 +515,8 @@ impl PoolBuilder {
     }
 
     /// Build the pool context, rebuild its Poseidon tree from the checkpoint, and
-    /// spawn the WS event loop. `attach_signer` wires the on-chain confirm signer
-    /// (only the primary pool gets it, matching prior single-signer behaviour).
-    async fn build(
-        &self,
-        contract_address: &str,
-        start_block: u64,
-        attach_signer: bool,
-    ) -> AppContext {
+    /// spawn the WS event loop.
+    async fn build(&self, contract_address: &str, start_block: u64) -> AppContext {
         let backend = match &self.pg_pool {
             Some(p) => StateBackend::Pgsql(p.clone()),
             None => StateBackend::Json(self.state_file_for(contract_address)),
@@ -592,13 +553,11 @@ impl PoolBuilder {
             }
         }
         if !ck.cmx_ordered.is_empty() {
-            let restored_checkpoint = ck.next_block.saturating_sub(1);
-            restored_tree.checkpoint(restored_checkpoint);
             println!(
-                "[indexer][{}] rebuilt tree with {} leaves, checkpoint at block {}",
+                "[indexer][{}] rebuilt tree with {} leaves through block {}",
                 &contract_address[..10.min(contract_address.len())],
                 ck.cmx_ordered.len(),
-                restored_checkpoint
+                ck.next_block.saturating_sub(1)
             );
         }
 
@@ -621,11 +580,9 @@ impl PoolBuilder {
             tree: restored_tree,
             cmx_to_position: restored_cmx_to_pos,
             cmx_ordered: ck.cmx_ordered,
-            pending_notes: HashMap::new(),
             confirmed_cmx: HashSet::new(),
             confirmed_count: 0, // rebuilt by the startup backfill event replay
             active_root: ck.active_root,
-            pending_timeout_blocks: self.pending_timeout_blocks,
             pending_tx_hashes: ck.pending_tx_hashes,
             bundle_out_cache: HashMap::new(),
             frozen_updates: ck.frozen_updates,
@@ -638,8 +595,6 @@ impl PoolBuilder {
             rpc: self.rpc.clone(),
             wss_url: self.wss_url.clone(),
             contract_address: contract_address.to_string(),
-            privacybtc_abi_logs: self.privacybtc_abi_logs,
-            legacy_bundle_topic0: self.legacy_bundle_topic0.clone(),
             note_confirmed_topic0: self.note_confirmed_topic0.clone(),
             shared: Arc::clone(&shared),
             persist: persist.clone(),
@@ -662,12 +617,6 @@ impl PoolBuilder {
 
         AppContext {
             state: shared,
-            signer: if attach_signer {
-                self.signer.clone()
-            } else {
-                None
-            },
-            rpc: self.rpc.clone(),
             contract_address: contract_address.to_string(),
             persist,
             batch_tx,
@@ -710,7 +659,7 @@ struct PoolRegistry {
     admin_token: Option<Arc<str>>,
     /// Separate token used only by the relayer to wake receipt recovery.
     relayer_token: Option<Arc<str>>,
-    /// Bounds expensive registration/confirmation RPC work.
+    /// Bounds expensive runtime registration RPC work.
     write_semaphore: Arc<Semaphore>,
 }
 
@@ -983,12 +932,7 @@ impl PoolRegistry {
                 self.max_pools
             ));
         }
-        // The first pool ever added becomes primary and owns the confirm signer.
-        let attach_signer = self.primary.read().await.is_none();
-        let ctx = self
-            .builder
-            .build(&address, start_block, attach_signer)
-            .await;
+        let ctx = self.builder.build(&address, start_block).await;
         {
             let mut map = self.pools.write().await;
             // Re-check under the write lock to avoid a concurrent double-insert.
@@ -1374,28 +1318,8 @@ struct BatchesQuery {
 struct MerklePathQuery {
     /// cmx in hex (with or without 0x prefix).
     cmx: String,
-    /// Commitment tree checkpoint (Ethereum block number).
-    /// Defaults to the latest checkpoint if omitted.
-    checkpoint: Option<u64>,
     /// Contract address of the pool to query. Omit to use the primary pool.
     pool: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ConfirmRequest {
-    /// cmx hex (with or without 0x prefix).
-    cmx_hex: String,
-    /// sharedSecret (KA^Orchard ECDH output) hex — the ack_hash preimage.
-    ack_preimage_hex: String,
-    /// New Orchard commitment tree root hex, computed by the client after
-    /// the indexer appended this cmx.
-    new_root_hex: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ConfirmResponse {
-    /// Submitted Ethereum transaction hash (0x-prefixed hex).
-    tx_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1406,7 +1330,6 @@ struct StatusResponse {
     last_finalized_block_hash: Option<String>,
     latest_seq: u64,
     cached_batches: usize,
-    pending_notes: usize,
     confirmed_notes: usize,
     /// Confirmed root (LE hex) at the batch-update watermark. This is what /root returns.
     active_root_hex: Option<String>,
@@ -1463,20 +1386,12 @@ async fn main() -> Result<()> {
 
     let signer = match &cli.signer_key {
         Some(key) => {
-            let cfg = SignerConfig::from_hex_key(
-                key,
-                cli.chain_id,
-                cli.gas_price,
-                cli.gas_limit_confirm,
-            )?;
+            let cfg = SignerConfig::from_hex_key(key, cli.chain_id, cli.gas_price)?;
             let addr_hex = hex::encode(cfg.address);
             println!("indexer signer account: 0x{addr_hex}");
             Some(Arc::new(cfg))
         }
-        None => {
-            println!("no --signer-key provided; /confirm will validate but not relay on-chain");
-            None
-        }
+        None => None,
     };
 
     let rpc = RpcClient::new(cli.rpc_url.clone());
@@ -1518,14 +1433,10 @@ async fn main() -> Result<()> {
     let builder = Arc::new(PoolBuilder {
         rpc: rpc.clone(),
         wss_url,
-        signer: signer.clone(),
         pg_pool: pg_pool.clone(),
         state_file_base: cli.state_file.clone(),
         derive_state_file,
         max_batches: cli.max_batches_in_memory,
-        pending_timeout_blocks: cli.pending_timeout_blocks,
-        privacybtc_abi_logs: cli.privacybtc_abi_logs,
-        legacy_bundle_topic0: cli.legacy_bundle_topic0.as_deref().map(normalize_hex_0x),
         note_confirmed_topic0: note_confirmed.clone(),
     });
 
@@ -1601,7 +1512,7 @@ async fn main() -> Result<()> {
     };
     registry.validate_trust_roots().await?;
 
-    // 1) CLI pools (the first one becomes primary and owns the confirm signer).
+    // 1) CLI pools (the first one becomes the default query target).
     for raw_addr in &cli.contract_address {
         if let Err(e) = registry
             .add_admitted_pool(raw_addr, cli.start_block, false)
@@ -1695,7 +1606,6 @@ async fn main() -> Result<()> {
         .route("/txs", get(get_txs))
         .route("/swap", get(get_swap))
         .route("/swap/leg", get(get_swap_leg))
-        .route("/confirm", post(post_confirm))
         .route("/notify_tx", post(post_notify_tx))
         .route("/pools", get(list_pools).post(register_pool))
         .route("/pool_meta", get(get_pool_meta))
@@ -2652,7 +2562,6 @@ async fn status(
         last_finalized_block_hash: s.last_finalized_block_hash.clone(),
         latest_seq: s.latest_seq,
         cached_batches: s.batches.len(),
-        pending_notes: s.pending_notes.len(),
         confirmed_notes: s.confirmed_cmx.len(),
         active_root_hex: http_root_hex(&s),
         local_tree_root_hex,
@@ -3579,9 +3488,6 @@ async fn get_merkle_path(
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let cmx = parse_hex32(&q.cmx)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx hex".to_owned()))?;
-    // Legacy param: witnesses are now always at the confirmed watermark.
-    let _ = q.checkpoint;
-
     let s = ctx.state.read().await;
     if s.tree_out_of_order {
         return Err((
@@ -3848,94 +3754,6 @@ async fn get_frozen_updates(
         .or_else(|| q.since.clone())
         .unwrap_or_default();
     Ok(Json(FrozenUpdatesResponse { updates, cursor }))
-}
-
-async fn post_confirm(
-    State(reg): State<PoolRegistry>,
-    headers: HeaderMap,
-    Query(q): Query<SimplePoolQuery>,
-    Json(req): Json<ConfirmRequest>,
-) -> Result<Json<ConfirmResponse>, (StatusCode, String)> {
-    require_admin(&headers, reg.admin_token.as_ref())?;
-    let _permit = reg
-        .write_semaphore
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                "indexer write capacity is busy; retry later".to_owned(),
-            )
-        })?;
-    let ctx = reg.resolve(q.pool.as_deref()).await?;
-    let cmx = parse_hex32(&req.cmx_hex)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx_hex".to_owned()))?;
-    let ack_preimage = parse_hex32(&req.ack_preimage_hex).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "invalid ack_preimage_hex".to_owned(),
-        )
-    })?;
-    let new_root = parse_hex32(&req.new_root_hex)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid new_root_hex".to_owned()))?;
-
-    // Verify preimage against stored ack_hash.
-    {
-        let s = ctx.state.read().await;
-        let pending = s
-            .pending_notes
-            .get(&cmx)
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "cmx not pending".to_owned()))?;
-
-        let computed_hash: [u8; 32] = Keccak256::digest(ack_preimage).into();
-        if computed_hash != pending.ack_hash {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "ack_preimage does not match ack_hash".to_owned(),
-            ));
-        }
-    }
-
-    // A signer is required to relay on-chain.  Without one the endpoint is not
-    // operational — returning a fake tx_hash and advancing local state would
-    // leave the indexer out of sync with the chain.
-    let signer = ctx.signer.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "indexer has no --signer-key configured; cannot relay confirmReceipt on-chain"
-                .to_owned(),
-        )
-    })?;
-
-    let nonce = ctx
-        .rpc
-        .get_transaction_count(&format!("0x{}", hex::encode(signer.address)))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let calldata = encode_confirm_receipt_calldata(&cmx, &ack_preimage, &new_root);
-    let raw_tx = build_and_sign_raw_tx(
-        nonce,
-        signer.gas_price,
-        signer.gas_limit,
-        &ctx.contract_address,
-        0u64,
-        &calldata,
-        signer.chain_id,
-        &signer.signing_key,
-    )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let tx_hash = ctx
-        .rpc
-        .send_raw_transaction(&raw_tx)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Local state is updated by the poll loop when it observes the NoteConfirmed
-    // event on-chain — do NOT update it here to avoid diverging from chain state.
-
-    Ok(Json(ConfirmResponse { tx_hash }))
 }
 
 // ─── POST /notify_tx ─────────────────────────────────────────────────────────
@@ -5173,8 +4991,6 @@ struct PollContext {
     /// WebSocket URL derived from rpc_url (https→wss, http→ws).
     wss_url: String,
     contract_address: String,
-    privacybtc_abi_logs: bool,
-    legacy_bundle_topic0: Option<String>,
     note_confirmed_topic0: String,
     shared: Arc<RwLock<SharedState>>,
     /// Coalescing persistence handle (JSON file or PostgreSQL).
@@ -5374,7 +5190,6 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
         state.last_leaf_key = None;
         state.batches.clear();
         state.latest_seq = 0;
-        state.pending_notes.clear();
         state.confirmed_cmx.clear();
         state.confirmed_count = 0;
         state.active_root = None;
@@ -5423,7 +5238,6 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
         s.last_leaf_key = None;
         s.batches.clear();
         s.latest_seq = 0;
-        s.pending_notes.clear();
         s.confirmed_cmx.clear();
         s.confirmed_count = 0;
         s.active_root = None;
@@ -6014,21 +5828,16 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
     );
 
     // Build topic0 OR list for subscription filter.
-    let mut topics: Vec<String> = Vec::new();
-    if ctx.privacybtc_abi_logs {
-        for t in note_added_topic0_alternatives() {
-            topics.push(norm_topic(&t));
-        }
-        topics.push(norm_topic(&shield_completed_topic0_hex()));
-        topics.push(norm_topic(&ctx.note_confirmed_topic0));
-        topics.push(norm_topic(&root_updated_topic0_hex()));
-        topics.push(norm_topic(&frozen_root_updated_topic0()));
-        topics.push(norm_topic(&shielded_topic0_hex()));
-        topics.push(norm_topic(&unshielded_topic0_hex()));
-    }
-    if let Some(ref leg) = ctx.legacy_bundle_topic0 {
-        topics.push(norm_topic(leg));
-    }
+    let mut topics: Vec<String> = note_added_topic0_alternatives()
+        .iter()
+        .map(|topic| norm_topic(topic))
+        .collect();
+    topics.push(norm_topic(&shield_completed_topic0_hex()));
+    topics.push(norm_topic(&ctx.note_confirmed_topic0));
+    topics.push(norm_topic(&root_updated_topic0_hex()));
+    topics.push(norm_topic(&frozen_root_updated_topic0()));
+    topics.push(norm_topic(&shielded_topic0_hex()));
+    topics.push(norm_topic(&unshielded_topic0_hex()));
 
     let sub_req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -6305,7 +6114,6 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         let (cmx, new_root, position) =
             decode_note_confirmed_log(log.topics.as_deref().unwrap_or(&[]), &log.data)
                 .map_err(|e| anyhow!("NoteConfirmed decode failed: {e}"))?;
-        state.pending_notes.remove(&cmx);
         state.confirmed_cmx.insert(cmx);
         state.active_root = Some(new_root);
         state.confirmed_count = state.confirmed_count.max(position.saturating_add(1));
@@ -6322,8 +6130,6 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 note.cmx_position = Some(position);
                 note
             });
-        state.tree.checkpoint(block_number);
-
         let envelope = maybe_note.map(|note| {
             let seq = state.latest_seq.saturating_add(1);
             state.latest_seq = seq;
@@ -7168,24 +6974,6 @@ impl RpcClient {
 
 // ─── Ethereum raw transaction ─────────────────────────────────────────────────
 
-/// Encodes calldata for `confirmReceipt(bytes32,bytes32,bytes32)`.
-/// Function selector = keccak256("confirmReceipt(bytes32,bytes32,bytes32)")[0:4]
-fn encode_confirm_receipt_calldata(
-    cmx: &[u8; 32],
-    ack_preimage: &[u8; 32],
-    new_root: &[u8; 32],
-) -> Vec<u8> {
-    let selector: [u8; 4] = Keccak256::digest(b"confirmReceipt(bytes32,bytes32,bytes32)")[..4]
-        .try_into()
-        .expect("keccak digest is 32 bytes");
-    let mut calldata = Vec::with_capacity(4 + 32 + 32 + 32);
-    calldata.extend_from_slice(&selector);
-    calldata.extend_from_slice(cmx);
-    calldata.extend_from_slice(ack_preimage);
-    calldata.extend_from_slice(new_root);
-    calldata
-}
-
 /// Builds and signs an EIP-155 legacy raw transaction.
 fn build_and_sign_raw_tx(
     nonce: u64,
@@ -7345,23 +7133,6 @@ struct JsonRpcResponse<T> {
     error: Option<JsonRpcError>,
 }
 
-fn decode_orchard_bundle_from_log_data(data_hex: &str) -> Result<OrchardStoredBundle> {
-    let raw = hex::decode(strip_0x(data_hex)).context("log data is not valid hex")?;
-
-    // Preferred format: ABI-encoded single `bytes` parameter containing UTF-8 JSON.
-    if let Ok(tokens) = ethabi::decode(&[ethabi::ParamType::Bytes], &raw) {
-        if let Some(ethabi::Token::Bytes(payload)) = tokens.first() {
-            if let Ok(bundle) = serde_json::from_slice::<OrchardStoredBundle>(payload) {
-                return Ok(bundle);
-            }
-        }
-    }
-
-    // Fallback format: raw UTF-8 JSON bytes directly in log data.
-    serde_json::from_slice::<OrchardStoredBundle>(&raw)
-        .context("log data is neither ABI(bytes-json) nor raw-json for OrchardStoredBundle")
-}
-
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 fn parse_hex_u64(hex_str: &str) -> Result<u64> {
@@ -7462,8 +7233,7 @@ mod tests {
         advance_cursor, beacon_words_match, canonical_guard, classify_selector,
         compact_note_mutations, crank_gas_limit, crank_next_delay_secs,
         decode_frozen_root_updated_log, decode_json_note_archive,
-        decode_orchard_bundle_from_log_data, eip1967_beacon_slot,
-        encode_confirm_receipt_calldata, encode_crank_root_calldata, factory_log_matches,
+        eip1967_beacon_slot, encode_crank_root_calldata, factory_log_matches,
         frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
         normalize_hex_0x, parse_address_set, parse_bytes32_strict, parse_tx_meta,
         perc20_deployed_topic0, pg_apply_note_mutations, pg_begin_canonical_rebuild,
@@ -7559,9 +7329,7 @@ mod tests {
         FrontierTree, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX,
     };
     use privacy_core::ethereum::{update_root_selector, update_roots_selector};
-    use privacy_core::types::{
-        OrchardIndexBatch, OrchardIndexedAbiNote, OrchardStoredBundle,
-    };
+    use privacy_core::types::{OrchardIndexBatch, OrchardIndexedAbiNote};
     use sha3::{Digest, Keccak256};
     use std::sync::Arc;
 
@@ -7791,22 +7559,6 @@ mod tests {
         let mut out = [0u8; 32];
         out.copy_from_slice(&bytes);
         out
-    }
-
-    fn sample_bundle() -> OrchardStoredBundle {
-        OrchardStoredBundle {
-            flags_orchard: 3,
-            value_balance_orchard: 0,
-            anchor_orchard: [0u8; 32],
-            proofs_orchard: vec![1, 2, 3],
-            actions: vec![],
-            binding_sig_orchard: vec![0u8; 64],
-            proof_bn254: None,
-            pub_fields_bn254: None,
-            binding_proof_bn254: None,
-            binding_sig_bn254: None,
-            value_balance_bn254: 0,
-        }
     }
 
     #[test]
@@ -8205,45 +7957,6 @@ mod tests {
             HeaderValue::from_static("Bearer relayer-secret"),
         );
         assert!(require_relayer(&headers, Some(&token)).is_ok());
-    }
-
-    #[test]
-    fn decode_raw_json_log_data() {
-        let bundle = sample_bundle();
-        let raw_json = serde_json::to_vec(&bundle).expect("bundle should serialize");
-        let data_hex = format!("0x{}", hex::encode(raw_json));
-        let decoded =
-            decode_orchard_bundle_from_log_data(&data_hex).expect("raw json bytes should decode");
-        assert_eq!(decoded.flags_orchard, 3);
-    }
-
-    #[test]
-    fn decode_abi_wrapped_json_log_data() {
-        let bundle = sample_bundle();
-        let json = serde_json::to_vec(&bundle).expect("bundle should serialize");
-        let encoded = ethabi::encode(&[ethabi::Token::Bytes(json)]);
-        let data_hex = format!("0x{}", hex::encode(encoded));
-        let decoded =
-            decode_orchard_bundle_from_log_data(&data_hex).expect("abi wrapped json should decode");
-        assert_eq!(decoded.flags_orchard, 3);
-    }
-
-    #[test]
-    fn confirm_receipt_calldata_length_and_selector() {
-        let cmx = [1u8; 32];
-        let preimage = [2u8; 32];
-        let root = [3u8; 32];
-        let cd = encode_confirm_receipt_calldata(&cmx, &preimage, &root);
-        assert_eq!(cd.len(), 4 + 32 + 32 + 32, "calldata should be 100 bytes");
-
-        let expected_selector: [u8; 4] =
-            Keccak256::digest(b"confirmReceipt(bytes32,bytes32,bytes32)")[..4]
-                .try_into()
-                .unwrap();
-        assert_eq!(&cd[..4], &expected_selector, "selector mismatch");
-        assert_eq!(&cd[4..36], &cmx, "cmx not encoded");
-        assert_eq!(&cd[36..68], &preimage, "preimage not encoded");
-        assert_eq!(&cd[68..100], &root, "root not encoded");
     }
 
     #[test]
