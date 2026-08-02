@@ -114,6 +114,9 @@ fn http_root_hex(state: &SharedState) -> Option<String> {
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
+const DEFAULT_MAX_BATCHES_IN_MEMORY: usize = 4_096;
+const MAX_INCREMENTAL_REPLAY_MUTATIONS: usize = 8_192;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "privacybtc-indexer",
@@ -150,7 +153,7 @@ struct Cli {
         default_value = "127.0.0.1:8787"
     )]
     bind: String,
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = DEFAULT_MAX_BATCHES_IN_MEMORY)]
     max_batches_in_memory: usize,
     /// Path to a JSON file for persisting the last scanned block height.
     /// If the file exists on startup, `next_block` is restored from it (never
@@ -472,6 +475,8 @@ struct AppContext {
     state: Arc<RwLock<SharedState>>,
     contract_address: String,
     persist: Persist,
+    /// Shared ordering lock used by chain replay and persistence-relevant HTTP writes.
+    ingest_lock: Arc<tokio::sync::Mutex<()>>,
     batch_tx: broadcast::Sender<BatchEnvelope>,
     /// Triggered by post_notify_tx to wake the event loop for immediate recovery.
     recover_trigger: Arc<tokio::sync::Notify>,
@@ -528,20 +533,25 @@ impl PoolBuilder {
             backend.reset_archive();
         }
         let persist_paused = Arc::new(AtomicBool::new(false));
+        let persist_epoch = Arc::new(AtomicU64::new(0));
         let backend_write_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let (persist_tx, persist_rx) = tokio::sync::watch::channel(std::sync::Arc::new(
-            CheckpointSnapshot::from_checkpoint_data(&ck),
-        ));
+        let (persist_tx, persist_rx) =
+            tokio::sync::watch::channel(std::sync::Arc::new(PersistRequest {
+                epoch: 0,
+                snapshot: CheckpointSnapshot::from_checkpoint_data(&ck),
+            }));
         tokio::spawn(persist_task(
             backend.clone(),
             contract_address.to_string(),
             persist_rx,
             Arc::clone(&persist_paused),
+            Arc::clone(&persist_epoch),
             Arc::clone(&backend_write_lock),
         ));
         let persist = Persist {
             tx: persist_tx,
             paused: Arc::clone(&persist_paused),
+            epoch: persist_epoch,
         };
 
         // Rebuild Poseidon tree from checkpoint.
@@ -591,6 +601,7 @@ impl PoolBuilder {
         let (batch_tx, _) = broadcast::channel::<BatchEnvelope>(256);
         let recover_trigger = Arc::new(tokio::sync::Notify::new());
 
+        let ingest_lock = Arc::new(tokio::sync::Mutex::new(()));
         let poll_ctx = PollContext {
             rpc: self.rpc.clone(),
             wss_url: self.wss_url.clone(),
@@ -601,11 +612,12 @@ impl PoolBuilder {
             batch_tx: batch_tx.clone(),
             recover_trigger: Arc::clone(&recover_trigger),
             start_block,
-            ingest_lock: Arc::new(tokio::sync::Mutex::new(())),
+            ingest_lock: Arc::clone(&ingest_lock),
             backend: backend.clone(),
             backend_write_lock,
             rebuild_generation: Arc::new(RwLock::new(None)),
             rebuild_mutations: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            incremental_replay_mutations: Arc::new(tokio::sync::Mutex::new(None)),
             broadcast_paused: Arc::new(AtomicBool::new(false)),
         };
         let addr_label = contract_address.to_string();
@@ -619,6 +631,7 @@ impl PoolBuilder {
             state: shared,
             contract_address: contract_address.to_string(),
             persist,
+            ingest_lock,
             batch_tx,
             recover_trigger,
             backend,
@@ -3782,6 +3795,7 @@ async fn post_notify_tx(
         ));
     }
     let tx_hash = normalize_hex_0x(&req.tx_hash);
+    let ingest_guard = ctx.ingest_lock.lock().await;
     let mut s = ctx.state.write().await;
     if !s.pending_tx_hashes.iter().any(|h| h == &tx_hash) {
         s.pending_tx_hashes.push_back(tx_hash.clone());
@@ -3796,6 +3810,7 @@ async fn post_notify_tx(
     // Persist immediately so the queue survives a restart.
     ctx.persist.notify(&s);
     drop(s);
+    drop(ingest_guard);
     // Signal the event loop to run immediate HTTP recovery — don't rely solely on
     // the next WS reconnect. This ensures all logs from multi-event txs (e.g.
     // NoteAdded × N + NoteConfirmed × N in complete()) are processed even if the
@@ -4024,6 +4039,20 @@ enum NoteArchiveMutation {
     },
 }
 
+fn push_incremental_replay_mutation(
+    buffered: &mut Vec<NoteArchiveMutation>,
+    mutation: NoteArchiveMutation,
+    limit: usize,
+) -> Result<()> {
+    if buffered.len() >= limit {
+        return Err(anyhow!(
+            "incremental replay mutation limit exceeded: {limit}"
+        ));
+    }
+    buffered.push(mutation);
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
 enum JsonNoteArchiveUpdate {
@@ -4121,6 +4150,26 @@ impl StateBackend {
                     mutations,
                 )
                 .await
+            }
+        }
+    }
+
+    /// Atomically publish one canonical incremental replay in PostgreSQL.
+    /// JSON mode preserves the same ordering but cannot provide a cross-file transaction.
+    async fn commit_incremental_replay(
+        &self,
+        pool_address: &str,
+        mutations: &[NoteArchiveMutation],
+        snap: &CheckpointSnapshot,
+    ) -> Result<()> {
+        match self {
+            StateBackend::Pgsql(pool) => {
+                pg_commit_incremental_replay(pool, pool_address, mutations, snap).await
+            }
+            StateBackend::Json(_) => {
+                self.apply_note_mutations(pool_address, None, mutations)
+                    .await?;
+                self.save(pool_address, snap).await
             }
         }
     }
@@ -4389,47 +4438,93 @@ fn empty_checkpoint(start_block: u64) -> CheckpointData {
 /// call sites stay synchronous (no await while holding a lock).
 #[derive(Clone)]
 struct Persist {
-    tx: tokio::sync::watch::Sender<std::sync::Arc<CheckpointSnapshot>>,
+    tx: tokio::sync::watch::Sender<std::sync::Arc<PersistRequest>>,
     paused: Arc<AtomicBool>,
+    /// Invalidates snapshots queued before a staged rebuild or incremental replay.
+    epoch: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct PersistRequest {
+    epoch: u64,
+    snapshot: CheckpointSnapshot,
 }
 
 impl Persist {
+    fn is_paused(&self) -> bool {
+        self.paused.load(AtomicOrdering::Acquire)
+    }
+
     fn notify(&self, s: &SharedState) {
-        if self.paused.load(AtomicOrdering::Acquire) {
+        if self.is_paused() {
+            return;
+        }
+        let epoch = self.epoch.load(AtomicOrdering::Acquire);
+        let snapshot = CheckpointSnapshot::from_state(s);
+        if self.is_paused() || epoch != self.epoch.load(AtomicOrdering::Acquire) {
             return;
         }
         let _ = self
             .tx
-            .send(std::sync::Arc::new(CheckpointSnapshot::from_state(s)));
+            .send(std::sync::Arc::new(PersistRequest { epoch, snapshot }));
     }
     /// Persist an already-built snapshot (for sites that dropped the lock first).
     fn notify_owned(&self, snap: CheckpointSnapshot) {
-        if self.paused.load(AtomicOrdering::Acquire) {
+        if self.is_paused() {
             return;
         }
-        let _ = self.tx.send(std::sync::Arc::new(snap));
+        let epoch = self.epoch.load(AtomicOrdering::Acquire);
+        if self.is_paused() || epoch != self.epoch.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        let _ = self.tx.send(std::sync::Arc::new(PersistRequest {
+            epoch,
+            snapshot: snap,
+        }));
     }
+
+    fn pause_and_invalidate_queued(&self) {
+        self.paused.store(true, AtomicOrdering::Release);
+        self.epoch.fetch_add(1, AtomicOrdering::AcqRel);
+    }
+
+    fn resume(&self) {
+        self.paused.store(false, AtomicOrdering::Release);
+    }
+}
+
+fn persist_request_is_current(paused: bool, current_epoch: u64, request_epoch: u64) -> bool {
+    !paused && current_epoch == request_epoch
 }
 
 /// Background task: drains the latest snapshot and persists it (JSON or PG).
 async fn persist_task(
     backend: StateBackend,
     pool_address: String,
-    mut rx: tokio::sync::watch::Receiver<std::sync::Arc<CheckpointSnapshot>>,
+    mut rx: tokio::sync::watch::Receiver<std::sync::Arc<PersistRequest>>,
     paused: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
     backend_write_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     let short = pool_address[..10.min(pool_address.len())].to_string();
     while rx.changed().await.is_ok() {
-        let snap = rx.borrow_and_update().clone();
-        if paused.load(AtomicOrdering::Acquire) {
+        let request = rx.borrow_and_update().clone();
+        if !persist_request_is_current(
+            paused.load(AtomicOrdering::Acquire),
+            epoch.load(AtomicOrdering::Acquire),
+            request.epoch,
+        ) {
             continue;
         }
         let _write_guard = backend_write_lock.lock().await;
-        if paused.load(AtomicOrdering::Acquire) {
+        if !persist_request_is_current(
+            paused.load(AtomicOrdering::Acquire),
+            epoch.load(AtomicOrdering::Acquire),
+            request.epoch,
+        ) {
             continue;
         }
-        if let Err(e) = backend.save(&pool_address, &snap).await {
+        if let Err(e) = backend.save(&pool_address, &request.snapshot).await {
             eprintln!("[indexer][{short}] persist failed: {e:#}");
         }
     }
@@ -4554,21 +4649,13 @@ async fn pg_bulk_upsert_notes(
     Ok(())
 }
 
-async fn pg_apply_note_mutations(
-    pool: &sqlx::PgPool,
+async fn pg_apply_compacted_note_mutations_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     pool_address: &str,
     rebuild_generation: Option<&str>,
-    mutations: &[NoteArchiveMutation],
+    compacted: &CompactedNoteMutations,
 ) -> Result<()> {
-    let compacted = compact_note_mutations(mutations);
-    let mut tx = pool.begin().await.context("begin note archive transaction")?;
-    pg_bulk_upsert_notes(
-        &mut tx,
-        pool_address,
-        rebuild_generation,
-        &compacted.upserts,
-    )
-    .await?;
+    pg_bulk_upsert_notes(tx, pool_address, rebuild_generation, &compacted.upserts).await?;
 
     if !compacted.confirmations.is_empty() {
         let cmx_values: Vec<String> = compacted
@@ -4592,7 +4679,7 @@ async fn pg_apply_note_mutations(
             .bind(generation)
             .bind(&cmx_values)
             .bind(&positions)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?
             .rows_affected()
         } else {
@@ -4605,7 +4692,7 @@ async fn pg_apply_note_mutations(
             .bind(pool_address)
             .bind(&cmx_values)
             .bind(&positions)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?
             .rows_affected()
         };
@@ -4639,7 +4726,7 @@ async fn pg_apply_note_mutations(
             .bind(generation)
             .bind(&cmx_values)
             .bind(&amounts)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?
             .rows_affected()
         } else {
@@ -4652,7 +4739,7 @@ async fn pg_apply_note_mutations(
             .bind(pool_address)
             .bind(&cmx_values)
             .bind(&amounts)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?
             .rows_affected()
         };
@@ -4663,6 +4750,22 @@ async fn pg_apply_note_mutations(
             ));
         }
     }
+    Ok(())
+}
+
+async fn pg_apply_note_mutations(
+    pool: &sqlx::PgPool,
+    pool_address: &str,
+    rebuild_generation: Option<&str>,
+    mutations: &[NoteArchiveMutation],
+) -> Result<()> {
+    let compacted = compact_note_mutations(mutations);
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin note archive transaction")?;
+    pg_apply_compacted_note_mutations_tx(&mut tx, pool_address, rebuild_generation, &compacted)
+        .await?;
     tx.commit().await.context("commit note archive transaction")
 }
 
@@ -4682,10 +4785,61 @@ async fn pg_begin_canonical_rebuild(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum SnapshotSaveMode {
+    ReplaceDerivedState,
+    AppendOnly,
+}
+
+async fn pg_existing_cmx_prefix_len(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pool_address: &str,
+    snap: &CheckpointSnapshot,
+) -> Result<usize> {
+    let (count, max_position): (i64, Option<i64>) =
+        sqlx::query_as("SELECT count(*), max(position) FROM cmx_leaves WHERE pool_address=$1")
+            .bind(pool_address)
+            .fetch_one(&mut **tx)
+            .await
+            .context("inspect persisted cmx prefix")?;
+    let count = usize::try_from(count).context("negative persisted cmx count")?;
+    let expected_max = count.checked_sub(1).map(|position| position as i64);
+    if max_position != expected_max {
+        return Err(anyhow!(
+            "persisted cmx positions are not contiguous: count={count}, max={max_position:?}"
+        ));
+    }
+    if count > snap.cmx_ordered.len() {
+        return Err(anyhow!(
+            "append-only cmx checkpoint would shrink persisted state: persisted={count}, snapshot={}",
+            snap.cmx_ordered.len()
+        ));
+    }
+    if count > 0 {
+        let last_hex: String = sqlx::query_scalar(
+            "SELECT cmx_hex FROM cmx_leaves WHERE pool_address=$1 AND position=$2",
+        )
+        .bind(pool_address)
+        .bind((count - 1) as i64)
+        .fetch_one(&mut **tx)
+        .await
+        .context("load persisted cmx prefix boundary")?;
+        let expected = hex::encode(snap.cmx_ordered[count - 1]);
+        if !last_hex.eq_ignore_ascii_case(&expected) {
+            return Err(anyhow!(
+                "append-only cmx checkpoint prefix mismatch at position {}",
+                count - 1
+            ));
+        }
+    }
+    Ok(count)
+}
+
 async fn pg_save_snapshot_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     pool_address: &str,
     snap: &CheckpointSnapshot,
+    mode: SnapshotSaveMode,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO indexer_meta \
@@ -4705,19 +4859,25 @@ async fn pg_save_snapshot_tx(
     .await
     .context("upsert indexer_meta")?;
 
-    sqlx::query("DELETE FROM cmx_leaves WHERE pool_address=$1")
-        .bind(pool_address)
-        .execute(&mut **tx)
-        .await
-        .context("replace cmx_leaves")?;
+    let cmx_start = match mode {
+        SnapshotSaveMode::ReplaceDerivedState => {
+            sqlx::query("DELETE FROM cmx_leaves WHERE pool_address=$1")
+                .bind(pool_address)
+                .execute(&mut **tx)
+                .await
+                .context("replace cmx_leaves")?;
+            0
+        }
+        SnapshotSaveMode::AppendOnly => pg_existing_cmx_prefix_len(tx, pool_address, snap).await?,
+    };
     sqlx::query("DELETE FROM frozen_updates WHERE pool_address=$1")
         .bind(pool_address)
         .execute(&mut **tx)
         .await
         .context("replace frozen_updates")?;
 
-    for (chunk_number, chunk) in snap.cmx_ordered.chunks(1_000).enumerate() {
-        let base = chunk_number * 1_000;
+    for (chunk_number, chunk) in snap.cmx_ordered[cmx_start..].chunks(1_000).enumerate() {
+        let base = cmx_start + chunk_number * 1_000;
         let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
             "INSERT INTO cmx_leaves (pool_address, position, cmx_hex) ",
         );
@@ -4841,7 +5001,13 @@ async fn pg_finish_canonical_rebuild(
         ));
     }
 
-    pg_save_snapshot_tx(&mut tx, pool_address, snap).await?;
+    pg_save_snapshot_tx(
+        &mut tx,
+        pool_address,
+        snap,
+        SnapshotSaveMode::ReplaceDerivedState,
+    )
+    .await?;
     sqlx::query("DELETE FROM notes_rebuild WHERE pool_address=$1")
         .bind(pool_address)
         .execute(&mut *tx)
@@ -4854,8 +5020,26 @@ async fn pg_finish_canonical_rebuild(
 
 async fn pg_save(pool: &sqlx::PgPool, pool_address: &str, snap: &CheckpointSnapshot) -> Result<()> {
     let mut tx = pool.begin().await.context("pg begin")?;
-    pg_save_snapshot_tx(&mut tx, pool_address, snap).await?;
+    pg_save_snapshot_tx(&mut tx, pool_address, snap, SnapshotSaveMode::AppendOnly).await?;
     tx.commit().await.context("pg commit")
+}
+
+async fn pg_commit_incremental_replay(
+    pool: &sqlx::PgPool,
+    pool_address: &str,
+    mutations: &[NoteArchiveMutation],
+    snap: &CheckpointSnapshot,
+) -> Result<()> {
+    let compacted = compact_note_mutations(mutations);
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin incremental replay transaction")?;
+    pg_apply_compacted_note_mutations_tx(&mut tx, pool_address, None, &compacted).await?;
+    pg_save_snapshot_tx(&mut tx, pool_address, snap, SnapshotSaveMode::AppendOnly).await?;
+    tx.commit()
+        .await
+        .context("commit incremental replay transaction")
 }
 
 /// Load scan scalars + tree leaves + pending txs from PG. Batches are intentionally left
@@ -5021,6 +5205,9 @@ struct PollContext {
     /// Per-getLogs-window note mutations. This bounds rebuild memory while
     /// avoiding a PostgreSQL round-trip for every historical event.
     rebuild_mutations: Arc<tokio::sync::Mutex<Vec<NoteArchiveMutation>>>,
+    /// Ordinary catch-up/WS replay mutations, committed only after the terminal
+    /// finalized hash check. `None` means there is no active incremental replay.
+    incremental_replay_mutations: Arc<tokio::sync::Mutex<Option<Vec<NoteArchiveMutation>>>>,
     /// Incremental replay buffers SSE publication until its terminal finalized
     /// hash check succeeds, preventing partial/non-canonical history leakage.
     broadcast_paused: Arc<AtomicBool>,
@@ -5028,7 +5215,7 @@ struct PollContext {
 
 impl PollContext {
     async fn begin_canonical_rebuild(&self, generation: &str) -> Result<()> {
-        self.persist.paused.store(true, AtomicOrdering::Release);
+        self.persist.pause_and_invalidate_queued();
         *self.rebuild_generation.write().await = Some(generation.to_string());
         self.rebuild_mutations.lock().await.clear();
         let _write_guard = self.backend_write_lock.lock().await;
@@ -5043,10 +5230,60 @@ impl PollContext {
             self.rebuild_mutations.lock().await.push(mutation);
             return Ok(());
         }
+        {
+            let mut slot = self.incremental_replay_mutations.lock().await;
+            if let Some(buffered) = slot.as_mut() {
+                return push_incremental_replay_mutation(
+                    buffered,
+                    mutation,
+                    MAX_INCREMENTAL_REPLAY_MUTATIONS,
+                );
+            }
+        }
         let _write_guard = self.backend_write_lock.lock().await;
         self.backend
             .apply_note_mutations(&self.contract_address, None, &[mutation])
             .await
+    }
+
+    async fn begin_incremental_replay(&self) -> Result<()> {
+        if self.rebuild_generation.read().await.is_some() {
+            return Err(anyhow!(
+                "incremental replay cannot start during canonical rebuild"
+            ));
+        }
+        if self.persist.paused.load(AtomicOrdering::Acquire) {
+            return Err(anyhow!("checkpoint persistence is already paused"));
+        }
+        let mut slot = self.incremental_replay_mutations.lock().await;
+        if slot.is_some() {
+            return Err(anyhow!("incremental replay is already active"));
+        }
+        *slot = Some(Vec::new());
+        self.persist.pause_and_invalidate_queued();
+        Ok(())
+    }
+
+    async fn finish_incremental_replay(&self, snap: &CheckpointSnapshot) -> Result<usize> {
+        let mutations = self.incremental_replay_mutations.lock().await.take();
+        let Some(mutations) = mutations else {
+            self.persist.resume();
+            return Err(anyhow!("no active incremental replay"));
+        };
+        let mutation_count = mutations.len();
+        let result = {
+            let _write_guard = self.backend_write_lock.lock().await;
+            self.backend
+                .commit_incremental_replay(&self.contract_address, &mutations, snap)
+                .await
+        };
+        self.persist.resume();
+        result.map(|()| mutation_count)
+    }
+
+    async fn abort_incremental_replay(&self) {
+        self.incremental_replay_mutations.lock().await.take();
+        self.persist.resume();
     }
 
     async fn flush_rebuild_note_mutations(&self) -> Result<()> {
@@ -5087,7 +5324,7 @@ impl PollContext {
 
     async fn mark_canonical_rebuild_ready(&self) {
         *self.rebuild_generation.write().await = None;
-        self.persist.paused.store(false, AtomicOrdering::Release);
+        self.persist.resume();
     }
 
     async fn mark_canonical_unready(&self) {
@@ -5377,17 +5614,21 @@ async fn catchup_from_chain(ctx: &PollContext) {
     }
 
     let starting_seq = ctx.shared.read().await.latest_seq;
-    ctx.broadcast_paused
-        .store(true, AtomicOrdering::Release);
+    if let Err(e) = ctx.begin_incremental_replay().await {
+        eprintln!("[indexer][{label}] cannot begin incremental catchup: {e:#}");
+        ctx.mark_canonical_unready().await;
+        return;
+    }
+    ctx.broadcast_paused.store(true, AtomicOrdering::Release);
     let total = match replay_range(ctx, from, head).await {
         Ok(n) => n,
         Err(()) => {
             // A prior window may already have mutated derived state. Never
             // expose that partial pass; the dirty path performs a full staged
             // rebuild on the next tick.
+            ctx.abort_incremental_replay().await;
             ctx.mark_canonical_unready().await;
-            ctx.broadcast_paused
-                .store(false, AtomicOrdering::Release);
+            ctx.broadcast_paused.store(false, AtomicOrdering::Release);
             return;
         }
     };
@@ -5399,16 +5640,16 @@ async fn catchup_from_chain(ctx: &PollContext) {
                 "[indexer][{label}] finalized head hash changed during catchup at block {head}: \
                  before={finalized_hash} after={hash}; cursor not advanced"
             );
+            ctx.abort_incremental_replay().await;
             ctx.mark_canonical_unready().await;
-            ctx.broadcast_paused
-                .store(false, AtomicOrdering::Release);
+            ctx.broadcast_paused.store(false, AtomicOrdering::Release);
             return;
         }
         Err(e) => {
             eprintln!("[indexer][{label}] finalized head recheck failed: {e:#}");
+            ctx.abort_incremental_replay().await;
             ctx.mark_canonical_unready().await;
-            ctx.broadcast_paused
-                .store(false, AtomicOrdering::Release);
+            ctx.broadcast_paused.store(false, AtomicOrdering::Release);
             return;
         }
     };
@@ -5417,15 +5658,24 @@ async fn catchup_from_chain(ctx: &PollContext) {
     s.next_block = advance_cursor(s.next_block, head);
     s.last_finalized_block = Some(head);
     s.last_finalized_block_hash = Some(canonical_hash);
-    ctx.persist.notify(&s);
+    let snap = CheckpointSnapshot::from_state(&s);
     drop(s);
-    ctx.broadcast_paused
-        .store(false, AtomicOrdering::Release);
+    let mutation_count = match ctx.finish_incremental_replay(&snap).await {
+        Ok(count) => count,
+        Err(e) => {
+            eprintln!("[indexer][{label}] incremental catchup commit failed: {e:#}");
+            ctx.mark_canonical_unready().await;
+            ctx.broadcast_paused.store(false, AtomicOrdering::Release);
+            return;
+        }
+    };
+    ctx.broadcast_paused.store(false, AtomicOrdering::Release);
     ctx.broadcast_batches_after(starting_seq).await;
     if total > 0 {
         println!(
-            "[indexer][{label}] catchup: reconciled {total} log(s) up to block {head}, next_block={}",
-            head
+            "[indexer][{label}] catchup: reconciled {total} log(s), committed \
+             {mutation_count} note mutation(s) up to block {head}, next_block={}",
+            head.saturating_add(1)
         );
     }
 }
@@ -5583,12 +5833,14 @@ async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         let cursor = { ctx.shared.read().await.next_block };
         let from = cursor.min(block_number);
         let starting_seq = ctx.shared.read().await.latest_seq;
-        ctx.broadcast_paused
-            .store(true, AtomicOrdering::Release);
+        ctx.begin_incremental_replay()
+            .await
+            .context("begin canonical WS replay")?;
+        ctx.broadcast_paused.store(true, AtomicOrdering::Release);
         if replay_range(ctx, from, block_number).await.is_err() {
+            ctx.abort_incremental_replay().await;
             ctx.mark_canonical_unready().await;
-            ctx.broadcast_paused
-                .store(false, AtomicOrdering::Release);
+            ctx.broadcast_paused.store(false, AtomicOrdering::Release);
             return Err(anyhow!(
                 "canonical replay failed while ingesting WS hint {event_id}"
             ));
@@ -5596,37 +5848,40 @@ async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         match ctx.rpc.block_hash(finalized_head).await {
             Ok(hash) if hash == finalized_hash => {}
             Ok(hash) => {
+                ctx.abort_incremental_replay().await;
                 ctx.mark_canonical_unready().await;
-                ctx.broadcast_paused
-                    .store(false, AtomicOrdering::Release);
+                ctx.broadcast_paused.store(false, AtomicOrdering::Release);
                 return Err(anyhow!(
                     "finalized boundary changed during WS replay: head={finalized_head}, \
                      before={finalized_hash}, after={hash}"
                 ));
             }
             Err(error) => {
+                ctx.abort_incremental_replay().await;
                 ctx.mark_canonical_unready().await;
-                ctx.broadcast_paused
-                    .store(false, AtomicOrdering::Release);
+                ctx.broadcast_paused.store(false, AtomicOrdering::Release);
                 return Err(error).context("recheck finalized boundary during WS replay");
             }
         }
         let mut s = ctx.shared.write().await;
-        if covered(&s) {
+        let is_covered = covered(&s);
+        if is_covered {
             // Cursor moves to B (not past it): later same-block pushes trigger
             // a cheap dedup-only replay of B, never a skip.
             s.next_block = s.next_block.max(block_number);
-            ctx.persist.notify(&s);
-            drop(s);
-            ctx.broadcast_paused
-                .store(false, AtomicOrdering::Release);
-            ctx.broadcast_batches_after(starting_seq).await;
+        }
+        let snap = CheckpointSnapshot::from_state(&s);
+        drop(s);
+        if let Err(e) = ctx.finish_incremental_replay(&snap).await {
+            ctx.mark_canonical_unready().await;
+            ctx.broadcast_paused.store(false, AtomicOrdering::Release);
+            return Err(e).context("commit canonical WS replay");
+        }
+        ctx.broadcast_paused.store(false, AtomicOrdering::Release);
+        ctx.broadcast_batches_after(starting_seq).await;
+        if is_covered {
             return Ok(());
         }
-        drop(s);
-        ctx.broadcast_paused
-            .store(false, AtomicOrdering::Release);
-        ctx.broadcast_batches_after(starting_seq).await;
         // getLogs has not caught up with the WS push yet.
         tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
     }
@@ -5796,8 +6051,10 @@ async fn recover_pending_txs(ctx: &PollContext) {
                 }
                 // Only a canonical finalized receipt (success or revert) can leave
                 // the recovery queue.
+                let _ingest = ctx.ingest_lock.lock().await;
                 let mut s = ctx.shared.write().await;
                 s.pending_tx_hashes.retain(|h| h != &tx_hash);
+                ctx.persist.notify(&s);
             }
             Ok(None) => {
                 // Not yet mined — keep in queue, will retry next reconnect.
@@ -6076,17 +6333,9 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         // does not prove the rest of the block's logs were ingested (getLogs
         // can lag the WS push), so the block must stay inside the replay
         // window until a full ordered window pass moves the cursor beyond it.
-        let next_block = block_number.max(state.next_block);
-        state.next_block = next_block;
-        let cmx_snap = state.cmx_ordered.clone();
-        let root_snap = state.active_root;
-        let seq_snap = state.latest_seq;
-        let batches_snap: Vec<BatchEnvelope> = state.batches.iter().cloned().collect();
-        let pending_snap: Vec<String> = state.pending_tx_hashes.iter().cloned().collect();
-        let frozen_snap: Vec<FrozenUpdate> = state.frozen_updates.clone();
-        let accounting_snap = state.shield_accounting;
-        let state_last_finalized_block = state.last_finalized_block;
-        let state_last_finalized_block_hash = state.last_finalized_block_hash.clone();
+        state.next_block = block_number.max(state.next_block);
+        let persist_snap =
+            (!ctx.persist.is_paused()).then(|| CheckpointSnapshot::from_state(&state));
         let canonical_ready = !state.tree_out_of_order;
         drop(state);
         ctx.archive_note_mutation(NoteArchiveMutation::Upsert(envelope.clone()))
@@ -6094,18 +6343,9 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         if canonical_ready && !ctx.broadcast_paused.load(AtomicOrdering::Acquire) {
             ctx.batch_tx.send(envelope).ok();
         }
-        ctx.persist.notify_owned(CheckpointSnapshot {
-            next_block,
-            last_finalized_block: state_last_finalized_block,
-            last_finalized_block_hash: state_last_finalized_block_hash,
-            cmx_ordered: cmx_snap,
-            active_root: root_snap,
-            latest_seq: seq_snap,
-            batches: batches_snap,
-            pending_tx_hashes: pending_snap,
-            frozen_updates: frozen_snap,
-            shield_accounting: accounting_snap,
-        });
+        if let Some(snap) = persist_snap {
+            ctx.persist.notify_owned(snap);
+        }
     } else if t0.as_deref() == Some(nc.as_str()) {
         // ── NoteConfirmed ────────────────────────────────────────────────────
         if !state.confirm_seen_ids.insert(event_id) {
@@ -6152,7 +6392,8 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             }
         }
         let canonical_ready = !state.tree_out_of_order;
-        let snap = CheckpointSnapshot::from_state(&state);
+        let persist_snap =
+            (!ctx.persist.is_paused()).then(|| CheckpointSnapshot::from_state(&state));
         drop(state);
 
         if let Some(envelope) = &envelope {
@@ -6166,7 +6407,9 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 ctx.batch_tx.send(envelope).ok();
             }
         }
-        ctx.persist.notify_owned(snap);
+        if let Some(snap) = persist_snap {
+            ctx.persist.notify_owned(snap);
+        }
         return Ok(());
     } else if t0.as_deref() == Some(ru.as_str()) {
         // ── RootUpdated (batch confirm) ──────────────────────────────────────
@@ -6268,7 +6511,8 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             }
         }
         let canonical_ready = !state.tree_out_of_order;
-        let snap = CheckpointSnapshot::from_state(&state);
+        let persist_snap =
+            (!ctx.persist.is_paused()).then(|| CheckpointSnapshot::from_state(&state));
         drop(state);
         if let Some(envelope) = &envelope {
             ctx.archive_note_mutation(NoteArchiveMutation::Upsert(envelope.clone()))
@@ -6281,7 +6525,9 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 ctx.batch_tx.send(envelope).ok();
             }
         }
-        ctx.persist.notify_owned(snap);
+        if let Some(snap) = persist_snap {
+            ctx.persist.notify_owned(snap);
+        }
         return Ok(());
     } else if t0.as_deref() == Some(shielded_topic.as_str()) {
         // ── Shielded accounting ───────────────────────────────────────────────
@@ -7236,11 +7482,14 @@ mod tests {
         eip1967_beacon_slot, encode_crank_root_calldata, factory_log_matches,
         frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
         normalize_hex_0x, parse_address_set, parse_bytes32_strict, parse_tx_meta,
-        perc20_deployed_topic0, pg_apply_note_mutations, pg_begin_canonical_rebuild,
-        pg_finish_canonical_rebuild, replay_frozen_set, require_admin, require_relayer,
-        rlp_bytes, rlp_list, rlp_uint, validate_log_against_canonical, BatchEnvelope,
-        CheckpointSnapshot, Cli, EthLog, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
-        JsonNoteArchiveUpdate, NoteArchiveMutation, RpcClient, MAX_CRANK_GAS_MARGIN_BPS,
+        perc20_deployed_topic0, persist_request_is_current, pg_apply_note_mutations,
+        pg_begin_canonical_rebuild, pg_commit_incremental_replay,
+        pg_finish_canonical_rebuild, push_incremental_replay_mutation,
+        replay_frozen_set, require_admin, require_relayer, rlp_bytes, rlp_list,
+        rlp_uint, validate_log_against_canonical, BatchEnvelope, CheckpointSnapshot,
+        Cli, EthLog, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
+        JsonNoteArchiveUpdate, NoteArchiveMutation, RpcClient,
+        DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS,
     };
 
     fn frozen_update(cmx: &[&str], is_add: &[bool]) -> FrozenUpdate {
@@ -7332,6 +7581,43 @@ mod tests {
     use privacy_core::types::{OrchardIndexBatch, OrchardIndexedAbiNote};
     use sha3::{Digest, Keccak256};
     use std::sync::Arc;
+
+    #[test]
+    fn incremental_replay_uses_a_larger_bounded_history_window() {
+        assert_eq!(DEFAULT_MAX_BATCHES_IN_MEMORY, 4_096);
+    }
+
+    #[test]
+    fn stale_checkpoint_requests_are_rejected_after_a_persistence_epoch_change() {
+        assert!(persist_request_is_current(false, 7, 7));
+        assert!(!persist_request_is_current(true, 7, 7));
+        assert!(!persist_request_is_current(false, 8, 7));
+    }
+
+    #[test]
+    fn incremental_replay_mutation_buffer_fails_closed_at_its_limit() {
+        let mut buffered = Vec::new();
+        push_incremental_replay_mutation(
+            &mut buffered,
+            NoteArchiveMutation::Confirm {
+                cmx: [0x11; 32],
+                position: 0,
+            },
+            1,
+        )
+        .unwrap();
+        let error = push_incremental_replay_mutation(
+            &mut buffered,
+            NoteArchiveMutation::Confirm {
+                cmx: [0x22; 32],
+                position: 1,
+            },
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("mutation limit exceeded"));
+        assert_eq!(buffered.len(), 1);
+    }
 
     #[test]
     fn gas_price_is_configurable_from_the_runtime_environment() {
@@ -7648,11 +7934,15 @@ mod tests {
     }
 
     fn sample_note_envelope(cmx_byte: u8, seq: u64) -> BatchEnvelope {
+        sample_note_envelope_for_cmx([cmx_byte; 32], seq)
+    }
+
+    fn sample_note_envelope_for_cmx(cmx: [u8; 32], seq: u64) -> BatchEnvelope {
         let note = OrchardIndexedAbiNote {
             block_number: 100 + seq,
-            tx_hash: format!("0x{}", format!("{:02x}", cmx_byte).repeat(32)),
+            tx_hash: format!("0x{}", hex::encode(cmx)),
             log_index: seq,
-            cmx: [cmx_byte; 32],
+            cmx,
             enc_ciphertext: vec![1, 2, 3],
             epk: [2u8; 32],
             out_ciphertext: vec![4, 5],
@@ -7674,6 +7964,12 @@ mod tests {
                 latest_root: None,
             },
         }
+    }
+
+    fn unique_cmx(index: u64) -> [u8; 32] {
+        let mut cmx = [0x5a; 32];
+        cmx[24..].copy_from_slice(&index.to_be_bytes());
+        cmx
     }
 
     #[test]
@@ -7850,6 +8146,164 @@ mod tests {
         assert_eq!(cursor.0, 102);
         assert_eq!(cursor.1, Some(101));
         assert_eq!(cursor.2, snap.last_finalized_block_hash);
+
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
+    }
+
+    #[tokio::test]
+    async fn pg_incremental_replay_is_atomic_and_appends_only_new_leaves_when_configured() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let pool_address = format!("0x{}", "ed".repeat(20));
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
+
+        const EXISTING_LEAVES: u64 = 58_000;
+        const REPLAY_NOTES: u64 = 340;
+
+        let prefix_snap = CheckpointSnapshot {
+            next_block: 1_001,
+            last_finalized_block: Some(1_000),
+            last_finalized_block_hash: Some(format!("0x{}", "cd".repeat(32))),
+            cmx_ordered: (0..EXISTING_LEAVES).map(unique_cmx).collect(),
+            ..CheckpointSnapshot::default()
+        };
+        pg_commit_incremental_replay(&pool, &pool_address, &[], &prefix_snap)
+            .await
+            .expect("seed production-sized cmx prefix");
+        let first_xmin: String = sqlx::query_scalar(
+            "SELECT xmin::text FROM cmx_leaves WHERE pool_address=$1 AND position=0",
+        )
+        .bind(&pool_address)
+        .fetch_one(&pool)
+        .await
+        .expect("read prefix xmin");
+
+        let mut mutations = Vec::with_capacity(REPLAY_NOTES as usize * 3);
+        let mut cmx_ordered = prefix_snap.cmx_ordered.clone();
+        for offset in 0..REPLAY_NOTES {
+            let position = EXISTING_LEAVES + offset;
+            let cmx = unique_cmx(position);
+            let seq = position * 2 + 1;
+            let initial = sample_note_envelope_for_cmx(cmx, seq);
+            let mut confirmed = initial.clone();
+            confirmed.seq = seq + 1;
+            confirmed.batch.abi_notes[0].is_confirmed = true;
+            confirmed.batch.abi_notes[0].cmx_position = Some(position);
+            mutations.push(NoteArchiveMutation::Upsert(initial));
+            mutations.push(NoteArchiveMutation::Upsert(confirmed));
+            mutations.push(NoteArchiveMutation::Confirm { cmx, position });
+            cmx_ordered.push(cmx);
+        }
+        let snap = CheckpointSnapshot {
+            next_block: 2_001,
+            last_finalized_block: Some(2_000),
+            last_finalized_block_hash: Some(format!("0x{}", "ab".repeat(32))),
+            cmx_ordered,
+            latest_seq: (EXISTING_LEAVES + REPLAY_NOTES) * 2,
+            ..CheckpointSnapshot::default()
+        };
+        let started = std::time::Instant::now();
+        pg_commit_incremental_replay(&pool, &pool_address, &mutations, &snap)
+            .await
+            .unwrap();
+        eprintln!(
+            "{EXISTING_LEAVES}-leaf prefix plus {REPLAY_NOTES}-note incremental replay transaction completed in {:?}",
+            started.elapsed()
+        );
+
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM notes WHERE pool_address=$1), \
+               (SELECT count(*) FROM notes WHERE pool_address=$1 AND is_confirmed), \
+               (SELECT count(*) FROM cmx_leaves WHERE pool_address=$1)",
+        )
+        .bind(&pool_address)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            counts,
+            (
+                REPLAY_NOTES as i64,
+                REPLAY_NOTES as i64,
+                (EXISTING_LEAVES + REPLAY_NOTES) as i64,
+            )
+        );
+        let first_xmin_after_replay: String = sqlx::query_scalar(
+            "SELECT xmin::text FROM cmx_leaves WHERE pool_address=$1 AND position=0",
+        )
+        .bind(&pool_address)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            first_xmin_after_replay, first_xmin,
+            "incremental replay must not rewrite the existing cmx prefix"
+        );
+
+        let cursor_before_failure: i64 =
+            sqlx::query_scalar("SELECT next_block FROM indexer_meta WHERE pool_address=$1")
+                .bind(&pool_address)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let bad_cmx = unique_cmx(EXISTING_LEAVES + REPLAY_NOTES);
+        let bad_seq = snap.latest_seq + 1;
+        let mut bad_snap = snap.clone();
+        let persisted_boundary = bad_snap.cmx_ordered.len() - 1;
+        bad_snap.cmx_ordered[persisted_boundary] = unique_cmx(9_999);
+        bad_snap.cmx_ordered.push(bad_cmx);
+        bad_snap.next_block = 9_999;
+        let error = pg_commit_incremental_replay(
+            &pool,
+            &pool_address,
+            &[
+                NoteArchiveMutation::Upsert(sample_note_envelope_for_cmx(bad_cmx, bad_seq)),
+                NoteArchiveMutation::Confirm {
+                    cmx: bad_cmx,
+                    position: EXISTING_LEAVES + REPLAY_NOTES,
+                },
+            ],
+            &bad_snap,
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("append-only cmx checkpoint prefix mismatch"));
+
+        let state_after_failure: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM notes WHERE pool_address=$1), \
+               (SELECT count(*) FROM cmx_leaves WHERE pool_address=$1), \
+               (SELECT next_block FROM indexer_meta WHERE pool_address=$1)",
+        )
+        .bind(&pool_address)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            state_after_failure,
+            (
+                REPLAY_NOTES as i64,
+                (EXISTING_LEAVES + REPLAY_NOTES) as i64,
+                cursor_before_failure,
+            )
+        );
+        let bad_note_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM notes WHERE pool_address=$1 AND cmx_hex=$2")
+                .bind(&pool_address)
+                .bind(hex::encode(bad_cmx))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            bad_note_count, 0,
+            "failed replay must roll back note upsert"
+        );
 
         clear_pg_rebuild_test_pool(&pool, &pool_address).await;
     }
