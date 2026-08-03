@@ -1441,6 +1441,34 @@ struct BatchesQuery {
     pool: Option<String>,
 }
 
+const DEFAULT_BATCH_PAGE_LIMIT: usize = 1_000;
+const MAX_BATCH_PAGE_LIMIT: usize = 2_000;
+
+#[derive(Debug, Deserialize)]
+struct BatchesPageQuery {
+    after_seq: Option<u64>,
+    /// Stable high-watermark for this catch-up pass. Omit on the first request;
+    /// reuse the returned target_seq on every subsequent page.
+    to_seq: Option<u64>,
+    /// Soft envelope limit. A page is extended when necessary so envelopes that
+    /// share one seq are never split across pages.
+    limit: Option<usize>,
+    /// Contract address of the pool to query. Omit to use the primary pool.
+    pool: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchesPageResponse {
+    envelopes: Vec<BatchEnvelope>,
+    /// Exclusive cursor for the next request. This can advance across valid
+    /// archive gaps when the server has completely inspected the target window.
+    next_after_seq: u64,
+    scanned_to_seq: u64,
+    target_seq: u64,
+    latest_seq: u64,
+    has_more: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct MerklePathQuery {
     /// cmx in hex (with or without 0x prefix).
@@ -1786,6 +1814,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(healthz))
         .route("/status", get(status))
         .route("/batches", get(get_batches))
+        .route("/batches/page", get(get_batches_page))
         .route("/batches/stream", get(get_batches_stream))
         .route("/root", get(get_root))
         .route("/merkle_path", get(get_merkle_path))
@@ -2813,6 +2842,95 @@ async fn get_batches(
     let after = q.after_seq.unwrap_or(0);
     let out = collect_batches_since(&ctx, after).await?;
     Ok(Json(out))
+}
+
+/// Paginated batch history for wallet catch-up.
+///
+/// The first request omits `to_seq`; the indexer freezes `target_seq` at its
+/// current latest sequence. Clients send that target back on later requests so
+/// a busy pool cannot make one catch-up pass chase a moving head forever.
+/// `limit` is soft because every envelope sharing the boundary seq stays in the
+/// same page. On the final page `scanned_to_seq` advances to the target even if
+/// the archive contains valid numeric seq gaps.
+async fn get_batches_page(
+    State(reg): State<PoolRegistry>,
+    Query(q): Query<BatchesPageQuery>,
+) -> Result<Json<BatchesPageResponse>, (StatusCode, String)> {
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
+    let after_seq = q.after_seq.unwrap_or(0);
+    let initial_latest_seq = {
+        let s = ctx.state.read().await;
+        canonical_guard(s.tree_out_of_order)?;
+        s.latest_seq
+    };
+    let target_seq = q
+        .to_seq
+        .unwrap_or(initial_latest_seq)
+        .min(initial_latest_seq);
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_BATCH_PAGE_LIMIT)
+        .clamp(1, MAX_BATCH_PAGE_LIMIT);
+
+    if after_seq >= target_seq {
+        return Ok(Json(BatchesPageResponse {
+            envelopes: Vec::new(),
+            next_after_seq: after_seq,
+            scanned_to_seq: after_seq,
+            target_seq,
+            latest_seq: initial_latest_seq,
+            has_more: false,
+        }));
+    }
+
+    let mut candidates = collect_batches_since(&ctx, after_seq).await?;
+    candidates.retain(|envelope| envelope.seq <= target_seq);
+    candidates.sort_by_key(|envelope| envelope.seq);
+
+    let sequences: Vec<u64> = candidates.iter().map(|envelope| envelope.seq).collect();
+    let page_end = batch_page_end(&sequences, limit);
+    let has_more = page_end < candidates.len();
+    let envelopes: Vec<BatchEnvelope> = candidates.into_iter().take(page_end).collect();
+    let scanned_to_seq = if has_more {
+        envelopes
+            .last()
+            .map(|envelope| envelope.seq)
+            .unwrap_or(after_seq)
+    } else {
+        // `collect_batches_since` inspected the complete retained window. Moving
+        // to target is therefore safe even when confirmation upserts created
+        // numeric gaps with no row at exactly target_seq.
+        target_seq
+    };
+    // Report the head again after the archive read, so a client can immediately
+    // start another fixed-target pass when new envelopes arrived mid-request.
+    let latest_seq = {
+        let s = ctx.state.read().await;
+        canonical_guard(s.tree_out_of_order)?;
+        s.latest_seq
+    };
+
+    Ok(Json(BatchesPageResponse {
+        envelopes,
+        next_after_seq: scanned_to_seq,
+        scanned_to_seq,
+        target_seq,
+        latest_seq,
+        has_more,
+    }))
+}
+
+/// Return the page boundary without splitting envelopes that share a sequence.
+fn batch_page_end(sequences: &[u64], limit: usize) -> usize {
+    if sequences.len() <= limit {
+        return sequences.len();
+    }
+    let boundary_seq = sequences[limit - 1];
+    let mut end = limit;
+    while end < sequences.len() && sequences[end] == boundary_seq {
+        end += 1;
+    }
+    end
 }
 
 /// All batch envelopes with `seq > after`, oldest first. Recent envelopes come
@@ -8486,7 +8604,7 @@ fn strip_0x(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_cursor, beacon_words_match, canonical_guard, classify_selector,
+        advance_cursor, batch_page_end, beacon_words_match, canonical_guard, classify_selector,
         compact_note_mutations, crank_gas_limit, crank_next_delay_secs,
         decode_frozen_root_updated_log, decode_json_note_archive, eip1967_beacon_slot,
         encode_crank_root_calldata, factory_log_matches, frontier_from_ordered_leaves,
@@ -8502,6 +8620,18 @@ mod tests {
         JsonNoteArchiveUpdate, NoteArchiveMutation, RpcClient, StateBackend,
         DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS,
     };
+
+    #[test]
+    fn batch_page_boundary_never_splits_one_sequence() {
+        assert_eq!(batch_page_end(&[11, 12, 12, 12, 15], 2), 4);
+        assert_eq!(batch_page_end(&[11, 12, 15], 2), 2);
+        assert_eq!(batch_page_end(&[11, 12], 500), 2);
+    }
+
+    #[test]
+    fn batch_page_limit_is_a_soft_envelope_limit() {
+        assert_eq!(batch_page_end(&[7, 7, 7], 1), 3);
+    }
 
     fn frozen_update(cmx: &[&str], is_add: &[bool]) -> FrozenUpdate {
         FrozenUpdate {
