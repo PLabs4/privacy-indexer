@@ -18,13 +18,16 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use ff::{Field, PrimeField};
 use futures_util::stream::{self, StreamExt};
 use futures_util::SinkExt;
+use halo2curves::bn256::Fr;
 use k256::ecdsa::{RecoveryId, SigningKey};
 use privacy_core::commitment_tree::frontier::{
     CmxConfirmWitnessInput, FrontierTree, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX,
 };
-use privacy_core::commitment_tree::frozen::fr_to_be_bytes;
+use privacy_core::commitment_tree::frozen::{fr_from_be_bytes, fr_to_be_bytes};
+use privacy_core::commitment_tree::poseidon::{merkle_compress, MERKLE_DEPTH_EVM};
 use privacy_core::commitment_tree::OrchardCommitmentTree;
 use privacy_core::ethereum::{
     bundle_actions_by_cmx,
@@ -160,6 +163,29 @@ struct Cli {
     /// going below --start-block). Updated after every successful scan chunk.
     #[arg(long, env = "PRIVACYBTC_INDEXER_STATE_FILE")]
     state_file: Option<String>,
+    /// Start as a read-only shadow instance. The process must restore a fully
+    /// validated PostgreSQL checkpoint; it never applies migrations, persists
+    /// state, cranks roots, accepts runtime pool registration, or relayer writes.
+    /// Trusted-factory discovery remains available so the shadow can mirror the
+    /// production pool set without a separate address list.
+    /// If warm-start validation fails, health remains 503 instead of replaying.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_SHADOW_MODE",
+        default_value_t = false,
+        value_parser = parse_bool_flag
+    )]
+    shadow_mode: bool,
+    /// Apply PostgreSQL migrations and exit before constructing RPC, pool, or
+    /// signer state. Used to prepare schema 0006 while the old primary remains
+    /// online, before starting a read-only shadow.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_MIGRATE_ONLY",
+        default_value_t = false,
+        value_parser = parse_bool_flag
+    )]
+    migrate_only: bool,
     /// First block to scan when no checkpoint exists; resume never goes below this.
     #[arg(long, env = "PRIVACYBTC_START_BLOCK", default_value_t = 0)]
     start_block: u64,
@@ -408,6 +434,11 @@ struct SharedState {
     /// monotonic in this key — the tree is append-only and must match on-chain
     /// insertion order exactly, or every root it produces is invalid.
     last_leaf_key: Option<(u64, u64)>,
+    /// True only when the loaded PostgreSQL checkpoint passed relational
+    /// integrity checks and contains all fields required for warm-start.
+    warm_start_candidate: bool,
+    /// Observable startup path for shadow-cutover readiness checks.
+    startup_source: String,
     /// Set when an out-of-order append was rejected: the tree is missing a
     /// leaf in the middle and must be rebuilt from chain (see catchup task).
     tree_out_of_order: bool,
@@ -429,6 +460,9 @@ struct SharedState {
     /// Leaves at positions `>= confirmed_count` are pending — excluded from
     /// `/root` anchors and `/merkle_path` witnesses.
     confirmed_count: u64,
+    /// Restored confirmed frontier. This is populated by warm-start validation
+    /// so the crank need not replay every confirmed leaf on the async runtime.
+    confirmed_frontier: Option<FrontierTree>,
     /// Latest confirmed Orchard commitment tree root.
     /// Updated only when a NoteConfirmed event is processed (Phase 2).
     active_root: Option<[u8; 32]>,
@@ -483,6 +517,7 @@ struct AppContext {
     /// Persistent backend, used by `/batches` to serve history evicted from the
     /// in-memory ring (the ring is a hot cache, NOT the source of truth).
     backend: StateBackend,
+    shadow_mode: bool,
 }
 
 /// Everything required to construct a per-pool `AppContext` and spawn its WS
@@ -498,6 +533,7 @@ struct PoolBuilder {
     derive_state_file: bool,
     max_batches: usize,
     note_confirmed_topic0: String,
+    shadow_mode: bool,
 }
 
 impl PoolBuilder {
@@ -526,7 +562,27 @@ impl PoolBuilder {
             Some(p) => StateBackend::Pgsql(p.clone()),
             None => StateBackend::Json(self.state_file_for(contract_address)),
         };
-        let ck = backend.load(contract_address, start_block).await;
+        let mut ck = backend.load(contract_address, start_block).await;
+        if matches!(&backend, StateBackend::Pgsql(_))
+            && ck.last_finalized_block.is_some()
+            && !ck.warm_start_candidate
+        {
+            // A pre-v1 writer commits archive mutations and its coalesced
+            // checkpoint in separate transactions. Retry a few read-only
+            // snapshots so a busy but healthy old primary is not rejected only
+            // because the first sample landed inside that short tail window.
+            for attempt in 1..=5 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                ck = backend.load(contract_address, start_block).await;
+                if ck.warm_start_candidate {
+                    println!(
+                        "[indexer][{}] checkpoint became consistent on snapshot retry {attempt}",
+                        &contract_address[..10.min(contract_address.len())]
+                    );
+                    break;
+                }
+            }
+        }
         // A fresh checkpoint restarts sequence numbers from 0; a leftover batch
         // archive from an earlier run would collide with re-issued seqs.
         if ck.latest_seq == 0 {
@@ -540,28 +596,67 @@ impl PoolBuilder {
                 epoch: 0,
                 snapshot: CheckpointSnapshot::from_checkpoint_data(&ck),
             }));
-        tokio::spawn(persist_task(
-            backend.clone(),
-            contract_address.to_string(),
-            persist_rx,
-            Arc::clone(&persist_paused),
-            Arc::clone(&persist_epoch),
-            Arc::clone(&backend_write_lock),
-        ));
+        if !self.shadow_mode {
+            tokio::spawn(persist_task(
+                backend.clone(),
+                contract_address.to_string(),
+                persist_rx,
+                Arc::clone(&persist_paused),
+                Arc::clone(&persist_epoch),
+                Arc::clone(&backend_write_lock),
+            ));
+        }
         let persist = Persist {
             tx: persist_tx,
             paused: Arc::clone(&persist_paused),
             epoch: persist_epoch,
+            read_only: self.shadow_mode,
         };
 
-        // Rebuild Poseidon tree from checkpoint.
+        // Rebuild the in-memory tree. A warm candidate is pre-hashed in a
+        // blocking worker so root/path caches and the crank frontier are hot
+        // before canonical health can turn green.
+        let mut restored_frontier = None;
         let mut restored_tree = OrchardCommitmentTree::new();
-        let mut restored_cmx_to_pos: HashMap<[u8; 32], u64> = HashMap::new();
-        for cmx_be in &ck.cmx_ordered {
-            if let Some(pos) = restored_tree.append(*cmx_be) {
-                restored_cmx_to_pos.insert(*cmx_be, pos);
+        if ck.warm_start_candidate {
+            let leaves = ck.cmx_ordered.clone();
+            let confirmed_count = ck.confirmed_count;
+            match tokio::task::spawn_blocking(move || {
+                checkpoint_tree_and_frontier(&leaves, confirmed_count)
+            })
+            .await
+            {
+                Ok(Ok((tree, frontier))) => {
+                    restored_tree = tree;
+                    restored_frontier = Some(frontier);
+                }
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "[indexer][{}] checkpoint tree prewarm rejected: {error:#}",
+                        &contract_address[..10.min(contract_address.len())]
+                    );
+                    ck.warm_start_candidate = false;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[indexer][{}] checkpoint tree worker failed: {error}",
+                        &contract_address[..10.min(contract_address.len())]
+                    );
+                    ck.warm_start_candidate = false;
+                }
             }
         }
+        if restored_frontier.is_none() {
+            for cmx_be in &ck.cmx_ordered {
+                restored_tree.append(*cmx_be);
+            }
+        }
+        let restored_cmx_to_pos: HashMap<[u8; 32], u64> = ck
+            .cmx_ordered
+            .iter()
+            .enumerate()
+            .map(|(position, cmx)| (*cmx, position as u64))
+            .collect();
         if !ck.cmx_ordered.is_empty() {
             println!(
                 "[indexer][{}] rebuilt tree with {} leaves through block {}",
@@ -581,7 +676,9 @@ impl PoolBuilder {
             shield_seen_ids: HashSet::new(),
             accounting_seen_ids: HashSet::new(),
             shield_accounting: ck.shield_accounting,
-            last_leaf_key: None,
+            last_leaf_key: ck.last_leaf_key,
+            warm_start_candidate: ck.warm_start_candidate,
+            startup_source: "pending".to_string(),
             // Startup state is untrusted until the persisted finalized cursor
             // has been checked and the finalized replay completes.
             tree_out_of_order: true,
@@ -590,8 +687,9 @@ impl PoolBuilder {
             tree: restored_tree,
             cmx_to_position: restored_cmx_to_pos,
             cmx_ordered: ck.cmx_ordered,
-            confirmed_cmx: HashSet::new(),
-            confirmed_count: 0, // rebuilt by the startup backfill event replay
+            confirmed_cmx: ck.confirmed_cmx,
+            confirmed_count: ck.confirmed_count,
+            confirmed_frontier: restored_frontier,
             active_root: ck.active_root,
             pending_tx_hashes: ck.pending_tx_hashes,
             bundle_out_cache: HashMap::new(),
@@ -619,6 +717,7 @@ impl PoolBuilder {
             rebuild_mutations: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             incremental_replay_mutations: Arc::new(tokio::sync::Mutex::new(None)),
             broadcast_paused: Arc::new(AtomicBool::new(false)),
+            shadow_mode: self.shadow_mode,
         };
         let addr_label = contract_address.to_string();
         tokio::spawn(async move {
@@ -635,6 +734,7 @@ impl PoolBuilder {
             batch_tx,
             recover_trigger,
             backend,
+            shadow_mode: self.shadow_mode,
         }
     }
 }
@@ -652,6 +752,8 @@ struct PoolRegistry {
     add_lock: Arc<tokio::sync::Mutex<()>>,
     max_pools: usize,
     allow_runtime_pool_registration: bool,
+    /// Fail health until at least one configured/discovered pool is ready.
+    require_pool: bool,
     registry_file: Option<String>,
     /// Cache of addresses already verified as genuine pERC20 assets (lowercase
     /// 0x). Avoids a repeat `eth_getLogs` on every re-registration attempt.
@@ -1339,6 +1441,9 @@ struct MerklePathQuery {
 struct StatusResponse {
     next_block: u64,
     canonical: bool,
+    /// `pending`, `checkpoint`, `full_replay`, or a fail-closed rejection state.
+    startup_source: String,
+    shadow_mode: bool,
     last_finalized_block: Option<u64>,
     last_finalized_block_hash: Option<String>,
     latest_seq: u64,
@@ -1396,15 +1501,44 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     let bind: SocketAddr = cli.bind.parse().context("invalid --bind address")?;
-
-    let signer = match &cli.signer_key {
-        Some(key) => {
-            let cfg = SignerConfig::from_hex_key(key, cli.chain_id, cli.gas_price)?;
-            let addr_hex = hex::encode(cfg.address);
-            println!("indexer signer account: 0x{addr_hex}");
-            Some(Arc::new(cfg))
+    if cli.migrate_only && cli.shadow_mode {
+        return Err(anyhow!(
+            "migrate-only and shadow mode are mutually exclusive"
+        ));
+    }
+    if cli.migrate_only && cli.database_url.is_none() {
+        return Err(anyhow!(
+            "migrate-only requires PRIVACYBTC_INDEXER_DATABASE_URL"
+        ));
+    }
+    if cli.shadow_mode {
+        if cli.database_url.is_none() {
+            return Err(anyhow!(
+                "shadow mode requires PRIVACYBTC_INDEXER_DATABASE_URL"
+            ));
         }
-        None => None,
+        if cli.crank || cli.signer_key.is_some() {
+            return Err(anyhow!(
+                "shadow mode forbids crank and signer configuration"
+            ));
+        }
+        if cli.allow_runtime_pool_registration {
+            return Err(anyhow!("shadow mode forbids runtime pool registration"));
+        }
+    }
+
+    let signer = if cli.migrate_only {
+        None
+    } else {
+        match &cli.signer_key {
+            Some(key) => {
+                let cfg = SignerConfig::from_hex_key(key, cli.chain_id, cli.gas_price)?;
+                let addr_hex = hex::encode(cfg.address);
+                println!("indexer signer account: 0x{addr_hex}");
+                Some(Arc::new(cfg))
+            }
+            None => None,
+        }
     };
 
     let rpc = RpcClient::new(cli.rpc_url.clone());
@@ -1420,11 +1554,24 @@ async fn main() -> Result<()> {
             let pool = sqlx::PgPool::connect(url)
                 .await
                 .context("connect PostgreSQL")?;
-            sqlx::migrate!("./migrations")
-                .run(&pool)
+            if cli.shadow_mode {
+                sqlx::query(
+                    "SELECT confirmed_count, last_leaf_block, last_leaf_log_index, checkpoint_version \
+                     FROM indexer_meta LIMIT 0",
+                )
+                .execute(&pool)
                 .await
-                .context("run migrations")?;
-            println!("[indexer] state backend: PostgreSQL (migrations applied)");
+                .context("shadow mode requires migration 0006_warm_checkpoint")?;
+                println!(
+                    "[indexer] state backend: PostgreSQL read-only shadow (migrations not applied)"
+                );
+            } else {
+                sqlx::migrate!("./migrations")
+                    .run(&pool)
+                    .await
+                    .context("run migrations")?;
+                println!("[indexer] state backend: PostgreSQL (migrations applied)");
+            }
             Some(pool)
         }
         None => {
@@ -1432,6 +1579,10 @@ async fn main() -> Result<()> {
             None
         }
     };
+    if cli.migrate_only {
+        println!("[indexer] migrations complete; exiting migrate-only mode");
+        return Ok(());
+    }
 
     // ── Pool factory: shared config used by both CLI pools and POST /pools ────
     let wss_url = cli.ws_url.clone().unwrap_or_else(|| {
@@ -1451,6 +1602,7 @@ async fn main() -> Result<()> {
         derive_state_file,
         max_batches: cli.max_batches_in_memory,
         note_confirmed_topic0: note_confirmed.clone(),
+        shadow_mode: cli.shadow_mode,
     });
 
     let admission = Arc::new(PoolAdmissionPolicy::from_cli(&cli)?);
@@ -1505,6 +1657,7 @@ async fn main() -> Result<()> {
         add_lock: Arc::new(tokio::sync::Mutex::new(())),
         max_pools: cli.max_pools,
         allow_runtime_pool_registration: cli.allow_runtime_pool_registration,
+        require_pool: cli.shadow_mode || cli.discover_pools || !cli.contract_address.is_empty(),
         registry_file: cli.pools_registry.clone(),
         verified_pools: Arc::new(RwLock::new(HashSet::new())),
         verified_pool_provenance: Arc::new(RwLock::new(HashMap::new())),
@@ -1949,6 +2102,9 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
             if !cfg.allowed_pools.contains(&pool.to_lowercase()) {
                 continue;
             }
+            if ctx.state.read().await.tree_out_of_order {
+                continue;
+            }
             if let Some(wait) = tx_budget.retry_after_seconds(unix_seconds()) {
                 println!(
                     "[crank] rolling hourly transaction budget exhausted; retrying in {wait}s"
@@ -2031,29 +2187,55 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
                 continue;
             }
 
-            // Advance (or rebuild) the confirmed-state frontier up to chain_count.
-            let frontier = frontiers.entry(pool.clone()).or_default();
-            if frontier.next_index() > chain_count {
-                *frontier = FrontierTree::new(); // chain went backwards?? rebuild from scratch
-            }
-            if frontier.next_index() < chain_count {
-                let (from, to) = (frontier.next_index() as usize, chain_count as usize);
-                let confirmed: Option<Vec<[u8; 32]>> = {
+            // Restore the exact confirmed-state frontier without monopolising a
+            // Tokio worker. Warm-start supplies it directly when counts match;
+            // otherwise derive it in a blocking worker from one final-leaf path
+            // (O(n), rather than replaying 32 hashes per historical leaf).
+            let frontier_matches = frontiers
+                .get(&pool)
+                .is_some_and(|frontier| frontier.next_index() == chain_count);
+            if !frontier_matches {
+                let (restored, confirmed_prefix): (Option<FrontierTree>, Option<Vec<[u8; 32]>>) = {
                     let s = ctx.state.read().await;
-                    s.cmx_ordered.get(from..to).map(|x| x.to_vec())
+                    let restored = s
+                        .confirmed_frontier
+                        .as_ref()
+                        .filter(|frontier| frontier.next_index() == chain_count)
+                        .cloned();
+                    let prefix = s
+                        .cmx_ordered
+                        .get(..chain_count as usize)
+                        .map(ToOwned::to_owned);
+                    (restored, prefix)
                 };
-                match confirmed {
-                    Some(cs) => {
-                        for c in cs {
-                            frontier.insert_be(c);
-                        }
+                let rebuilt = if let Some(frontier) = restored {
+                    Ok(frontier)
+                } else if let Some(prefix) = confirmed_prefix {
+                    println!(
+                        "[crank][{label}] deriving confirmed frontier at count {chain_count} in blocking worker"
+                    );
+                    match tokio::task::spawn_blocking(move || frontier_from_ordered_leaves(&prefix))
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(anyhow!("frontier worker failed: {error}")),
                     }
-                    None => {
-                        println!("[crank][{label}] local tree behind chain watermark — waiting");
+                } else {
+                    Err(anyhow!("local tree behind chain watermark"))
+                };
+                match rebuilt {
+                    Ok(frontier) => {
+                        frontiers.insert(pool.clone(), frontier);
+                    }
+                    Err(error) => {
+                        eprintln!("[crank][{label}] cannot restore frontier: {error:#}");
                         continue;
                     }
                 }
             }
+            let frontier = frontiers
+                .get_mut(&pool)
+                .expect("frontier inserted after successful restore");
             // Byte-identity guard: local frontier must reproduce the chain root.
             let local_root = fr_to_be_bytes(frontier.root());
             if local_root != chain_root {
@@ -2373,6 +2555,12 @@ async fn healthz(
     State(reg): State<PoolRegistry>,
 ) -> Result<&'static str, (StatusCode, String)> {
     let contexts: Vec<AppContext> = reg.pools.read().await.values().cloned().collect();
+    if contexts.is_empty() && reg.require_pool {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no required pool has been configured or discovered".to_owned(),
+        ));
+    }
     for ctx in contexts {
         require_canonical_context(&ctx).await.map_err(|_| {
             (
@@ -2571,6 +2759,8 @@ async fn status(
     Ok(Json(StatusResponse {
         next_block: s.next_block,
         canonical: !s.tree_out_of_order,
+        startup_source: s.startup_source.clone(),
+        shadow_mode: ctx.shadow_mode,
         last_finalized_block: s.last_finalized_block,
         last_finalized_block_hash: s.last_finalized_block_hash.clone(),
         latest_seq: s.latest_seq,
@@ -3786,8 +3976,14 @@ async fn post_notify_tx(
     Query(q): Query<SimplePoolQuery>,
     Json(req): Json<NotifyTxRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    require_relayer(&headers, reg.relayer_token.as_ref())?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
+    if ctx.shadow_mode {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relayer notifications are disabled in shadow mode".to_owned(),
+        ));
+    }
+    require_relayer(&headers, reg.relayer_token.as_ref())?;
     if parse_hex32(&req.tx_hash).is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -3833,6 +4029,12 @@ struct IndexerCheckpoint {
     #[serde(default)]
     active_root_hex: Option<String>,
     #[serde(default)]
+    confirmed_count: Option<u64>,
+    #[serde(default)]
+    last_leaf_block: Option<u64>,
+    #[serde(default)]
+    last_leaf_log_index: Option<u64>,
+    #[serde(default)]
     latest_seq: u64,
     #[serde(default)]
     batches: Vec<BatchEnvelope>,
@@ -3855,6 +4057,10 @@ struct CheckpointData {
     last_finalized_block_hash: Option<String>,
     cmx_ordered: Vec<[u8; 32]>,
     active_root: Option<[u8; 32]>,
+    confirmed_count: u64,
+    confirmed_cmx: HashSet<[u8; 32]>,
+    last_leaf_key: Option<(u64, u64)>,
+    warm_start_candidate: bool,
     latest_seq: u64,
     batches: VecDeque<BatchEnvelope>,
     pending_tx_hashes: VecDeque<String>,
@@ -3903,6 +4109,12 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                         .and_then(|hash| normalize_block_hash(&hash).ok()),
                     cmx_ordered,
                     active_root,
+                    confirmed_count: ck.confirmed_count.unwrap_or(0),
+                    confirmed_cmx: HashSet::new(),
+                    last_leaf_key: ck.last_leaf_block.zip(ck.last_leaf_log_index),
+                    // JSON checkpoints do not have a transactional note archive,
+                    // so they deliberately retain the full-replay startup path.
+                    warm_start_candidate: false,
                     latest_seq: ck.latest_seq,
                     batches,
                     pending_tx_hashes,
@@ -3920,6 +4132,10 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
                     last_finalized_block_hash: None,
                     cmx_ordered: vec![],
                     active_root: None,
+                    confirmed_count: 0,
+                    confirmed_cmx: HashSet::new(),
+                    last_leaf_key: None,
+                    warm_start_candidate: false,
                     latest_seq: 0,
                     batches: VecDeque::new(),
                     pending_tx_hashes: VecDeque::new(),
@@ -3934,6 +4150,10 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
             last_finalized_block_hash: None,
             cmx_ordered: vec![],
             active_root: None,
+            confirmed_count: 0,
+            confirmed_cmx: HashSet::new(),
+            last_leaf_key: None,
+            warm_start_candidate: false,
             latest_seq: 0,
             batches: VecDeque::new(),
             pending_tx_hashes: VecDeque::new(),
@@ -3943,30 +4163,21 @@ fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
     }
 }
 
-fn save_checkpoint(
-    path: &str,
-    next_block: u64,
-    last_finalized_block: Option<u64>,
-    last_finalized_block_hash: Option<&str>,
-    cmx_ordered: &[[u8; 32]],
-    active_root: Option<[u8; 32]>,
-    latest_seq: u64,
-    batches: &[BatchEnvelope],
-    pending_tx_hashes: &[String],
-    frozen_updates: &[FrozenUpdate],
-    shield_accounting: ShieldAccounting,
-) -> Result<()> {
+fn save_checkpoint(path: &str, snap: &CheckpointSnapshot) -> Result<()> {
     let ck = IndexerCheckpoint {
-        next_block,
-        last_finalized_block,
-        last_finalized_block_hash: last_finalized_block_hash.map(str::to_owned),
-        cmx_leaves_hex: cmx_ordered.iter().map(hex::encode).collect(),
-        active_root_hex: active_root.map(hex::encode),
-        latest_seq,
-        batches: batches.to_vec(),
-        pending_tx_hashes: pending_tx_hashes.to_vec(),
-        frozen_updates: frozen_updates.to_vec(),
-        shield_accounting,
+        next_block: snap.next_block,
+        last_finalized_block: snap.last_finalized_block,
+        last_finalized_block_hash: snap.last_finalized_block_hash.clone(),
+        cmx_leaves_hex: snap.cmx_ordered.iter().map(hex::encode).collect(),
+        active_root_hex: snap.active_root.map(hex::encode),
+        confirmed_count: Some(snap.confirmed_count),
+        last_leaf_block: snap.last_leaf_key.map(|(block, _)| block),
+        last_leaf_log_index: snap.last_leaf_key.map(|(_, log_index)| log_index),
+        latest_seq: snap.latest_seq,
+        batches: snap.batches.clone(),
+        pending_tx_hashes: snap.pending_tx_hashes.clone(),
+        frozen_updates: snap.frozen_updates.clone(),
+        shield_accounting: snap.shield_accounting,
     };
     let json = serde_json::to_string(&ck).context("serialize indexer checkpoint")?;
     let tmp = format!("{path}.tmp");
@@ -3986,6 +4197,8 @@ struct CheckpointSnapshot {
     last_finalized_block_hash: Option<String>,
     cmx_ordered: Vec<[u8; 32]>,
     active_root: Option<[u8; 32]>,
+    confirmed_count: u64,
+    last_leaf_key: Option<(u64, u64)>,
     latest_seq: u64,
     batches: Vec<BatchEnvelope>,
     pending_tx_hashes: Vec<String>,
@@ -4001,6 +4214,8 @@ impl CheckpointSnapshot {
             last_finalized_block_hash: s.last_finalized_block_hash.clone(),
             cmx_ordered: s.cmx_ordered.clone(),
             active_root: s.active_root,
+            confirmed_count: s.confirmed_count,
+            last_leaf_key: s.last_leaf_key,
             latest_seq: s.latest_seq,
             batches: s.batches.iter().cloned().collect(),
             pending_tx_hashes: s.pending_tx_hashes.iter().cloned().collect(),
@@ -4015,6 +4230,8 @@ impl CheckpointSnapshot {
             last_finalized_block_hash: ck.last_finalized_block_hash.clone(),
             cmx_ordered: ck.cmx_ordered.clone(),
             active_root: ck.active_root,
+            confirmed_count: ck.confirmed_count,
+            last_leaf_key: ck.last_leaf_key,
             latest_seq: ck.latest_seq,
             batches: ck.batches.iter().cloned().collect(),
             pending_tx_hashes: ck.pending_tx_hashes.iter().cloned().collect(),
@@ -4211,19 +4428,7 @@ impl StateBackend {
                         snap.cmx_ordered.len()
                     ));
                 }
-                save_checkpoint(
-                    path,
-                    snap.next_block,
-                    snap.last_finalized_block,
-                    snap.last_finalized_block_hash.as_deref(),
-                    &snap.cmx_ordered,
-                    snap.active_root,
-                    snap.latest_seq,
-                    &snap.batches,
-                    &snap.pending_tx_hashes,
-                    &snap.frozen_updates,
-                    snap.shield_accounting,
-                )?;
+                save_checkpoint(path, snap)?;
                 std::fs::rename(
                     rebuild_path,
                     Self::json_archive_path(path),
@@ -4358,21 +4563,7 @@ impl StateBackend {
     }
     async fn save(&self, pool_address: &str, snap: &CheckpointSnapshot) -> Result<()> {
         match self {
-            StateBackend::Json(Some(path)) => {
-                save_checkpoint(
-                    path,
-                    snap.next_block,
-                    snap.last_finalized_block,
-                    snap.last_finalized_block_hash.as_deref(),
-                    &snap.cmx_ordered,
-                    snap.active_root,
-                    snap.latest_seq,
-                    &snap.batches,
-                    &snap.pending_tx_hashes,
-                    &snap.frozen_updates,
-                    snap.shield_accounting,
-                )
-            }
+            StateBackend::Json(Some(path)) => save_checkpoint(path, snap),
             StateBackend::Json(None) => Ok(()),
             StateBackend::Pgsql(pool) => pg_save(pool, pool_address, snap).await,
         }
@@ -4426,6 +4617,10 @@ fn empty_checkpoint(start_block: u64) -> CheckpointData {
         last_finalized_block_hash: None,
         cmx_ordered: vec![],
         active_root: None,
+        confirmed_count: 0,
+        confirmed_cmx: HashSet::new(),
+        last_leaf_key: None,
+        warm_start_candidate: false,
         latest_seq: 0,
         batches: VecDeque::new(),
         pending_tx_hashes: VecDeque::new(),
@@ -4442,6 +4637,7 @@ struct Persist {
     paused: Arc<AtomicBool>,
     /// Invalidates snapshots queued before a staged rebuild or incremental replay.
     epoch: Arc<AtomicU64>,
+    read_only: bool,
 }
 
 #[derive(Clone)]
@@ -4456,7 +4652,7 @@ impl Persist {
     }
 
     fn notify(&self, s: &SharedState) {
-        if self.is_paused() {
+        if self.read_only || self.is_paused() {
             return;
         }
         let epoch = self.epoch.load(AtomicOrdering::Acquire);
@@ -4470,7 +4666,7 @@ impl Persist {
     }
     /// Persist an already-built snapshot (for sites that dropped the lock first).
     fn notify_owned(&self, snap: CheckpointSnapshot) {
-        if self.is_paused() {
+        if self.read_only || self.is_paused() {
             return;
         }
         let epoch = self.epoch.load(AtomicOrdering::Acquire);
@@ -4843,11 +5039,13 @@ async fn pg_save_snapshot_tx(
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO indexer_meta \
-           (pool_address, next_block, active_root_hex, latest_seq, last_finalized_block, last_finalized_block_hash, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6, now()) \
+           (pool_address, next_block, active_root_hex, latest_seq, last_finalized_block, last_finalized_block_hash, \
+            confirmed_count, last_leaf_block, last_leaf_log_index, checkpoint_version, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1, now()) \
          ON CONFLICT (pool_address) DO UPDATE SET \
            next_block=$2, active_root_hex=$3, latest_seq=$4, \
-           last_finalized_block=$5, last_finalized_block_hash=$6, updated_at=now()",
+           last_finalized_block=$5, last_finalized_block_hash=$6, confirmed_count=$7, \
+           last_leaf_block=$8, last_leaf_log_index=$9, checkpoint_version=1, updated_at=now()",
     )
     .bind(pool_address)
     .bind(snap.next_block as i64)
@@ -4855,6 +5053,9 @@ async fn pg_save_snapshot_tx(
     .bind(snap.latest_seq as i64)
     .bind(snap.last_finalized_block.map(|block| block as i64))
     .bind(&snap.last_finalized_block_hash)
+    .bind(snap.confirmed_count as i64)
+    .bind(snap.last_leaf_key.map(|(block, _)| block as i64))
+    .bind(snap.last_leaf_key.map(|(_, log_index)| log_index as i64))
     .execute(&mut **tx)
     .await
     .context("upsert indexer_meta")?;
@@ -5042,85 +5243,315 @@ async fn pg_commit_incremental_replay(
         .context("commit incremental replay transaction")
 }
 
-/// Load scan scalars + tree leaves + pending txs from PG. Batches are intentionally left
-/// empty: `backfill_from_chain` rebuilds them (and the tree) from the finalized chain;
-/// staged canonical-note activation preserves full history beyond the in-memory ring.
+/// Load a transactional PostgreSQL checkpoint and prove its relational shape is
+/// sufficient for warm-start.  Cryptographic/root and finalized-hash validation
+/// happen later against the rebuilt in-memory tree and live RPC.
 async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> CheckpointData {
-    let meta: Option<(i64, Option<String>, i64, Option<i64>, Option<String>)> = sqlx::query_as(
-        "SELECT next_block, active_root_hex, latest_seq, last_finalized_block, last_finalized_block_hash \
+    type MetaRow = (
+        i64,
+        Option<String>,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        i16,
+    );
+    let label = &pool_address[..10.min(pool_address.len())];
+    let mut warm_rejection: Option<String> = None;
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            eprintln!("[indexer][{label}] cannot open checkpoint snapshot: {error}");
+            return empty_checkpoint(start_block);
+        }
+    };
+    if let Err(error) = sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await
+    {
+        eprintln!("[indexer][{label}] cannot pin checkpoint snapshot: {error}");
+        return empty_checkpoint(start_block);
+    }
+    let meta = match sqlx::query_as::<_, MetaRow>(
+        "SELECT next_block, active_root_hex, latest_seq, last_finalized_block, \
+                last_finalized_block_hash, confirmed_count, last_leaf_block, last_leaf_log_index, \
+                checkpoint_version \
          FROM indexer_meta WHERE pool_address=$1",
     )
     .bind(pool_address)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
-    .ok()
-    .flatten();
-    let (nb, active_root_hex, latest_seq, last_finalized_block, last_finalized_block_hash) = meta
-        .map(|(n, a, l, finalized, hash)| {
-            (
-                n as u64,
-                a,
-                l as u64,
-                finalized.map(|block| block as u64),
-                hash.and_then(|value| normalize_block_hash(&value).ok()),
-            )
-        })
-        .unwrap_or((start_block, None, 0, None, None));
-    let next_block = nb.max(start_block);
-    let active_root = active_root_hex.as_deref().and_then(parse_hex32);
+    {
+        Ok(row) => row,
+        Err(error) => {
+            warm_rejection = Some(format!("load indexer_meta: {error}"));
+            None
+        }
+    };
+    let meta_present = meta.is_some();
+    let (
+        raw_next_block,
+        active_root_hex,
+        raw_latest_seq,
+        raw_finalized_block,
+        raw_finalized_hash,
+        raw_confirmed_count,
+        raw_last_leaf_block,
+        raw_last_leaf_log_index,
+        checkpoint_version,
+    ) = meta.unwrap_or((start_block as i64, None, 0, None, None, None, None, None, 0));
+    if !matches!(checkpoint_version, 0 | 1) {
+        warm_rejection.get_or_insert_with(|| "unsupported checkpoint version".to_string());
+    }
 
-    let leaf_rows: Vec<(String,)> =
-        sqlx::query_as("SELECT cmx_hex FROM cmx_leaves WHERE pool_address=$1 ORDER BY position")
-            .bind(pool_address)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-    let cmx_ordered: Vec<[u8; 32]> = leaf_rows.iter().filter_map(|(h,)| parse_hex32(h)).collect();
+    if raw_next_block < 0 || raw_latest_seq < 0 {
+        warm_rejection.get_or_insert_with(|| "negative checkpoint scalar".to_string());
+    }
+    let next_block = u64::try_from(raw_next_block)
+        .unwrap_or(start_block)
+        .max(start_block);
+    let latest_seq = u64::try_from(raw_latest_seq).unwrap_or(0);
+    let last_finalized_block = raw_finalized_block.and_then(|value| u64::try_from(value).ok());
+    let last_finalized_block_hash = raw_finalized_hash
+        .as_deref()
+        .and_then(|value| normalize_block_hash(value).ok());
+    if raw_finalized_block.is_some() != raw_finalized_hash.is_some()
+        || raw_finalized_block.is_some() != last_finalized_block.is_some()
+        || raw_finalized_hash.is_some() != last_finalized_block_hash.is_some()
+    {
+        warm_rejection.get_or_insert_with(|| "invalid finalized cursor pair".to_string());
+    }
+    let persisted_confirmed_count = raw_confirmed_count.and_then(|value| u64::try_from(value).ok());
+    if checkpoint_version == 1 && persisted_confirmed_count.is_none() {
+        warm_rejection.get_or_insert_with(|| "missing confirmed_count".to_string());
+    }
+    let persisted_last_leaf_key = match (raw_last_leaf_block, raw_last_leaf_log_index) {
+        (Some(block), Some(log_index)) => match (u64::try_from(block), u64::try_from(log_index)) {
+            (Ok(block), Ok(log_index)) => Some((block, log_index)),
+            _ => {
+                if checkpoint_version == 1 {
+                    warm_rejection.get_or_insert_with(|| "negative last-leaf cursor".to_string());
+                }
+                None
+            }
+        },
+        (None, None) => None,
+        _ => {
+            if checkpoint_version == 1 {
+                warm_rejection.get_or_insert_with(|| "incomplete last-leaf cursor".to_string());
+            }
+            None
+        }
+    };
+    let active_root = match active_root_hex.as_deref() {
+        Some(value) => match parse_hex32(value) {
+            Some(root) => Some(root),
+            None => {
+                warm_rejection.get_or_insert_with(|| "invalid active_root_hex".to_string());
+                None
+            }
+        },
+        None => None,
+    };
 
-    let pend_rows: Vec<(String,)> =
-        sqlx::query_as("SELECT tx_hash FROM pending_tx WHERE pool_address=$1")
-            .bind(pool_address)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-    let pending_tx_hashes: VecDeque<String> = pend_rows.into_iter().map(|(h,)| h).collect();
+    let leaf_rows: Vec<(i64, String)> = match sqlx::query_as(
+        "SELECT position, cmx_hex FROM cmx_leaves WHERE pool_address=$1 ORDER BY position",
+    )
+    .bind(pool_address)
+    .fetch_all(&mut *tx)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            warm_rejection.get_or_insert_with(|| format!("load cmx leaves: {error}"));
+            Vec::new()
+        }
+    };
+    let mut cmx_ordered = Vec::with_capacity(leaf_rows.len());
+    for (expected, (position, cmx_hex)) in leaf_rows.iter().enumerate() {
+        if *position != expected as i64 {
+            warm_rejection.get_or_insert_with(|| "non-contiguous cmx positions".to_string());
+        }
+        match parse_hex32(cmx_hex) {
+            Some(cmx) => cmx_ordered.push(cmx),
+            None => {
+                warm_rejection.get_or_insert_with(|| "invalid persisted cmx".to_string());
+            }
+        }
+    }
 
-    // Frozen leaf-delta feed in on-chain order → replayed by wallets to rebuild the Frozen IMT.
-    let frozen_rows: Vec<(String,)> = sqlx::query_as(
+    type NoteIntegrityRow = (String, Option<i64>, i64, i64, bool);
+    let note_rows: Vec<NoteIntegrityRow> = match sqlx::query_as(
+        "SELECT cmx_hex, position, block_number, log_index, is_confirmed \
+         FROM notes WHERE pool_address=$1 ORDER BY position NULLS LAST, cmx_hex",
+    )
+    .bind(pool_address)
+    .fetch_all(&mut *tx)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            warm_rejection.get_or_insert_with(|| format!("load note integrity rows: {error}"));
+            Vec::new()
+        }
+    };
+    if note_rows.len() != cmx_ordered.len() {
+        warm_rejection.get_or_insert_with(|| "note/leaf cardinality mismatch".to_string());
+    }
+    let mut confirmed_cmx = HashSet::new();
+    let mut derived_confirmed_count = 0u64;
+    let mut saw_unconfirmed = false;
+    for (expected, (cmx_hex, position, block, log_index, is_confirmed)) in
+        note_rows.iter().enumerate()
+    {
+        let parsed = parse_hex32(cmx_hex);
+        if *position != Some(expected as i64)
+            || parsed != cmx_ordered.get(expected).copied()
+            || *block < 0
+            || *log_index < 0
+        {
+            warm_rejection.get_or_insert_with(|| "note/leaf position mismatch".to_string());
+        }
+        if *is_confirmed {
+            if saw_unconfirmed {
+                warm_rejection.get_or_insert_with(|| "confirmed note prefix mismatch".to_string());
+            }
+            derived_confirmed_count = derived_confirmed_count.saturating_add(1);
+            if let Some(cmx) = parsed {
+                confirmed_cmx.insert(cmx);
+            }
+        } else {
+            saw_unconfirmed = true;
+        }
+    }
+    let confirmed_count = if checkpoint_version == 1 {
+        let persisted = persisted_confirmed_count.unwrap_or(0);
+        if persisted != derived_confirmed_count {
+            warm_rejection.get_or_insert_with(|| "persisted confirmed_count mismatch".to_string());
+        }
+        persisted
+    } else {
+        derived_confirmed_count
+    };
+    if confirmed_count > cmx_ordered.len() as u64 {
+        warm_rejection.get_or_insert_with(|| "confirmed_count exceeds tree size".to_string());
+    }
+    let archive_last_leaf = note_rows
+        .last()
+        .and_then(|(_, position, block, log_index, _)| {
+            position.map(|_| (*block as u64, *log_index as u64))
+        });
+    let last_leaf_key = if checkpoint_version == 1 {
+        if archive_last_leaf != persisted_last_leaf_key
+            || cmx_ordered.is_empty() != persisted_last_leaf_key.is_none()
+        {
+            warm_rejection.get_or_insert_with(|| "last-leaf cursor mismatch".to_string());
+        }
+        persisted_last_leaf_key
+    } else {
+        archive_last_leaf
+    };
+    match (last_finalized_block, last_finalized_block_hash.as_ref()) {
+        (Some(block), Some(_)) if next_block == block.saturating_add(1) => {}
+        _ => {
+            warm_rejection.get_or_insert_with(|| {
+                "checkpoint is not at a complete finalized boundary".to_string()
+            });
+        }
+    }
+    if last_leaf_key
+        .zip(last_finalized_block)
+        .is_some_and(|((leaf_block, _), finalized_block)| leaf_block > finalized_block)
+    {
+        warm_rejection
+            .get_or_insert_with(|| "last leaf is beyond finalized checkpoint".to_string());
+    }
+
+    let pending_tx_hashes: VecDeque<String> = match sqlx::query_as::<_, (String,)>(
+        "SELECT tx_hash FROM pending_tx WHERE pool_address=$1 ORDER BY inserted_at, tx_hash",
+    )
+    .bind(pool_address)
+    .fetch_all(&mut *tx)
+    .await
+    {
+        Ok(rows) => rows.into_iter().map(|(hash,)| hash).collect(),
+        Err(error) => {
+            warm_rejection.get_or_insert_with(|| format!("load pending txs: {error}"));
+            VecDeque::new()
+        }
+    };
+
+    let frozen_rows: Vec<(String,)> = match sqlx::query_as(
         "SELECT update_json FROM frozen_updates WHERE pool_address=$1 ORDER BY position",
     )
     .bind(pool_address)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
-    .unwrap_or_default();
-    let frozen_updates: Vec<FrozenUpdate> = frozen_rows
-        .iter()
-        .filter_map(|(j,)| serde_json::from_str(j).ok())
-        .collect();
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            warm_rejection.get_or_insert_with(|| format!("load frozen updates: {error}"));
+            Vec::new()
+        }
+    };
+    let mut frozen_updates = Vec::with_capacity(frozen_rows.len());
+    for (json,) in frozen_rows {
+        match serde_json::from_str(&json) {
+            Ok(update) => frozen_updates.push(update),
+            Err(error) => {
+                warm_rejection.get_or_insert_with(|| format!("decode frozen update: {error}"));
+            }
+        }
+    }
 
-    let stats_row: Option<(String, String, String, String)> =
-        sqlx::query_as(
-            "SELECT total_shielded_units, total_shielded_wei, total_unshielded_units, total_unshielded_wei \
-             FROM shield_pool_stats WHERE pool_address=$1",
-        )
-        .bind(pool_address)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    let shield_accounting = stats_row
-        .map(|(tsu, tsw, tuu, tuw)| ShieldAccounting {
-            total_shielded_units: tsu.parse::<u128>().unwrap_or(0),
-            total_shielded_wei: tsw.parse::<u128>().unwrap_or(0),
-            total_unshielded_units: tuu.parse::<u128>().unwrap_or(0),
-            total_unshielded_wei: tuw.parse::<u128>().unwrap_or(0),
-        })
-        .unwrap_or_default();
+    let stats_row: Option<(String, String, String, String)> = match sqlx::query_as(
+        "SELECT total_shielded_units, total_shielded_wei, total_unshielded_units, total_unshielded_wei \
+         FROM shield_pool_stats WHERE pool_address=$1",
+    )
+    .bind(pool_address)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            warm_rejection.get_or_insert_with(|| format!("load shield stats: {error}"));
+            None
+        }
+    };
+    let shield_accounting = match stats_row {
+        Some((tsu, tsw, tuu, tuw)) => match (
+            tsu.parse::<u128>(),
+            tsw.parse::<u128>(),
+            tuu.parse::<u128>(),
+            tuw.parse::<u128>(),
+        ) {
+            (Ok(tsu), Ok(tsw), Ok(tuu), Ok(tuw)) => ShieldAccounting {
+                total_shielded_units: tsu,
+                total_shielded_wei: tsw,
+                total_unshielded_units: tuu,
+                total_unshielded_wei: tuw,
+            },
+            _ => {
+                warm_rejection.get_or_insert_with(|| "invalid persisted shield stats".to_string());
+                ShieldAccounting::default()
+            }
+        },
+        None => ShieldAccounting::default(),
+    };
 
+    if let Err(error) = tx.commit().await {
+        warm_rejection.get_or_insert_with(|| format!("close checkpoint snapshot: {error}"));
+    }
+
+    let warm_start_candidate = meta_present && warm_rejection.is_none();
+    if let Some(reason) = &warm_rejection {
+        eprintln!("[indexer][{label}] checkpoint is not warm-start eligible: {reason}");
+    }
     println!(
-        "[indexer] pg load: pool={} next_block={next_block} leaves={} pending={} frozen_updates={} shielded={} unshielded={}",
-        &pool_address[..10.min(pool_address.len())], cmx_ordered.len(), pending_tx_hashes.len(), frozen_updates.len(),
-        shield_accounting.total_shielded_units, shield_accounting.total_unshielded_units
+        "[indexer] pg load: pool={label} next_block={next_block} leaves={} confirmed={} pending={} frozen_updates={} warm_candidate={warm_start_candidate}",
+        cmx_ordered.len(), confirmed_count, pending_tx_hashes.len(), frozen_updates.len()
     );
     CheckpointData {
         next_block,
@@ -5128,6 +5559,10 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
         last_finalized_block_hash,
         cmx_ordered,
         active_root,
+        confirmed_count,
+        confirmed_cmx,
+        last_leaf_key,
+        warm_start_candidate,
         latest_seq,
         batches: VecDeque::new(),
         pending_tx_hashes,
@@ -5211,10 +5646,15 @@ struct PollContext {
     /// Incremental replay buffers SSE publication until its terminal finalized
     /// hash check succeeds, preventing partial/non-canonical history leakage.
     broadcast_paused: Arc<AtomicBool>,
+    /// Read-only warm-start probe used for blue/green shadow validation.
+    shadow_mode: bool,
 }
 
 impl PollContext {
     async fn begin_canonical_rebuild(&self, generation: &str) -> Result<()> {
+        if self.shadow_mode {
+            return Err(anyhow!("canonical rebuild is disabled in shadow mode"));
+        }
         self.persist.pause_and_invalidate_queued();
         *self.rebuild_generation.write().await = Some(generation.to_string());
         self.rebuild_mutations.lock().await.clear();
@@ -5239,6 +5679,9 @@ impl PollContext {
                     MAX_INCREMENTAL_REPLAY_MUTATIONS,
                 );
             }
+        }
+        if self.shadow_mode {
+            return Ok(());
         }
         let _write_guard = self.backend_write_lock.lock().await;
         self.backend
@@ -5271,6 +5714,10 @@ impl PollContext {
             return Err(anyhow!("no active incremental replay"));
         };
         let mutation_count = mutations.len();
+        if self.shadow_mode {
+            self.persist.resume();
+            return Ok(mutation_count);
+        }
         let result = {
             let _write_guard = self.backend_write_lock.lock().await;
             self.backend
@@ -5328,7 +5775,9 @@ impl PollContext {
     }
 
     async fn mark_canonical_unready(&self) {
-        self.shared.write().await.tree_out_of_order = true;
+        let mut state = self.shared.write().await;
+        state.tree_out_of_order = true;
+        state.confirmed_frontier = None;
     }
 
     async fn broadcast_batches_after(&self, after_seq: u64) {
@@ -5382,6 +5831,187 @@ async fn persisted_finalized_cursor_matches(
     }
 }
 
+fn fr_from_le_hex(value: &str) -> Result<Fr> {
+    let bytes = hex::decode(strip_0x(value)).context("invalid little-endian field hex")?;
+    let repr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("field element must be 32 bytes"))?;
+    Option::from(Fr::from_repr(repr.into()))
+        .ok_or_else(|| anyhow!("non-canonical BN254 field element"))
+}
+
+/// Reconstruct the exact O(1) on-chain frontier from the authentication path of
+/// the final leaf. This performs O(n) Poseidon work once, rather than replaying
+/// 32 hashes for every historical leaf (O(32n)).
+fn frontier_from_tree_prefix(
+    tree: &OrchardCommitmentTree,
+    leaves: &[[u8; 32]],
+    confirmed_count: u64,
+) -> Result<FrontierTree> {
+    if confirmed_count == 0 {
+        return Ok(FrontierTree::new());
+    }
+    let confirmed_count =
+        usize::try_from(confirmed_count).context("confirmed_count does not fit in usize")?;
+    if confirmed_count > leaves.len() {
+        return Err(anyhow!("confirmed_count exceeds checkpoint leaves"));
+    }
+    let final_position = (confirmed_count - 1) as u64;
+    let path = tree
+        .merkle_path_at(final_position, confirmed_count as u64)
+        .ok_or_else(|| anyhow!("cannot derive final-leaf Merkle path"))?;
+    if path.siblings.len() != MERKLE_DEPTH_EVM {
+        return Err(anyhow!(
+            "unexpected Merkle path depth: {}",
+            path.siblings.len()
+        ));
+    }
+    let mut filled = [Fr::ZERO; MERKLE_DEPTH_EVM];
+    let mut node = fr_from_be_bytes(&leaves[final_position as usize])
+        .ok_or_else(|| anyhow!("non-canonical confirmed cmx"))?;
+    for (level, sibling_hex) in path.siblings.iter().enumerate() {
+        let sibling = fr_from_le_hex(sibling_hex)?;
+        if (final_position >> level) & 1 == 0 {
+            filled[level] = node;
+            node = merkle_compress(level as u8, node, sibling);
+        } else {
+            filled[level] = sibling;
+            node = merkle_compress(level as u8, sibling, node);
+        }
+    }
+    Ok(FrontierTree::from_parts(
+        filled,
+        confirmed_count as u64,
+        node,
+    ))
+}
+
+fn checkpoint_tree_and_frontier(
+    leaves: &[[u8; 32]],
+    confirmed_count: u64,
+) -> Result<(OrchardCommitmentTree, FrontierTree)> {
+    let mut tree = OrchardCommitmentTree::new();
+    for leaf in leaves {
+        tree.append(*leaf);
+    }
+    let frontier = frontier_from_tree_prefix(&tree, leaves, confirmed_count)?;
+    // The prefix path above warms the confirmed subtree cache. Warm the small
+    // pending suffix too so /status, /root, and the first witness request do not
+    // pay another O(n) Poseidon pass after health turns green.
+    let _ = tree.latest_root();
+    Ok((tree, frontier))
+}
+
+fn frontier_from_ordered_leaves(leaves: &[[u8; 32]]) -> Result<FrontierTree> {
+    checkpoint_tree_and_frontier(leaves, leaves.len() as u64).map(|(_, frontier)| frontier)
+}
+
+/// Returns the finalized head that the initial incremental catch-up must cover
+/// before health may turn green.
+async fn try_warm_start(ctx: &PollContext) -> Result<Option<u64>> {
+    let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
+    let (candidate, next_block, confirmed_count, active_root, frontier) = {
+        let state = ctx.shared.read().await;
+        (
+            state.warm_start_candidate,
+            state.next_block,
+            state.confirmed_count,
+            state.active_root,
+            state.confirmed_frontier.clone(),
+        )
+    };
+    if !candidate {
+        return Ok(None);
+    }
+    let Some(frontier) = frontier else {
+        ctx.shared.write().await.startup_source = "checkpoint_rejected".to_string();
+        return Ok(None);
+    };
+    let (finalized_head, _) = ctx
+        .rpc
+        .finalized_block()
+        .await
+        .context("resolve finalized head for warm-start")?;
+    if !persisted_finalized_cursor_matches(ctx, finalized_head).await? {
+        ctx.shared.write().await.startup_source = "checkpoint_rejected".to_string();
+        return Err(anyhow!(
+            "persisted finalized cursor is not canonical; reviewed recovery is required"
+        ));
+    }
+
+    let local_root = fr_to_be_bytes(frontier.root());
+    let expected_root = match (confirmed_count, active_root) {
+        (0, None) => EVM_EMPTY_IMT_ROOT,
+        (0, Some(root)) if root == EVM_EMPTY_IMT_ROOT => root,
+        (0, Some(_)) => {
+            ctx.shared.write().await.startup_source = "checkpoint_rejected".to_string();
+            return Ok(None);
+        }
+        (_, Some(root)) => root,
+        (_, None) => {
+            ctx.shared.write().await.startup_source = "checkpoint_rejected".to_string();
+            return Ok(None);
+        }
+    };
+    if local_root != expected_root {
+        eprintln!(
+            "[indexer][{label}] warm checkpoint root mismatch: local={} persisted={} count={confirmed_count}",
+            hex::encode(local_root),
+            hex::encode(expected_root)
+        );
+        ctx.shared.write().await.startup_source = "checkpoint_rejected".to_string();
+        return Ok(None);
+    }
+
+    let chain_count_before = word_to_u64(
+        &ctx.rpc
+            .eth_call_word(&ctx.contract_address, eth_selector(b"confirmedCount()"))
+            .await
+            .context("read confirmedCount for warm-start")?,
+    );
+    let chain_root = ctx
+        .rpc
+        .eth_call_word(&ctx.contract_address, eth_selector(b"confirmedRoot()"))
+        .await
+        .context("read confirmedRoot for warm-start")?;
+    let chain_count = word_to_u64(
+        &ctx.rpc
+            .eth_call_word(&ctx.contract_address, eth_selector(b"confirmedCount()"))
+            .await
+            .context("re-read confirmedCount for warm-start")?,
+    );
+    if chain_count != chain_count_before {
+        return Err(anyhow!(
+            "confirmed watermark changed during warm-start validation: {chain_count_before} -> {chain_count}"
+        ));
+    }
+    if chain_count < confirmed_count || (chain_count == confirmed_count && chain_root != local_root)
+    {
+        eprintln!(
+            "[indexer][{label}] warm checkpoint is ahead of or divergent from chain: checkpoint_count={confirmed_count}, chain_count={chain_count}"
+        );
+        ctx.shared.write().await.startup_source = "checkpoint_rejected".to_string();
+        return Ok(None);
+    }
+
+    let mut state = ctx.shared.write().await;
+    if !state.warm_start_candidate
+        || state.next_block != next_block
+        || state.confirmed_count != confirmed_count
+    {
+        state.startup_source = "checkpoint_rejected".to_string();
+        return Ok(None);
+    }
+    state.confirmed_frontier = Some(frontier);
+    // Stay fail-closed until the incremental suffix reaches `finalized_head`.
+    state.tree_out_of_order = true;
+    state.startup_source = "checkpoint_validated".to_string();
+    println!(
+        "[indexer][{label}] canonical warm-start accepted: next_block={next_block}, confirmed={confirmed_count}, chain_confirmed={chain_count}"
+    );
+    Ok(Some(finalized_head))
+}
+
 async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
     let _ingest = ctx.ingest_lock.lock().await;
     let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
@@ -5429,6 +6059,7 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
         state.latest_seq = 0;
         state.confirmed_cmx.clear();
         state.confirmed_count = 0;
+        state.confirmed_frontier = Some(FrontierTree::new());
         state.active_root = None;
         state.next_block = ctx.start_block;
         state.last_finalized_block = Some(head);
@@ -5439,7 +6070,11 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
         let snap = CheckpointSnapshot::from_state(&state);
         drop(state);
         ctx.finish_canonical_rebuild(&generation, &snap).await?;
-        ctx.shared.write().await.tree_out_of_order = false;
+        {
+            let mut state = ctx.shared.write().await;
+            state.tree_out_of_order = false;
+            state.startup_source = "full_replay".to_string();
+        }
         ctx.mark_canonical_rebuild_ready().await;
         return Ok(());
     }
@@ -5477,6 +6112,7 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
         s.latest_seq = 0;
         s.confirmed_cmx.clear();
         s.confirmed_count = 0;
+        s.confirmed_frontier = None;
         s.active_root = None;
     }
     println!(
@@ -5551,7 +6187,11 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
     let snap = CheckpointSnapshot::from_state(&s);
     drop(s);
     ctx.finish_canonical_rebuild(&generation, &snap).await?;
-    ctx.shared.write().await.tree_out_of_order = false;
+    {
+        let mut state = ctx.shared.write().await;
+        state.tree_out_of_order = false;
+        state.startup_source = "full_replay".to_string();
+    }
     ctx.mark_canonical_rebuild_ready().await;
     println!(
         "[indexer][{label}] finalized backfill complete: {total} log(s), \
@@ -5592,6 +6232,7 @@ async fn catchup_from_chain(ctx: &PollContext) {
         Ok(false) => {
             let mut state = ctx.shared.write().await;
             state.tree_out_of_order = true;
+            state.confirmed_frontier = None;
             ctx.persist.notify(&state);
             drop(state);
             eprintln!(
@@ -5902,17 +6543,66 @@ async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
 /// 4. Also listens for recover_trigger signals from post_notify_tx for immediate recovery.
 /// 5. A concurrent `catchup_from_chain` task reconciles anything the WS silently dropped.
 async fn run_event_loop(ctx: PollContext) -> Result<()> {
-    // Rebuild the commitment tree from chain so the indexer matches on-chain state
-    // (correct leaf positions / root) even after restarts or a partial checkpoint.
-    loop {
-        match backfill_from_chain(&ctx).await {
-            Ok(()) => break,
-            Err(e) => {
+    let label = &ctx.contract_address[..10.min(ctx.contract_address.len())];
+    let warm_target = loop {
+        match try_warm_start(&ctx).await {
+            Ok(Some(target)) => break Some(target),
+            Ok(None) if ctx.shadow_mode => {
+                return Err(anyhow!(
+                    "shadow checkpoint rejected; health remains 503 until the shadow is restarted from a reviewed checkpoint"
+                ));
+            }
+            Ok(None) => break None,
+            Err(error) => {
                 eprintln!(
-                    "[indexer][{}] finalized startup backfill failed closed: {e:#}; retrying in 5s",
-                    &ctx.contract_address[..10.min(ctx.contract_address.len())]
+                    "[indexer][{label}] warm-start validation failed closed: {error:#}; retrying in 5s"
                 );
                 tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    };
+    let mut full_replay_required = warm_target.is_none();
+    if let Some(target) = warm_target {
+        // Reconcile only the post-checkpoint finalized suffix. The checkpoint
+        // remains fail-closed until the captured finalized head is covered.
+        catchup_from_chain(&ctx).await;
+        let caught_up = {
+            let state = ctx.shared.read().await;
+            state
+                .last_finalized_block
+                .is_some_and(|block| block >= target)
+                && state.next_block > target
+        };
+        if caught_up {
+            let mut state = ctx.shared.write().await;
+            state.tree_out_of_order = false;
+            state.startup_source = "checkpoint".to_string();
+            // Primary instances immediately seal a version-1 checkpoint even
+            // when no suffix block needed replay; shadow persistence is a no-op.
+            ctx.persist.notify(&state);
+            println!(
+                "[indexer][{label}] warm-start suffix caught up through finalized block {target}"
+            );
+        } else if ctx.shadow_mode {
+            return Err(anyhow!(
+                "shadow warm-start suffix did not reach finalized block {target}; health remains 503"
+            ));
+        } else {
+            full_replay_required = true;
+        }
+    }
+    if full_replay_required {
+        // A primary instance may bootstrap/repair a legacy checkpoint by doing
+        // the staged full replay. A shadow is never allowed down this path.
+        loop {
+            match backfill_from_chain(&ctx).await {
+                Ok(()) => break,
+                Err(e) => {
+                    eprintln!(
+                        "[indexer][{label}] finalized startup backfill failed closed: {e:#}; retrying in 5s"
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
             }
         }
     }
@@ -5934,11 +6624,17 @@ async fn run_event_loop(ctx: PollContext) -> Result<()> {
                 // getLogs replay) instead of running the incremental catchup.
                 let dirty = { ctx_catchup.shared.read().await.tree_out_of_order };
                 if dirty {
-                    eprintln!(
-                        "[indexer] commitment tree flagged out-of-order — rebuilding from chain"
-                    );
-                    if let Err(e) = backfill_from_chain(&ctx_catchup).await {
-                        eprintln!("[indexer] finalized rebuild failed closed: {e:#}");
+                    if ctx_catchup.shadow_mode {
+                        eprintln!(
+                            "[indexer] shadow commitment tree is unready; full replay is disabled"
+                        );
+                    } else {
+                        eprintln!(
+                            "[indexer] commitment tree flagged out-of-order — rebuilding from chain"
+                        );
+                        if let Err(e) = backfill_from_chain(&ctx_catchup).await {
+                            eprintln!("[indexer] finalized rebuild failed closed: {e:#}");
+                        }
                     }
                 } else {
                     catchup_from_chain(&ctx_catchup).await;
@@ -6267,6 +6963,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                         "[indexer] OUT-OF-ORDER leaf rejected: event {event_id} key={key:?} <= last appended {last:?}; scheduling tree rebuild"
                     );
                     state.tree_out_of_order = true;
+                    state.confirmed_frontier = None;
                     return Ok(());
                 }
             }
@@ -7478,18 +8175,17 @@ mod tests {
     use super::{
         advance_cursor, beacon_words_match, canonical_guard, classify_selector,
         compact_note_mutations, crank_gas_limit, crank_next_delay_secs,
-        decode_frozen_root_updated_log, decode_json_note_archive,
-        eip1967_beacon_slot, encode_crank_root_calldata, factory_log_matches,
-        frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
-        normalize_hex_0x, parse_address_set, parse_bytes32_strict, parse_tx_meta,
-        perc20_deployed_topic0, persist_request_is_current, pg_apply_note_mutations,
-        pg_begin_canonical_rebuild, pg_commit_incremental_replay,
-        pg_finish_canonical_rebuild, push_incremental_replay_mutation,
-        replay_frozen_set, require_admin, require_relayer, rlp_bytes, rlp_list,
-        rlp_uint, validate_log_against_canonical, BatchEnvelope, CheckpointSnapshot,
-        Cli, EthLog, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
-        JsonNoteArchiveUpdate, NoteArchiveMutation, RpcClient,
-        DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS,
+        decode_frozen_root_updated_log, decode_json_note_archive, eip1967_beacon_slot,
+        encode_crank_root_calldata, factory_log_matches, frontier_from_ordered_leaves,
+        frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error, normalize_hex_0x,
+        parse_address_set, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
+        persist_request_is_current, pg_apply_note_mutations, pg_begin_canonical_rebuild,
+        pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
+        push_incremental_replay_mutation, replay_frozen_set, require_admin, require_relayer,
+        rlp_bytes, rlp_list, rlp_uint, validate_log_against_canonical, BatchEnvelope,
+        CheckpointSnapshot, Cli, EthLog, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
+        JsonNoteArchiveUpdate, NoteArchiveMutation, RpcClient, DEFAULT_MAX_BATCHES_IN_MEMORY,
+        MAX_CRANK_GAS_MARGIN_BPS,
     };
 
     fn frozen_update(cmx: &[&str], is_add: &[bool]) -> FrozenUpdate {
@@ -7574,9 +8270,12 @@ mod tests {
     }
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use clap::CommandFactory;
+    use ff::PrimeField;
+    use halo2curves::bn256::Fr;
     use privacy_core::commitment_tree::frontier::{
         FrontierTree, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX,
     };
+    use privacy_core::commitment_tree::frozen::fr_to_be_bytes;
     use privacy_core::ethereum::{update_root_selector, update_roots_selector};
     use privacy_core::types::{OrchardIndexBatch, OrchardIndexedAbiNote};
     use sha3::{Digest, Keccak256};
@@ -7630,6 +8329,68 @@ mod tests {
             gas_price.get_env(),
             Some(std::ffi::OsStr::new("PRIVACYBTC_INDEXER_GAS_PRICE"))
         );
+    }
+
+    #[test]
+    fn shadow_mode_is_configurable_from_the_runtime_environment() {
+        let command = Cli::command();
+        let shadow_mode = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "shadow_mode")
+            .expect("shadow_mode CLI argument");
+        assert_eq!(
+            shadow_mode.get_env(),
+            Some(std::ffi::OsStr::new("PRIVACYBTC_INDEXER_SHADOW_MODE"))
+        );
+        let migrate_only = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "migrate_only")
+            .expect("migrate_only CLI argument");
+        assert_eq!(
+            migrate_only.get_env(),
+            Some(std::ffi::OsStr::new("PRIVACYBTC_INDEXER_MIGRATE_ONLY"))
+        );
+    }
+
+    fn canonical_test_leaf(value: u64) -> [u8; 32] {
+        let mut be: [u8; 32] = Fr::from(value).to_repr().into();
+        be.reverse();
+        be
+    }
+
+    #[test]
+    fn final_leaf_path_reconstructs_exact_crank_frontier() {
+        let leaves: Vec<[u8; 32]> = (1..=65).map(canonical_test_leaf).collect();
+        for size in [0usize, 1, 2, 3, 4, 7, 8, 31, 32, 33, 64, 65] {
+            let restored = frontier_from_ordered_leaves(&leaves[..size])
+                .expect("reconstruct frontier from checkpoint leaves");
+            let mut replayed = FrontierTree::new();
+            for leaf in &leaves[..size] {
+                replayed.insert_be(*leaf);
+            }
+            assert_eq!(restored.next_index(), replayed.next_index(), "size={size}");
+            assert_eq!(restored.filled(), replayed.filled(), "size={size}");
+            assert_eq!(
+                fr_to_be_bytes(restored.root()),
+                fr_to_be_bytes(replayed.root()),
+                "size={size}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "capacity benchmark; run explicitly in release mode"]
+    fn production_sized_checkpoint_frontier_rebuild() {
+        const LEAVES: u64 = 61_504;
+        let leaves: Vec<[u8; 32]> = (1..=LEAVES).map(canonical_test_leaf).collect();
+        let started = std::time::Instant::now();
+        let restored = frontier_from_ordered_leaves(&leaves)
+            .expect("reconstruct production-sized checkpoint frontier");
+        eprintln!(
+            "reconstructed {LEAVES}-leaf frontier in {:?}",
+            started.elapsed()
+        );
+        assert_eq!(restored.next_index(), LEAVES);
     }
 
     #[test]
@@ -7918,12 +8679,18 @@ mod tests {
             serde_json::from_str(r#"{"next_block":7}"#).expect("legacy checkpoint");
         assert_eq!(legacy.last_finalized_block, None);
         assert_eq!(legacy.last_finalized_block_hash, None);
+        assert_eq!(legacy.confirmed_count, None);
+        assert_eq!(legacy.last_leaf_block, None);
+        assert_eq!(legacy.last_leaf_log_index, None);
 
         let hash = format!("0x{}", "ab".repeat(32));
         let current: IndexerCheckpoint = serde_json::from_value(serde_json::json!({
             "next_block": 43,
             "last_finalized_block": 42,
             "last_finalized_block_hash": hash.clone(),
+            "confirmed_count": 9,
+            "last_leaf_block": 41,
+            "last_leaf_log_index": 3,
         }))
         .expect("current checkpoint");
         assert_eq!(current.last_finalized_block, Some(42));
@@ -7931,6 +8698,9 @@ mod tests {
             current.last_finalized_block_hash.as_deref(),
             Some(hash.as_str())
         );
+        assert_eq!(current.confirmed_count, Some(9));
+        assert_eq!(current.last_leaf_block, Some(41));
+        assert_eq!(current.last_leaf_log_index, Some(3));
     }
 
     fn sample_note_envelope(cmx_byte: u8, seq: u64) -> BatchEnvelope {
@@ -8056,6 +8826,78 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn pg_checkpoint_integrity_enables_warm_start_when_database_is_configured() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let pool_address = format!("0x{}", "ec".repeat(20));
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
+
+        let cmx = canonical_test_leaf(77);
+        let note = sample_note_envelope_for_cmx(cmx, 1);
+        let frontier = frontier_from_ordered_leaves(&[cmx]).unwrap();
+        let snap = CheckpointSnapshot {
+            next_block: 102,
+            last_finalized_block: Some(101),
+            last_finalized_block_hash: Some(format!("0x{}", "cd".repeat(32))),
+            cmx_ordered: vec![cmx],
+            active_root: Some(fr_to_be_bytes(frontier.root())),
+            confirmed_count: 1,
+            last_leaf_key: Some((101, 1)),
+            latest_seq: 1,
+            ..CheckpointSnapshot::default()
+        };
+        pg_commit_incremental_replay(
+            &pool,
+            &pool_address,
+            &[
+                NoteArchiveMutation::Upsert(note),
+                NoteArchiveMutation::Confirm { cmx, position: 0 },
+            ],
+            &snap,
+        )
+        .await
+        .unwrap();
+
+        let loaded = pg_load(&pool, &pool_address, 1).await;
+        assert!(loaded.warm_start_candidate);
+        assert_eq!(loaded.confirmed_count, 1);
+        assert_eq!(loaded.last_leaf_key, Some((101, 1)));
+        assert!(loaded.confirmed_cmx.contains(&cmx));
+
+        // Version 0 models an old writer that cannot maintain the new scalar
+        // columns. The read-only snapshot derives them from the atomic note
+        // archive, then the Poseidon/RPC warm-start checks still apply.
+        sqlx::query(
+            "UPDATE indexer_meta SET checkpoint_version=0, confirmed_count=0, \
+             last_leaf_block=NULL, last_leaf_log_index=NULL WHERE pool_address=$1",
+        )
+        .bind(&pool_address)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let legacy_writer = pg_load(&pool, &pool_address, 1).await;
+        assert!(legacy_writer.warm_start_candidate);
+        assert_eq!(legacy_writer.confirmed_count, 1);
+        assert_eq!(legacy_writer.last_leaf_key, Some((101, 1)));
+
+        sqlx::query(
+            "UPDATE indexer_meta SET checkpoint_version=1, confirmed_count=1, \
+             last_leaf_block=101, last_leaf_log_index=2 WHERE pool_address=$1",
+        )
+        .bind(&pool_address)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rejected = pg_load(&pool, &pool_address, 1).await;
+        assert!(!rejected.warm_start_candidate);
+
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
     }
 
     #[tokio::test]

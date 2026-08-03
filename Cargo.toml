@@ -27,4 +27,6 @@ axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.6", features = ["cors", "timeout"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ethabi = "18"
+ff = "0.13"
+halo2curves = { version = "0.10.0", default-features = false }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "migrate"] }
