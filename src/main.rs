@@ -2919,24 +2919,29 @@ async fn get_note(
     let cmx = parse_hex32(&q.cmx)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx hex".to_owned()))?;
 
-    let s = ctx.state.read().await;
-    if s.tree_out_of_order {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "indexer canonical cursor is not verified".to_owned(),
-        ));
-    }
-    for batch in s.batches.iter().rev() {
-        for note in &batch.batch.abi_notes {
-            if note.cmx == cmx {
-                return Ok(Json(note.clone()));
+    {
+        let s = ctx.state.read().await;
+        canonical_guard(s.tree_out_of_order)?;
+        for batch in s.batches.iter().rev() {
+            for note in &batch.batch.abi_notes {
+                if note.cmx == cmx {
+                    return Ok(Json(note.clone()));
+                }
             }
         }
     }
-    Err((
-        StatusCode::NOT_FOUND,
-        "cmx not found in indexer batches".to_owned(),
-    ))
+    // Ring miss: the note is older than the most recent `max_batches` envelopes.
+    // The ring is a hot cache, not the source of truth — answering 404 here would
+    // make an evicted note unspendable (the prover refreshes its witness fields
+    // through this endpoint) and break the wallet's history decrypt.
+    let note = ctx
+        .backend
+        .load_note_by_cmx(&ctx.contract_address, cmx)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "cmx not found in indexer".to_owned()))?;
+    // A cursor mismatch may be detected while the archive query is in flight.
+    require_canonical_context(&ctx).await?;
+    Ok(Json(note))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2970,20 +2975,43 @@ async fn get_tx(
     let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     for ctx in contexts {
         let pool_lc = ctx.contract_address.to_lowercase();
-        let s = ctx.state.read().await;
-        canonical_guard(s.tree_out_of_order)?;
-        for batch in s.batches.iter() {
-            for note in &batch.batch.abi_notes {
-                if normalize_hex_0x(&note.tx_hash).to_lowercase() == want && seen.insert(note.cmx) {
-                    out.push(TxNote {
-                        note: note.clone(),
-                        pool: pool_lc.clone(),
-                        symbol: None,
-                        decimals: None,
-                    });
+        {
+            let s = ctx.state.read().await;
+            canonical_guard(s.tree_out_of_order)?;
+            for batch in s.batches.iter() {
+                for note in &batch.batch.abi_notes {
+                    if normalize_hex_0x(&note.tx_hash).to_lowercase() == want
+                        && seen.insert(note.cmx)
+                    {
+                        out.push(TxNote {
+                            note: note.clone(),
+                            pool: pool_lc.clone(),
+                            symbol: None,
+                            decimals: None,
+                        });
+                    }
                 }
             }
         }
+        // Then the archive, for notes this pool's ring has already evicted. The ring
+        // pass runs first and `seen` dedupes, so an in-ring note keeps its (fresher)
+        // in-memory copy and the archive only ever *adds* rows. A tx whose notes
+        // straddle the eviction boundary would otherwise return a partial list.
+        for note in ctx
+            .backend
+            .load_notes_by_tx_hash(&ctx.contract_address, &want)
+            .await
+        {
+            if seen.insert(note.cmx) {
+                out.push(TxNote {
+                    note,
+                    pool: pool_lc.clone(),
+                    symbol: None,
+                    decimals: None,
+                });
+            }
+        }
+        require_canonical_context(&ctx).await?;
     }
     let pools: std::collections::HashSet<String> = out.iter().map(|n| n.pool.clone()).collect();
     for pool in pools {
@@ -4471,93 +4499,101 @@ impl StateBackend {
         before_seq: u64,
     ) -> Vec<BatchEnvelope> {
         match self {
-            StateBackend::Json(Some(path)) => {
-                let raw = match std::fs::read_to_string(Self::json_archive_path(path)) {
-                    Ok(r) => r,
-                    Err(_) => return Vec::new(),
-                };
-                decode_json_note_archive(&raw, pool_address)
-                    .into_iter()
-                    .filter(|env| env.seq > after_seq && env.seq < before_seq)
-                    .collect()
-            }
+            StateBackend::Json(Some(path)) => Self::read_json_archive(path, pool_address)
+                .into_iter()
+                .filter(|env| env.seq > after_seq && env.seq < before_seq)
+                .collect(),
             StateBackend::Json(None) => Vec::new(),
             StateBackend::Pgsql(pool) => {
-                type NoteRow = (
-                    String,         // cmx_hex
-                    i64,            // seq
-                    i64,            // block_number
-                    String,         // tx_hash
-                    i64,            // log_index
-                    Option<i64>,    // position
-                    String,         // enc_ciphertext_hex
-                    String,         // epk_hex
-                    String,         // out_ciphertext_hex
-                    Option<String>, // cv_net_x_hex
-                    String,         // nf_old_hex
-                    String,         // ack_hash_hex
-                    Option<i64>,    // shield_amount_sats
-                    bool,           // is_confirmed
-                );
-                let rows: Vec<NoteRow> = sqlx::query_as(
-                    "SELECT cmx_hex, seq, block_number, tx_hash, log_index, position, \
-                       enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, \
-                       nf_old_hex, ack_hash_hex, shield_amount_sats, is_confirmed \
-                     FROM notes WHERE pool_address=$1 AND seq > $2 AND seq < $3 ORDER BY seq",
-                )
+                let rows: Vec<NoteRow> = sqlx::query_as(&format!(
+                    "{NOTE_SELECT_PREFIX} WHERE pool_address=$1 AND seq > $2 AND seq < $3 \
+                     ORDER BY seq"
+                ))
                 .bind(pool_address)
                 .bind(after_seq as i64)
                 .bind(before_seq as i64)
                 .fetch_all(pool)
                 .await
                 .unwrap_or_default();
+                note_rows_into_envelopes(rows, pool_address)
+            }
+        }
+    }
 
-                rows.into_iter()
-                    .filter_map(|r| {
-                        let (
-                            cmx_hex,
-                            seq,
-                            block_number,
-                            tx_hash,
-                            log_index,
-                            position,
-                            enc_hex,
-                            epk_hex,
-                            out_hex,
-                            cv_hex,
-                            nf_hex,
-                            ack_hex,
-                            shield,
-                            confirmed,
-                        ) = r;
-                        let note = OrchardIndexedAbiNote {
-                            block_number: block_number as u64,
-                            tx_hash,
-                            log_index: log_index as u64,
-                            cmx: parse_hex32(&cmx_hex)?,
-                            enc_ciphertext: hex::decode(strip_0x(&enc_hex)).ok()?,
-                            epk: parse_hex32(&epk_hex)?,
-                            out_ciphertext: hex::decode(strip_0x(&out_hex)).unwrap_or_default(),
-                            cv_net_x: cv_hex.as_deref().and_then(parse_hex32),
-                            nf_old: parse_hex32(&nf_hex)?,
-                            ack_hash: parse_hex32(&ack_hex)?,
-                            cmx_position: position.map(|p| p as u64),
-                            shield_amount_sats: shield.map(|v| v as u64),
-                            is_confirmed: confirmed,
-                        };
-                        Some(BatchEnvelope {
-                            seq: seq as u64,
-                            pool_address: Some(pool_address.to_string()),
-                            batch: OrchardIndexBatch {
-                                from_block: note.block_number,
-                                to_block: note.block_number,
-                                abi_notes: vec![note],
-                                bundles: vec![],
-                                latest_root: None,
-                            },
-                        })
-                    })
-                    .collect()
+    /// Read + decode the whole JSON note archive. JSON mode is a development
+    /// backend: this is O(total history) per call, which is why production must
+    /// run on PostgreSQL (see `load_note_by_cmx` / `load_notes_by_tx_hash`).
+    fn read_json_archive(path: &str, pool_address: &str) -> Vec<BatchEnvelope> {
+        match std::fs::read_to_string(Self::json_archive_path(path)) {
+            Ok(raw) => decode_json_note_archive(&raw, pool_address),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Point lookup of one archived note by cmx.
+    ///
+    /// The in-memory ring only holds the most recent `max_batches` envelopes, so a
+    /// ring scan alone answers `/note` with a false 404 for any note the ring has
+    /// already evicted. `notes` is keyed by `(pool_address, cmx_hex)`, so on
+    /// PostgreSQL this is a primary-key hit — cheaper than the ring scan it backs up.
+    async fn load_note_by_cmx(
+        &self,
+        pool_address: &str,
+        cmx: [u8; 32],
+    ) -> Option<OrchardIndexedAbiNote> {
+        match self {
+            StateBackend::Json(Some(path)) => Self::read_json_archive(path, pool_address)
+                .into_iter()
+                .find_map(|env| env.batch.abi_notes.into_iter().find(|note| note.cmx == cmx)),
+            StateBackend::Json(None) => None,
+            StateBackend::Pgsql(pool) => {
+                let row: Option<NoteRow> = sqlx::query_as(&format!(
+                    "{NOTE_SELECT_PREFIX} WHERE pool_address=$1 AND cmx_hex=$2"
+                ))
+                .bind(pool_address)
+                .bind(hex::encode(cmx))
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+                row.and_then(note_row_into_note)
+            }
+        }
+    }
+
+    /// Every archived note added by one transaction, oldest first.
+    ///
+    /// `tx_hash` is stored verbatim as it came off the log, so both sides are
+    /// normalised the same way the in-memory scan normalises them. The PostgreSQL
+    /// predicate matches `notes_tx_hash_idx` (`lower(tx_hash)`, migration 0007) —
+    /// changing it without changing the index turns this into a sequential scan.
+    async fn load_notes_by_tx_hash(
+        &self,
+        pool_address: &str,
+        tx_hash: &str,
+    ) -> Vec<OrchardIndexedAbiNote> {
+        let want = normalize_hex_0x(tx_hash).to_lowercase();
+        match self {
+            StateBackend::Json(Some(path)) => Self::read_json_archive(path, pool_address)
+                .into_iter()
+                .flat_map(|env| env.batch.abi_notes)
+                .filter(|note| normalize_hex_0x(&note.tx_hash).to_lowercase() == want)
+                .collect(),
+            StateBackend::Json(None) => Vec::new(),
+            StateBackend::Pgsql(pool) => {
+                // Accept either storage convention (`0x`-prefixed or bare) so the
+                // lookup cannot miss rows written before any normalisation existed.
+                let candidates = vec![want.clone(), strip_0x(&want).to_owned()];
+                let rows: Vec<NoteRow> = sqlx::query_as(&format!(
+                    "{NOTE_SELECT_PREFIX} WHERE pool_address=$1 \
+                       AND lower(tx_hash) = ANY($2::text[]) ORDER BY seq"
+                ))
+                .bind(pool_address)
+                .bind(&candidates)
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+                rows.into_iter().filter_map(note_row_into_note).collect()
             }
         }
     }
@@ -4789,6 +4825,89 @@ const NOTE_COLUMNS: &str = "\
 pool_address, cmx_hex, seq, block_number, tx_hash, log_index, position, \
 enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, nf_old_hex, ack_hash_hex, \
 shield_amount_sats, is_confirmed";
+
+/// Column list + FROM for every `notes` read. Its order defines `NoteRow`, so the
+/// two must be changed together.
+const NOTE_SELECT_PREFIX: &str = "\
+SELECT cmx_hex, seq, block_number, tx_hash, log_index, position, \
+enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, \
+nf_old_hex, ack_hash_hex, shield_amount_sats, is_confirmed \
+FROM notes";
+
+/// One `notes` row in `NOTE_SELECT_PREFIX` column order.
+type NoteRow = (
+    String,         // cmx_hex
+    i64,            // seq
+    i64,            // block_number
+    String,         // tx_hash
+    i64,            // log_index
+    Option<i64>,    // position
+    String,         // enc_ciphertext_hex
+    String,         // epk_hex
+    String,         // out_ciphertext_hex
+    Option<String>, // cv_net_x_hex
+    String,         // nf_old_hex
+    String,         // ack_hash_hex
+    Option<i64>,    // shield_amount_sats
+    bool,           // is_confirmed
+);
+
+/// Decode a `notes` row. Returns `None` for a row whose hex columns are malformed,
+/// so one corrupt row cannot fail an entire query.
+fn note_row_into_note(row: NoteRow) -> Option<OrchardIndexedAbiNote> {
+    let (
+        cmx_hex,
+        _seq,
+        block_number,
+        tx_hash,
+        log_index,
+        position,
+        enc_hex,
+        epk_hex,
+        out_hex,
+        cv_hex,
+        nf_hex,
+        ack_hex,
+        shield,
+        confirmed,
+    ) = row;
+    Some(OrchardIndexedAbiNote {
+        block_number: block_number as u64,
+        tx_hash,
+        log_index: log_index as u64,
+        cmx: parse_hex32(&cmx_hex)?,
+        enc_ciphertext: hex::decode(strip_0x(&enc_hex)).ok()?,
+        epk: parse_hex32(&epk_hex)?,
+        out_ciphertext: hex::decode(strip_0x(&out_hex)).unwrap_or_default(),
+        cv_net_x: cv_hex.as_deref().and_then(parse_hex32),
+        nf_old: parse_hex32(&nf_hex)?,
+        ack_hash: parse_hex32(&ack_hex)?,
+        cmx_position: position.map(|p| p as u64),
+        shield_amount_sats: shield.map(|v| v as u64),
+        is_confirmed: confirmed,
+    })
+}
+
+/// Wrap `notes` rows back into the one-note-per-envelope shape `/batches` serves.
+fn note_rows_into_envelopes(rows: Vec<NoteRow>, pool_address: &str) -> Vec<BatchEnvelope> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let seq = row.1 as u64;
+            let note = note_row_into_note(row)?;
+            Some(BatchEnvelope {
+                seq,
+                pool_address: Some(pool_address.to_string()),
+                batch: OrchardIndexBatch {
+                    from_block: note.block_number,
+                    to_block: note.block_number,
+                    abi_notes: vec![note],
+                    bundles: vec![],
+                    latest_root: None,
+                },
+            })
+        })
+        .collect()
+}
 
 const NOTE_UPDATE_FROM_EXCLUDED: &str = "\
 seq=EXCLUDED.seq, block_number=EXCLUDED.block_number, tx_hash=EXCLUDED.tx_hash, \
@@ -8191,10 +8310,10 @@ mod tests {
         persist_request_is_current, pg_apply_note_mutations, pg_begin_canonical_rebuild,
         pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
         push_incremental_replay_mutation, replay_frozen_set, require_admin, require_relayer,
-        rlp_bytes, rlp_list, rlp_uint, validate_log_against_canonical, BatchEnvelope,
+        rlp_bytes, rlp_list, rlp_uint, strip_0x, validate_log_against_canonical, BatchEnvelope,
         CheckpointSnapshot, Cli, EthLog, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
-        JsonNoteArchiveUpdate, NoteArchiveMutation, RpcClient, DEFAULT_MAX_BATCHES_IN_MEMORY,
-        MAX_CRANK_GAS_MARGIN_BPS,
+        JsonNoteArchiveUpdate, NoteArchiveMutation, RpcClient, StateBackend,
+        DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS,
     };
 
     fn frozen_update(cmx: &[&str], is_add: &[bool]) -> FrozenUpdate {
@@ -8825,6 +8944,143 @@ mod tests {
         assert!(note.is_confirmed);
         assert_eq!(note.shield_amount_sats, Some(500));
         assert_eq!(decoded[0].pool_address.as_deref(), Some(pool.as_str()));
+    }
+
+    /// `/note` and `/tx` fall back to the archive once the ring evicts a note, so
+    /// both point lookups must resolve notes the in-memory ring no longer holds.
+    #[tokio::test]
+    async fn json_archive_point_lookups_find_notes_evicted_from_the_ring() {
+        let dir = std::env::temp_dir().join(format!("indexer-pointlookup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        let state_path = state_path.to_str().unwrap().to_owned();
+        let archive_path = StateBackend::json_archive_path(&state_path);
+        let _ = std::fs::remove_file(&archive_path);
+
+        let pool = format!("0x{}", "11".repeat(20));
+        // Two notes in one tx (recipient + change), plus an unrelated third.
+        let mut first = sample_note_envelope(0x33, 9);
+        let mut second = sample_note_envelope(0x44, 10);
+        let shared_tx = format!("0x{}", "ab".repeat(32));
+        first.batch.abi_notes[0].tx_hash = shared_tx.clone();
+        second.batch.abi_notes[0].tx_hash = shared_tx.to_uppercase();
+        let other = sample_note_envelope(0x55, 11);
+        for env in [&first, &second, &other] {
+            StateBackend::append_json_line(&archive_path, env).unwrap();
+        }
+        let backend = StateBackend::Json(Some(state_path));
+
+        let found = backend.load_note_by_cmx(&pool, [0x33; 32]).await;
+        assert_eq!(found.map(|n| n.cmx), Some([0x33; 32]));
+        assert!(backend.load_note_by_cmx(&pool, [0x99; 32]).await.is_none());
+
+        // Casing and `0x` prefix are normalised on both sides, and the unrelated
+        // note must not leak into the result.
+        for needle in [
+            shared_tx.as_str(),
+            &shared_tx.to_uppercase(),
+            strip_0x(&shared_tx),
+        ] {
+            let mut notes = backend.load_notes_by_tx_hash(&pool, needle).await;
+            notes.sort_by_key(|n| n.cmx);
+            assert_eq!(
+                notes.iter().map(|n| n.cmx).collect::<Vec<_>>(),
+                vec![[0x33; 32], [0x44; 32]],
+                "tx lookup failed for needle {needle}"
+            );
+        }
+        assert!(backend
+            .load_notes_by_tx_hash(&pool, &format!("0x{}", "cd".repeat(32)))
+            .await
+            .is_empty());
+
+        let _ = std::fs::remove_file(&archive_path);
+    }
+
+    /// The PostgreSQL `/tx` predicate must match `notes_tx_hash_idx` (migration
+    /// 0007). `enable_seqscan=off` asserts the index is *usable* by the query —
+    /// asserting the planner *chose* it would fail spuriously on a small table,
+    /// where a sequential scan is genuinely cheaper.
+    #[tokio::test]
+    async fn pg_note_and_tx_point_lookups_use_the_archive_when_database_is_configured() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pg = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pg).await.unwrap();
+        let pool_address = format!("0x{}", "b7".repeat(20));
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
+
+        let shared_tx = format!("0x{}", "ab".repeat(32));
+        let mut first = sample_note_envelope(0x33, 9);
+        let mut second = sample_note_envelope(0x44, 10);
+        first.batch.abi_notes[0].tx_hash = shared_tx.clone();
+        // Stored verbatim from the log, so the archive must tolerate mixed casing.
+        second.batch.abi_notes[0].tx_hash = shared_tx.to_uppercase();
+        let backend = StateBackend::Pgsql(pg.clone());
+        backend
+            .apply_note_mutations(
+                &pool_address,
+                None,
+                &[
+                    NoteArchiveMutation::Upsert(first),
+                    NoteArchiveMutation::Upsert(second),
+                    NoteArchiveMutation::Upsert(sample_note_envelope(0x55, 11)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let found = backend.load_note_by_cmx(&pool_address, [0x44; 32]).await;
+        assert_eq!(found.map(|n| n.cmx), Some([0x44; 32]));
+        assert!(backend
+            .load_note_by_cmx(&pool_address, [0x99; 32])
+            .await
+            .is_none());
+
+        let mut notes = backend
+            .load_notes_by_tx_hash(&pool_address, &shared_tx)
+            .await;
+        notes.sort_by_key(|n| n.cmx);
+        assert_eq!(
+            notes.iter().map(|n| n.cmx).collect::<Vec<_>>(),
+            vec![[0x33; 32], [0x44; 32]]
+        );
+
+        // Only the forced plan is asserted. On a table this small Postgres will
+        // reasonably prefer a sequential scan (or another index), so asserting the
+        // *chosen* plan would be flaky in both directions — it would fail on a
+        // legitimate small-table plan, and it would pass on a bare `Seq Scan`,
+        // which is precisely the outcome the index exists to prevent.
+        sqlx::query("SET enable_seqscan = off")
+            .execute(&pg)
+            .await
+            .unwrap();
+        let forced: Vec<(String,)> = sqlx::query_as(
+            "EXPLAIN SELECT cmx_hex FROM notes \
+             WHERE pool_address=$1 AND lower(tx_hash) = ANY($2::text[])",
+        )
+        .bind(&pool_address)
+        .bind(vec![shared_tx.to_lowercase()])
+        .fetch_all(&pg)
+        .await
+        .unwrap();
+        let forced = forced
+            .into_iter()
+            .map(|(line,)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        sqlx::query("SET enable_seqscan = on")
+            .execute(&pg)
+            .await
+            .unwrap();
+        assert!(
+            forced.contains("notes_tx_hash_idx"),
+            "the /tx predicate cannot use notes_tx_hash_idx; it would seq-scan `notes` \
+             at production size. Plan:\n{forced}"
+        );
+
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
     }
 
     async fn clear_pg_rebuild_test_pool(pool: &sqlx::PgPool, pool_address: &str) {
