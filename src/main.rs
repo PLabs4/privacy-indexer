@@ -375,6 +375,13 @@ fn parse_bool_flag(s: &str) -> Result<bool, String> {
     }
 }
 
+/// Compose may retain a key with an empty value when an inherited production
+/// secret is deliberately cleared for a read-only process. Treat whitespace-only
+/// values as absent while preserving the fail-closed handling of any real key.
+fn nonempty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 // ─── Domain types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -1501,6 +1508,7 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     let bind: SocketAddr = cli.bind.parse().context("invalid --bind address")?;
+    let signer_key = nonempty_trimmed(cli.signer_key.as_deref());
     if cli.migrate_only && cli.shadow_mode {
         return Err(anyhow!(
             "migrate-only and shadow mode are mutually exclusive"
@@ -1517,7 +1525,7 @@ async fn main() -> Result<()> {
                 "shadow mode requires PRIVACYBTC_INDEXER_DATABASE_URL"
             ));
         }
-        if cli.crank || cli.signer_key.is_some() {
+        if cli.crank || signer_key.is_some() {
             return Err(anyhow!(
                 "shadow mode forbids crank and signer configuration"
             ));
@@ -1530,7 +1538,7 @@ async fn main() -> Result<()> {
     let signer = if cli.migrate_only {
         None
     } else {
-        match &cli.signer_key {
+        match signer_key {
             Some(key) => {
                 let cfg = SignerConfig::from_hex_key(key, cli.chain_id, cli.gas_price)?;
                 let addr_hex = hex::encode(cfg.address);
@@ -8177,8 +8185,9 @@ mod tests {
         compact_note_mutations, crank_gas_limit, crank_next_delay_secs,
         decode_frozen_root_updated_log, decode_json_note_archive, eip1967_beacon_slot,
         encode_crank_root_calldata, factory_log_matches, frontier_from_ordered_leaves,
-        frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error, normalize_hex_0x,
-        parse_address_set, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
+        frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error, nonempty_trimmed,
+        normalize_hex_0x, parse_address_set, parse_bytes32_strict, parse_tx_meta,
+        perc20_deployed_topic0,
         persist_request_is_current, pg_apply_note_mutations, pg_begin_canonical_rebuild,
         pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
         push_incremental_replay_mutation, replay_frozen_set, require_admin, require_relayer,
@@ -8350,6 +8359,14 @@ mod tests {
             migrate_only.get_env(),
             Some(std::ffi::OsStr::new("PRIVACYBTC_INDEXER_MIGRATE_ONLY"))
         );
+    }
+
+    #[test]
+    fn empty_inherited_signer_is_not_configured() {
+        assert_eq!(nonempty_trimmed(None), None);
+        assert_eq!(nonempty_trimmed(Some("")), None);
+        assert_eq!(nonempty_trimmed(Some("   \t")), None);
+        assert_eq!(nonempty_trimmed(Some(" 0x1234 ")), Some("0x1234"));
     }
 
     fn canonical_test_leaf(value: u64) -> [u8; 32] {
