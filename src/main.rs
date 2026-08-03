@@ -525,6 +525,8 @@ struct AppContext {
     /// in-memory ring (the ring is a hot cache, NOT the source of truth).
     backend: StateBackend,
     shadow_mode: bool,
+    /// Ring-miss / recovery-source counters, shared with this pool's event loop.
+    ring_recovery: Arc<RingRecoveryMetrics>,
 }
 
 /// Everything required to construct a per-pool `AppContext` and spawn its WS
@@ -707,6 +709,7 @@ impl PoolBuilder {
         let recover_trigger = Arc::new(tokio::sync::Notify::new());
 
         let ingest_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let ring_recovery = Arc::new(RingRecoveryMetrics::default());
         let poll_ctx = PollContext {
             rpc: self.rpc.clone(),
             wss_url: self.wss_url.clone(),
@@ -725,6 +728,7 @@ impl PoolBuilder {
             incremental_replay_mutations: Arc::new(tokio::sync::Mutex::new(None)),
             broadcast_paused: Arc::new(AtomicBool::new(false)),
             shadow_mode: self.shadow_mode,
+            ring_recovery: Arc::clone(&ring_recovery),
         };
         let addr_label = contract_address.to_string();
         tokio::spawn(async move {
@@ -742,6 +746,7 @@ impl PoolBuilder {
             recover_trigger,
             backend,
             shadow_mode: self.shadow_mode,
+            ring_recovery,
         }
     }
 }
@@ -1469,6 +1474,15 @@ struct StatusResponse {
     /// Pool contract address this indexer instance is watching (0x-prefixed lowercase).
     /// Allows clients querying multiple indexer instances to identify which pool each serves.
     pool_address: String,
+    /// Re-emission lookups the `batches` ring could not answer, and where the
+    /// payload came from instead. A steadily rising `ring_misses` means
+    /// `--max-batches-in-memory` no longer covers the lag between a note's
+    /// `NoteAdded` and its `NoteConfirmed`; `ring_recovery_unrecovered` rising
+    /// means the archive is incomplete and those notes were never republished.
+    ring_misses: u64,
+    ring_recovery_from_buffer: u64,
+    ring_recovery_from_archive: u64,
+    ring_recovery_unrecovered: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -2780,6 +2794,14 @@ async fn status(
         confirmed_count: s.confirmed_count,
         pending_cmx: s.tree.size().saturating_sub(s.confirmed_count),
         pool_address: ctx.contract_address.clone(),
+        ring_misses: RingRecoveryMetrics::get(&ctx.ring_recovery.ring_misses),
+        ring_recovery_from_buffer: RingRecoveryMetrics::get(
+            &ctx.ring_recovery.recovered_from_buffer,
+        ),
+        ring_recovery_from_archive: RingRecoveryMetrics::get(
+            &ctx.ring_recovery.recovered_from_archive,
+        ),
+        ring_recovery_unrecovered: RingRecoveryMetrics::get(&ctx.ring_recovery.unrecovered),
     }))
 }
 
@@ -2936,7 +2958,7 @@ async fn get_note(
     // through this endpoint) and break the wallet's history decrypt.
     let note = ctx
         .backend
-        .load_note_by_cmx(&ctx.contract_address, cmx)
+        .load_note_by_cmx(&ctx.contract_address, None, cmx)
         .await
         .ok_or_else(|| (StatusCode::NOT_FOUND, "cmx not found in indexer".to_owned()))?;
     // A cursor mismatch may be detected while the archive query is in flight.
@@ -4292,6 +4314,54 @@ enum NoteArchiveMutation {
     },
 }
 
+/// How often the `batches` ring failed to answer a re-emission lookup, and where
+/// the payload was recovered from instead.
+///
+/// A ring miss is not an error — the archive fallback makes it correct — but the
+/// rate is the signal for sizing `--max-batches-in-memory`: a steadily non-zero
+/// `ring_misses` means the ring no longer covers the lag between a note's
+/// `NoteAdded` and its `NoteConfirmed`. `unrecovered` is the one that indicates a
+/// real problem: the payload was in neither the ring nor the archive, so the
+/// confirmation could not be republished at all.
+#[derive(Debug, Default)]
+struct RingRecoveryMetrics {
+    /// Re-emission lookups the ring could not answer (all event kinds).
+    ring_misses: AtomicU64,
+    /// Recovered from the uncommitted rebuild/incremental-replay buffer.
+    recovered_from_buffer: AtomicU64,
+    /// Recovered from the persisted archive (PostgreSQL row or JSON line).
+    recovered_from_archive: AtomicU64,
+    /// Found in neither. The note is not republished with a new seq.
+    unrecovered: AtomicU64,
+}
+
+impl RingRecoveryMetrics {
+    fn get(counter: &AtomicU64) -> u64 {
+        counter.load(AtomicOrdering::Relaxed)
+    }
+
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Newest buffered `Upsert` payload for `cmx`, if any. Scans in reverse because a
+/// note can be upserted more than once in a batch and the last write is current.
+fn latest_upserted_note(
+    mutations: &[NoteArchiveMutation],
+    cmx: [u8; 32],
+) -> Option<OrchardIndexedAbiNote> {
+    mutations.iter().rev().find_map(|mutation| match mutation {
+        NoteArchiveMutation::Upsert(env) => env
+            .batch
+            .abi_notes
+            .iter()
+            .find(|note| note.cmx == cmx)
+            .cloned(),
+        _ => None,
+    })
+}
+
 fn push_incremental_replay_mutation(
     buffered: &mut Vec<NoteArchiveMutation>,
     mutation: NoteArchiveMutation,
@@ -4506,8 +4576,8 @@ impl StateBackend {
             StateBackend::Json(None) => Vec::new(),
             StateBackend::Pgsql(pool) => {
                 let rows: Vec<NoteRow> = sqlx::query_as(&format!(
-                    "{NOTE_SELECT_PREFIX} WHERE pool_address=$1 AND seq > $2 AND seq < $3 \
-                     ORDER BY seq"
+                    "SELECT {NOTE_SELECT_COLUMNS} FROM notes \
+                     WHERE pool_address=$1 AND seq > $2 AND seq < $3 ORDER BY seq"
                 ))
                 .bind(pool_address)
                 .bind(after_seq as i64)
@@ -4536,24 +4606,48 @@ impl StateBackend {
     /// ring scan alone answers `/note` with a false 404 for any note the ring has
     /// already evicted. `notes` is keyed by `(pool_address, cmx_hex)`, so on
     /// PostgreSQL this is a primary-key hit — cheaper than the ring scan it backs up.
+    /// `rebuild_generation` selects the staging table a canonical rebuild writes
+    /// to. Passing `None` during a rebuild would read the *previous* generation:
+    /// same cmx means the same note, so the payload would still be correct, but
+    /// the read is kept inside the active generation so an isolated rebuild stays
+    /// isolated.
     async fn load_note_by_cmx(
         &self,
         pool_address: &str,
+        rebuild_generation: Option<&str>,
         cmx: [u8; 32],
     ) -> Option<OrchardIndexedAbiNote> {
         match self {
-            StateBackend::Json(Some(path)) => Self::read_json_archive(path, pool_address)
-                .into_iter()
-                .find_map(|env| env.batch.abi_notes.into_iter().find(|note| note.cmx == cmx)),
+            StateBackend::Json(Some(path)) => {
+                let path = match rebuild_generation {
+                    Some(_) => Self::json_rebuild_archive_path(path),
+                    None => Self::json_archive_path(path),
+                };
+                let raw = std::fs::read_to_string(path).ok()?;
+                decode_json_note_archive(&raw, pool_address)
+                    .into_iter()
+                    .find_map(|env| env.batch.abi_notes.into_iter().find(|note| note.cmx == cmx))
+            }
             StateBackend::Json(None) => None,
             StateBackend::Pgsql(pool) => {
-                let row: Option<NoteRow> = sqlx::query_as(&format!(
-                    "{NOTE_SELECT_PREFIX} WHERE pool_address=$1 AND cmx_hex=$2"
-                ))
-                .bind(pool_address)
-                .bind(hex::encode(cmx))
-                .fetch_optional(pool)
-                .await
+                let row: Option<NoteRow> = match rebuild_generation {
+                    Some(generation) => sqlx::query_as(&format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes_rebuild \
+                           WHERE pool_address=$1 AND rebuild_generation=$2 AND cmx_hex=$3"
+                    ))
+                    .bind(pool_address)
+                    .bind(generation)
+                    .bind(hex::encode(cmx))
+                    .fetch_optional(pool)
+                    .await,
+                    None => sqlx::query_as(&format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes WHERE pool_address=$1 AND cmx_hex=$2"
+                    ))
+                    .bind(pool_address)
+                    .bind(hex::encode(cmx))
+                    .fetch_optional(pool)
+                    .await,
+                }
                 .ok()
                 .flatten();
                 row.and_then(note_row_into_note)
@@ -4585,7 +4679,7 @@ impl StateBackend {
                 // lookup cannot miss rows written before any normalisation existed.
                 let candidates = vec![want.clone(), strip_0x(&want).to_owned()];
                 let rows: Vec<NoteRow> = sqlx::query_as(&format!(
-                    "{NOTE_SELECT_PREFIX} WHERE pool_address=$1 \
+                    "SELECT {NOTE_SELECT_COLUMNS} FROM notes WHERE pool_address=$1 \
                        AND lower(tx_hash) = ANY($2::text[]) ORDER BY seq"
                 ))
                 .bind(pool_address)
@@ -4826,15 +4920,14 @@ pool_address, cmx_hex, seq, block_number, tx_hash, log_index, position, \
 enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, nf_old_hex, ack_hash_hex, \
 shield_amount_sats, is_confirmed";
 
-/// Column list + FROM for every `notes` read. Its order defines `NoteRow`, so the
-/// two must be changed together.
-const NOTE_SELECT_PREFIX: &str = "\
-SELECT cmx_hex, seq, block_number, tx_hash, log_index, position, \
+/// Column list for every note read, in the order `NoteRow` decodes them — the two
+/// must be changed together. `notes` and `notes_rebuild` share these columns.
+const NOTE_SELECT_COLUMNS: &str = "\
+cmx_hex, seq, block_number, tx_hash, log_index, position, \
 enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, \
-nf_old_hex, ack_hash_hex, shield_amount_sats, is_confirmed \
-FROM notes";
+nf_old_hex, ack_hash_hex, shield_amount_sats, is_confirmed";
 
-/// One `notes` row in `NOTE_SELECT_PREFIX` column order.
+/// One note row in `NOTE_SELECT_COLUMNS` order.
 type NoteRow = (
     String,         // cmx_hex
     i64,            // seq
@@ -5775,6 +5868,8 @@ struct PollContext {
     broadcast_paused: Arc<AtomicBool>,
     /// Read-only warm-start probe used for blue/green shadow validation.
     shadow_mode: bool,
+    /// Ring-miss / recovery-source counters, shared with this pool's HTTP context.
+    ring_recovery: Arc<RingRecoveryMetrics>,
 }
 
 impl PollContext {
@@ -5814,6 +5909,42 @@ impl PollContext {
         self.backend
             .apply_note_mutations(&self.contract_address, None, &[mutation])
             .await
+    }
+
+    /// Recover a note's full payload after the ring has evicted it, so its
+    /// `NoteConfirmed` can still be republished with a fresh seq.
+    ///
+    /// Search order mirrors `archive_note_mutation`'s write order: mutations are
+    /// buffered in memory during a canonical rebuild or an incremental replay and
+    /// only reach the tables when that batch commits, so whichever sink is
+    /// currently being written to holds the newest rows and is searched first.
+    /// Skipping the buffer would miss a note whose `NoteAdded` is in the same
+    /// uncommitted batch as its `NoteConfirmed` — exactly the case a long
+    /// catch-up produces.
+    async fn recover_evicted_note(&self, cmx: [u8; 32]) -> Option<OrchardIndexedAbiNote> {
+        RingRecoveryMetrics::bump(&self.ring_recovery.ring_misses);
+        let generation = self.rebuild_generation.read().await.clone();
+        if generation.is_some() {
+            if let Some(note) = latest_upserted_note(&self.rebuild_mutations.lock().await, cmx) {
+                RingRecoveryMetrics::bump(&self.ring_recovery.recovered_from_buffer);
+                return Some(note);
+            }
+        } else if let Some(buffered) = self.incremental_replay_mutations.lock().await.as_ref() {
+            if let Some(note) = latest_upserted_note(buffered, cmx) {
+                RingRecoveryMetrics::bump(&self.ring_recovery.recovered_from_buffer);
+                return Some(note);
+            }
+        }
+        let recovered = self
+            .backend
+            .load_note_by_cmx(&self.contract_address, generation.as_deref(), cmx)
+            .await;
+        RingRecoveryMetrics::bump(if recovered.is_some() {
+            &self.ring_recovery.recovered_from_archive
+        } else {
+            &self.ring_recovery.unrecovered
+        });
+        recovered
     }
 
     async fn begin_incremental_replay(&self) -> Result<()> {
@@ -7182,18 +7313,54 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         state.active_root = Some(new_root);
         state.confirmed_count = state.confirmed_count.max(position.saturating_add(1));
 
-        let maybe_note = state
+        // The confirmation event carries only (cmx, root, position) — republishing
+        // it to subscribers needs the note's full payload, which only the original
+        // NoteAdded had. The ring is a bounded cache, so under load the NoteAdded
+        // can be evicted before its NoteConfirmed arrives.
+        //
+        // Without a fallback the confirmation is applied to state and to the
+        // archive but never republished with a fresh seq. Consumers track this
+        // feed by a monotonic cursor (`/batches?after_seq=`), so a note whose
+        // confirmation never reaches the head of the feed is skipped forever:
+        // wallets never see it become spendable, and the official prover's
+        // successor scan walks its cursor past it.
+        //
+        // Lazy fallback: the ring stays the fast path (steady-state cost is zero,
+        // hit rate is ~100%), and only a miss pays for an archive read. The read
+        // must happen with the state lock released — every log-ingestion path
+        // holds `ingest_lock` for its whole duration, so no other ingestion can
+        // interleave here, but `/root` and `/merkle_path` readers must not be
+        // blocked on a database round-trip.
+        let ring_hit = state
             .batches
             .iter()
             .rev()
             .flat_map(|env| env.batch.abi_notes.iter())
             .find(|note| note.cmx == cmx)
-            .cloned()
-            .map(|mut note| {
-                note.is_confirmed = true;
-                note.cmx_position = Some(position);
-                note
-            });
+            .cloned();
+        let (mut state, base_note) = match ring_hit {
+            Some(note) => (state, Some(note)),
+            None => {
+                drop(state);
+                let recovered = ctx.recover_evicted_note(cmx).await;
+                if recovered.is_none() && !ctx.shadow_mode {
+                    // Every NoteAdded is archived before its NoteConfirmed can be
+                    // processed, so this means the archive is incomplete.
+                    eprintln!(
+                        "[indexer][{}] NoteConfirmed for cmx {} is absent from the ring AND the \
+                         archive; it will not be republished with a new seq",
+                        &ctx.contract_address[..10.min(ctx.contract_address.len())],
+                        hex::encode(cmx)
+                    );
+                }
+                (ctx.shared.write().await, recovered)
+            }
+        };
+        let maybe_note = base_note.map(|mut note| {
+            note.is_confirmed = true;
+            note.cmx_position = Some(position);
+            note
+        });
         let envelope = maybe_note.map(|note| {
             let seq = state.latest_seq.saturating_add(1);
             state.latest_seq = seq;
@@ -7302,17 +7469,36 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 .map_err(|e| anyhow!("ShieldCompleted decode failed: {e}"))?;
         let amount =
             u64::try_from(raw_amount).context("ShieldCompleted amount exceeds u64")?;
-        let maybe_note = state
+        // Same eviction hazard as NoteConfirmed: `ShieldCompleted` carries only
+        // (cmx, amount), so re-emitting needs the NoteAdded payload, and the ring
+        // may already have dropped it. Recovering keeps `shield_amount_sats`
+        // reaching subscribers, which is what the pool's public shield accounting
+        // is rendered from.
+        let ring_hit = state
             .batches
             .iter()
             .rev()
             .flat_map(|env| env.batch.abi_notes.iter())
             .find(|note| note.cmx == cmx && note.tx_hash == log.transaction_hash)
-            .cloned()
-            .map(|mut note| {
-                note.shield_amount_sats = Some(amount);
-                note
-            });
+            .cloned();
+        let (mut state, base_note) = match ring_hit {
+            Some(note) => (state, Some(note)),
+            None => {
+                drop(state);
+                // The archive is keyed by cmx alone, so the tx_hash match the ring
+                // scan applies is re-checked here: a recovered note from a
+                // different transaction is not this event's note.
+                let recovered = ctx.recover_evicted_note(cmx).await.filter(|note| {
+                    normalize_hex_0x(&note.tx_hash).to_lowercase()
+                        == normalize_hex_0x(&log.transaction_hash).to_lowercase()
+                });
+                (ctx.shared.write().await, recovered)
+            }
+        };
+        let maybe_note = base_note.map(|mut note| {
+            note.shield_amount_sats = Some(amount);
+            note
+        });
         let envelope = maybe_note.map(|note| {
             let seq = state.latest_seq.saturating_add(1);
             state.latest_seq = seq;
@@ -8310,7 +8496,8 @@ mod tests {
         persist_request_is_current, pg_apply_note_mutations, pg_begin_canonical_rebuild,
         pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
         push_incremental_replay_mutation, replay_frozen_set, require_admin, require_relayer,
-        rlp_bytes, rlp_list, rlp_uint, strip_0x, validate_log_against_canonical, BatchEnvelope,
+        latest_upserted_note, rlp_bytes, rlp_list, rlp_uint, strip_0x,
+        validate_log_against_canonical, BatchEnvelope,
         CheckpointSnapshot, Cli, EthLog, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
         JsonNoteArchiveUpdate, NoteArchiveMutation, RpcClient, StateBackend,
         DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS,
@@ -8946,6 +9133,106 @@ mod tests {
         assert_eq!(decoded[0].pool_address.as_deref(), Some(pool.as_str()));
     }
 
+    /// `NoteConfirmed`'s ring-miss fallback searches the uncommitted mutation
+    /// buffer before the tables, so it must pick the newest `Upsert` for the cmx
+    /// and ignore the other mutation kinds.
+    #[test]
+    fn latest_upserted_note_prefers_the_newest_write_for_that_cmx() {
+        let mut stale = sample_note_envelope(0x33, 4);
+        stale.batch.abi_notes[0].block_number = 111;
+        let mut fresh = sample_note_envelope(0x33, 9);
+        fresh.batch.abi_notes[0].block_number = 222;
+        let mutations = vec![
+            NoteArchiveMutation::Upsert(sample_note_envelope(0x44, 3)),
+            NoteArchiveMutation::Upsert(stale),
+            NoteArchiveMutation::Confirm {
+                cmx: [0x33; 32],
+                position: 7,
+            },
+            NoteArchiveMutation::Upsert(fresh),
+            NoteArchiveMutation::ShieldAmount {
+                cmx: [0x33; 32],
+                amount: 5,
+            },
+        ];
+        let found = latest_upserted_note(&mutations, [0x33; 32]).expect("buffered upsert");
+        assert_eq!(found.block_number, 222, "expected the newest Upsert");
+        assert_eq!(
+            latest_upserted_note(&mutations, [0x44; 32]).map(|n| n.cmx),
+            Some([0x44; 32])
+        );
+        // A cmx that only ever appears in non-Upsert mutations has no payload to
+        // recover — the caller must fall through to the tables, not synthesise one.
+        assert!(latest_upserted_note(
+            &[NoteArchiveMutation::Confirm {
+                cmx: [0x55; 32],
+                position: 1,
+            }],
+            [0x55; 32]
+        )
+        .is_none());
+    }
+
+    /// A canonical rebuild stages its notes in an isolated generation. The
+    /// ring-miss fallback must read inside that generation while it is active,
+    /// and must not see it once it has been abandoned.
+    #[tokio::test]
+    async fn pg_evicted_note_recovery_reads_inside_the_active_rebuild_generation() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pg = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pg).await.unwrap();
+        let pool_address = format!("0x{}", "c4".repeat(20));
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
+        let backend = StateBackend::Pgsql(pg.clone());
+        let generation = "gen-under-test";
+
+        // Live table carries an older copy; the rebuild stages a newer one.
+        let mut live = sample_note_envelope(0x33, 1);
+        live.batch.abi_notes[0].block_number = 111;
+        backend
+            .apply_note_mutations(&pool_address, None, &[NoteArchiveMutation::Upsert(live)])
+            .await
+            .unwrap();
+        pg_begin_canonical_rebuild(&pg, &pool_address, generation)
+            .await
+            .unwrap();
+        let mut staged = sample_note_envelope(0x33, 2);
+        staged.batch.abi_notes[0].block_number = 222;
+        backend
+            .apply_note_mutations(
+                &pool_address,
+                Some(generation),
+                &[NoteArchiveMutation::Upsert(staged)],
+            )
+            .await
+            .unwrap();
+
+        let in_generation = backend
+            .load_note_by_cmx(&pool_address, Some(generation), [0x33; 32])
+            .await
+            .expect("staged note");
+        assert_eq!(in_generation.block_number, 222);
+        let live_row = backend
+            .load_note_by_cmx(&pool_address, None, [0x33; 32])
+            .await
+            .expect("live note");
+        assert_eq!(
+            live_row.block_number, 111,
+            "an active rebuild must not leak into the live table"
+        );
+        assert!(
+            backend
+                .load_note_by_cmx(&pool_address, Some("other-generation"), [0x33; 32])
+                .await
+                .is_none(),
+            "generations must be isolated from each other"
+        );
+
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
+    }
+
     /// `/note` and `/tx` fall back to the archive once the ring evicts a note, so
     /// both point lookups must resolve notes the in-memory ring no longer holds.
     #[tokio::test]
@@ -8970,9 +9257,12 @@ mod tests {
         }
         let backend = StateBackend::Json(Some(state_path));
 
-        let found = backend.load_note_by_cmx(&pool, [0x33; 32]).await;
+        let found = backend.load_note_by_cmx(&pool, None, [0x33; 32]).await;
         assert_eq!(found.map(|n| n.cmx), Some([0x33; 32]));
-        assert!(backend.load_note_by_cmx(&pool, [0x99; 32]).await.is_none());
+        assert!(backend
+            .load_note_by_cmx(&pool, None, [0x99; 32])
+            .await
+            .is_none());
 
         // Casing and `0x` prefix are normalised on both sides, and the unrelated
         // note must not leak into the result.
@@ -9031,10 +9321,12 @@ mod tests {
             .await
             .unwrap();
 
-        let found = backend.load_note_by_cmx(&pool_address, [0x44; 32]).await;
+        let found = backend
+            .load_note_by_cmx(&pool_address, None, [0x44; 32])
+            .await;
         assert_eq!(found.map(|n| n.cmx), Some([0x44; 32]));
         assert!(backend
-            .load_note_by_cmx(&pool_address, [0x99; 32])
+            .load_note_by_cmx(&pool_address, None, [0x99; 32])
             .await
             .is_none());
 
@@ -9052,8 +9344,14 @@ mod tests {
         // *chosen* plan would be flaky in both directions — it would fail on a
         // legitimate small-table plan, and it would pass on a bare `Seq Scan`,
         // which is precisely the outcome the index exists to prevent.
-        sqlx::query("SET enable_seqscan = off")
-            .execute(&pg)
+        //
+        // `SET LOCAL` inside a transaction, not a bare `SET`: `enable_seqscan` is
+        // session state, and sqlx hands out pooled connections, so a bare `SET`
+        // may not apply to the connection the EXPLAIN lands on — and would leak to
+        // whichever test borrows that connection next.
+        let mut tx = pg.begin().await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
             .await
             .unwrap();
         let forced: Vec<(String,)> = sqlx::query_as(
@@ -9062,18 +9360,15 @@ mod tests {
         )
         .bind(&pool_address)
         .bind(vec![shared_tx.to_lowercase()])
-        .fetch_all(&pg)
+        .fetch_all(&mut *tx)
         .await
         .unwrap();
+        tx.rollback().await.unwrap();
         let forced = forced
             .into_iter()
             .map(|(line,)| line)
             .collect::<Vec<_>>()
             .join("\n");
-        sqlx::query("SET enable_seqscan = on")
-            .execute(&pg)
-            .await
-            .unwrap();
         assert!(
             forced.contains("notes_tx_hash_idx"),
             "the /tx predicate cannot use notes_tx_hash_idx; it would seq-scan `notes` \
