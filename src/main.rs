@@ -788,6 +788,10 @@ struct PoolRegistry {
     relayer_token: Option<Arc<str>>,
     /// Bounds expensive runtime registration RPC work.
     write_semaphore: Arc<Semaphore>,
+    /// Bounds archive reads and their JSON serialization. Historical catch-up
+    /// used to be unbounded, so a handful of concurrent clients could each
+    /// materialize the complete `notes` table and exhaust the process heap.
+    history_read_semaphore: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug)]
@@ -1443,6 +1447,8 @@ struct BatchesQuery {
 
 const DEFAULT_BATCH_PAGE_LIMIT: usize = 1_000;
 const MAX_BATCH_PAGE_LIMIT: usize = 2_000;
+const HISTORY_READ_CONCURRENCY: usize = 4;
+const MAX_TX_HISTORY_NOTE_ROWS: usize = 2_000;
 
 #[derive(Debug, Deserialize)]
 struct BatchesPageQuery {
@@ -1725,6 +1731,7 @@ async fn main() -> Result<()> {
             .filter(|s| !s.is_empty())
             .map(Arc::<str>::from),
         write_semaphore: Arc::new(Semaphore::new(2)),
+        history_read_semaphore: Arc::new(Semaphore::new(HISTORY_READ_CONCURRENCY)),
     };
     registry.validate_trust_roots().await?;
 
@@ -2584,6 +2591,17 @@ async fn require_canonical_context(
     canonical_guard(ctx.state.read().await.tree_out_of_order)
 }
 
+async fn acquire_history_read(
+    reg: &PoolRegistry,
+) -> Result<tokio::sync::SemaphorePermit<'_>, (StatusCode, String)> {
+    reg.history_read_semaphore.acquire().await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "historical batch reader is shutting down".to_string(),
+        )
+    })
+}
+
 async fn canonical_api_gate(
     State(reg): State<PoolRegistry>,
     request: Request<axum::body::Body>,
@@ -2838,9 +2856,18 @@ async fn get_batches(
     State(reg): State<PoolRegistry>,
     Query(q): Query<BatchesQuery>,
 ) -> Result<Json<Vec<BatchEnvelope>>, (StatusCode, String)> {
+    let _history_permit = acquire_history_read(&reg).await?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let after = q.after_seq.unwrap_or(0);
-    let out = collect_batches_since(&ctx, after).await?;
+    let target = ctx.state.read().await.latest_seq;
+    let (out, has_more) = collect_batch_page(&ctx, after, target, MAX_BATCH_PAGE_LIMIT).await?;
+    if has_more {
+        return Err((
+            StatusCode::CONFLICT,
+            "legacy /batches history exceeds the bounded response; use /batches/page"
+                .to_string(),
+        ));
+    }
     Ok(Json(out))
 }
 
@@ -2856,6 +2883,7 @@ async fn get_batches_page(
     State(reg): State<PoolRegistry>,
     Query(q): Query<BatchesPageQuery>,
 ) -> Result<Json<BatchesPageResponse>, (StatusCode, String)> {
+    let _history_permit = acquire_history_read(&reg).await?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let after_seq = q.after_seq.unwrap_or(0);
     let initial_latest_seq = {
@@ -2872,7 +2900,13 @@ async fn get_batches_page(
         .unwrap_or(DEFAULT_BATCH_PAGE_LIMIT)
         .clamp(1, MAX_BATCH_PAGE_LIMIT);
 
-    if after_seq >= target_seq {
+    if after_seq > target_seq {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "after_seq cannot exceed the fixed to_seq boundary".to_string(),
+        ));
+    }
+    if after_seq == target_seq {
         return Ok(Json(BatchesPageResponse {
             envelopes: Vec::new(),
             next_after_seq: after_seq,
@@ -2883,24 +2917,14 @@ async fn get_batches_page(
         }));
     }
 
-    // TODO(indexer-oom): push `target_seq` and `limit` through the backend so
-    // PostgreSQL applies bounded keyset pagination. The current compatibility
-    // path materializes the remaining archive before truncating the response.
-    let mut candidates = collect_batches_since(&ctx, after_seq).await?;
-    candidates.retain(|envelope| envelope.seq <= target_seq);
-    candidates.sort_by_key(|envelope| envelope.seq);
-
-    let sequences: Vec<u64> = candidates.iter().map(|envelope| envelope.seq).collect();
-    let page_end = batch_page_end(&sequences, limit);
-    let has_more = page_end < candidates.len();
-    let envelopes: Vec<BatchEnvelope> = candidates.into_iter().take(page_end).collect();
+    let (envelopes, has_more) = collect_batch_page(&ctx, after_seq, target_seq, limit).await?;
     let scanned_to_seq = if has_more {
         envelopes
             .last()
             .map(|envelope| envelope.seq)
             .unwrap_or(after_seq)
     } else {
-        // `collect_batches_since` inspected the complete retained window. Moving
+        // `collect_batch_page` inspected the complete retained window. Moving
         // to target is therefore safe even when confirmation upserts created
         // numeric gaps with no row at exactly target_seq.
         target_seq
@@ -2936,43 +2960,69 @@ fn batch_page_end(sequences: &[u64], limit: usize) -> usize {
     end
 }
 
-/// All batch envelopes with `seq > after`, oldest first. Recent envelopes come
-/// from the in-memory ring; anything older than the ring's front (evicted) is
-/// loaded from the persistent backend, so full-history scans never silently
-/// miss notes regardless of `--max-batches-in-memory`.
-async fn collect_batches_since(
+/// One bounded page with `after < seq <= target`, oldest first. The archive is
+/// read by keyset page and then joined to the finite in-memory ring. At most one
+/// equal-sequence group may extend `limit`.
+async fn collect_batch_page(
     ctx: &AppContext,
     after: u64,
-) -> Result<Vec<BatchEnvelope>, (StatusCode, String)> {
-    let (ring, ring_front, latest_seq) = {
+    target: u64,
+    limit: usize,
+) -> Result<(Vec<BatchEnvelope>, bool), (StatusCode, String)> {
+    let (mut ring, ring_front, latest_seq) = {
         let s = ctx.state.read().await;
         canonical_guard(s.tree_out_of_order)?;
         let ring: Vec<BatchEnvelope> = s
             .batches
             .iter()
-            .filter(|b| b.seq > after)
+            .filter(|b| b.seq > after && b.seq <= target)
             .cloned()
             .collect();
         (ring, s.batches.front().map(|b| b.seq), s.latest_seq)
     };
+    ring.sort_by_key(|envelope| envelope.seq);
     // The ring covers (front..=latest); anything in (after..front) was evicted.
     let missing_before = match ring_front {
         Some(front) if front > after.saturating_add(1) => Some(front),
         None if latest_seq > after => Some(u64::MAX),
         _ => None,
     };
-    let Some(before) = missing_before else {
-        return Ok(ring);
-    };
-    let mut out = ctx
-        .backend
-        .load_archived_batches(&ctx.contract_address, after, before)
-        .await;
-    out.extend(ring);
+    let mut out = Vec::new();
+    if let Some(before) = missing_before {
+        let archived = ctx
+            .backend
+            .load_archived_batch_page(&ctx.contract_address, after, target, before, limit)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("bounded batch archive read failed: {error:#}"),
+                )
+            })?;
+        out = archived.envelopes;
+        if archived.has_more {
+            require_canonical_context(ctx).await?;
+            return Ok((out, true));
+        }
+    }
+
+    if out.len() >= limit {
+        let has_more = !ring.is_empty();
+        require_canonical_context(ctx).await?;
+        return Ok((out, has_more));
+    }
+
+    let remaining = limit - out.len();
+    let ring_end = batch_page_end(
+        &ring.iter().map(|envelope| envelope.seq).collect::<Vec<_>>(),
+        remaining,
+    );
+    let has_more = ring_end < ring.len();
+    out.extend(ring.into_iter().take(ring_end));
     // A cursor mismatch may be detected while the archive query is in flight.
     // Recheck before returning any historical rows.
     require_canonical_context(ctx).await?;
-    Ok(out)
+    Ok((out, has_more))
 }
 
 /// SSE endpoint: streams BatchEnvelopes to the client as they arrive.
@@ -2989,6 +3039,7 @@ async fn get_batches_stream(
     headers: HeaderMap,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)>
 {
+    let _history_permit = acquire_history_read(&reg).await?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
 
     // Determine after_seq: Last-Event-ID (reconnect) takes priority over query param.
@@ -3002,9 +3053,18 @@ async fn get_batches_stream(
     // Subscribe FIRST so no live batch is missed while we read history.
     let live_rx = ctx.batch_tx.subscribe();
 
-    // Collect historical batches (seq > after_seq), including archived ones the
-    // in-memory ring has already evicted.
-    let historical: Vec<BatchEnvelope> = collect_batches_since(&ctx, after_seq).await?;
+    // The legacy SSE endpoint keeps only a bounded compatibility window. New
+    // clients must catch up through `/batches/page` before opening a live feed.
+    let target = ctx.state.read().await.latest_seq;
+    let (historical, has_more) =
+        collect_batch_page(&ctx, after_seq, target, MAX_BATCH_PAGE_LIMIT).await?;
+    if has_more {
+        return Err((
+            StatusCode::CONFLICT,
+            "SSE backlog exceeds the bounded compatibility window; catch up with /batches/page"
+                .to_string(),
+        ));
+    }
     let max_hist_seq = historical.last().map(|b| b.seq).unwrap_or(after_seq);
 
     // Build SSE event from a BatchEnvelope.
@@ -3364,6 +3424,7 @@ async fn get_txs(
     State(reg): State<PoolRegistry>,
     Query(q): Query<TxsListQuery>,
 ) -> Result<Json<TxsListResponse>, (StatusCode, String)> {
+    let _history_permit = acquire_history_read(&reg).await?;
     let limit = q.limit.unwrap_or(25).clamp(1, 100);
     let before = q.before_block.unwrap_or(u64::MAX);
     let contexts: Vec<AppContext> = match q.pool.as_deref() {
@@ -3375,8 +3436,8 @@ async fn get_txs(
     // settle emits a note in each leg's pool), so key by hash and merge.
     // Newest page (no cursor) reads only the in-memory ring — cheap, and it's the
     // hot path the live poll hits every few seconds. Any older page (cursor set)
-    // pulls FULL history (ring + persisted archive) via collect_batches_since, so
-    // deep pagination reaches beyond the ring instead of dead-ending at its edge.
+    // reads a bounded PostgreSQL block page, so deep pagination reaches beyond
+    // the ring without materializing the full archive.
     let full_history = q.before_block.is_some();
     let mut by_tx: HashMap<String, TxSummary> = HashMap::new();
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
@@ -3388,10 +3449,27 @@ async fn get_txs(
     // floors. Blocks at/below it are deferred to the next (full-history) page.
     let mut ring_has_older = false;
     let mut ring_cutoff: Option<u64> = None;
+    let mut archive_has_older = false;
+    let per_pool_note_limit = MAX_TX_HISTORY_NOTE_ROWS.div_ceil(contexts.len().max(1));
     for ctx in &contexts {
         let pool_lc = ctx.contract_address.to_lowercase();
         let batches: Vec<BatchEnvelope> = if full_history {
-            collect_batches_since(ctx, 0).await?
+            let page = ctx
+                .backend
+                .load_archived_batches_before_block(
+                    &ctx.contract_address,
+                    before,
+                    per_pool_note_limit,
+                )
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("bounded transaction archive read failed: {error:#}"),
+                    )
+                })?;
+            archive_has_older |= page.has_more;
+            page.envelopes
         } else {
             let s = ctx.state.read().await;
             canonical_guard(s.tree_out_of_order)?;
@@ -3467,7 +3545,7 @@ async fn get_txs(
     // full-history page, preserving "a block is never split across a cursor boundary".
     let mut items: Vec<TxSummary> = Vec::new();
     let mut last_block: Option<u64> = None;
-    let mut truncated = false;
+    let mut truncated = archive_has_older;
     for tx in txs
         .into_iter()
         .filter(|t| t.block_number < before && ring_cutoff.is_none_or(|c| t.block_number > c))
@@ -4386,6 +4464,14 @@ struct CheckpointSnapshot {
 }
 
 impl CheckpointSnapshot {
+    fn is_complete_finalized_boundary(&self) -> bool {
+        checkpoint_is_complete_finalized_boundary(
+            self.next_block,
+            self.last_finalized_block,
+            self.last_finalized_block_hash.as_deref(),
+        )
+    }
+
     fn from_state(s: &SharedState) -> Self {
         Self {
             next_block: s.next_block,
@@ -4418,6 +4504,18 @@ impl CheckpointSnapshot {
             shield_accounting: ck.shield_accounting,
         }
     }
+}
+
+fn checkpoint_is_complete_finalized_boundary(
+    next_block: u64,
+    last_finalized_block: Option<u64>,
+    last_finalized_block_hash: Option<&str>,
+) -> bool {
+    matches!(
+        (last_finalized_block, last_finalized_block_hash),
+        (Some(block), Some(hash))
+            if !hash.is_empty() && next_block == block.saturating_add(1)
+    )
 }
 
 /// Where persisted state lives. `Json` is per-pool (its own file); `Pgsql` is one shared
@@ -4516,10 +4614,15 @@ enum StateBackend {
     Pgsql(sqlx::PgPool),
 }
 
+struct ArchivedBatchPage {
+    envelopes: Vec<BatchEnvelope>,
+    has_more: bool,
+}
+
 impl StateBackend {
     /// Sidecar JSONL file holding every batch envelope ever emitted (JSON mode).
     /// The in-memory ring only caches the most recent `max_batches`; this archive
-    /// is what lets `/batches?after_seq=0` serve full history after eviction.
+    /// is what lets `/batches/page` traverse history after eviction.
     fn json_archive_path(state_path: &str) -> String {
         format!("{state_path}.batches.jsonl")
     }
@@ -4680,39 +4783,191 @@ impl StateBackend {
         }
     }
 
-    /// Load archived envelopes with `after_seq < seq < before_seq`, oldest first.
-    /// Complements the in-memory ring when a client asks for history that has
-    /// already been evicted from it.
-    async fn load_archived_batches(
+    /// Load one bounded keyset page with `after_seq < seq <= target_seq` and
+    /// `seq < before_seq`, oldest first. PostgreSQL applies the limit before
+    /// decoding rows; only the final equal-sequence group may extend the soft
+    /// limit so clients never split one logical batch across cursors.
+    async fn load_archived_batch_page(
         &self,
         pool_address: &str,
         after_seq: u64,
+        target_seq: u64,
         before_seq: u64,
-    ) -> Vec<BatchEnvelope> {
+        limit: usize,
+    ) -> Result<ArchivedBatchPage> {
         match self {
-            StateBackend::Json(Some(path)) => Self::read_json_archive(path, pool_address)
-                .into_iter()
-                .filter(|env| env.seq > after_seq && env.seq < before_seq)
-                .collect(),
-            StateBackend::Json(None) => Vec::new(),
+            StateBackend::Json(Some(path)) => {
+                // JSON is a development backend whose update records require a
+                // full fold. Keep response size bounded even though decoding it
+                // remains O(history); production PostgreSQL is truly keyset-paged.
+                let mut candidates: Vec<_> = Self::read_json_archive(path, pool_address)
+                    .into_iter()
+                    .filter(|env| {
+                        env.seq > after_seq
+                            && env.seq <= target_seq
+                            && env.seq < before_seq
+                    })
+                    .collect();
+                candidates.sort_by_key(|env| env.seq);
+                let end = batch_page_end(
+                    &candidates.iter().map(|env| env.seq).collect::<Vec<_>>(),
+                    limit,
+                );
+                let has_more = end < candidates.len();
+                candidates.truncate(end);
+                Ok(ArchivedBatchPage {
+                    envelopes: candidates,
+                    has_more,
+                })
+            }
+            StateBackend::Json(None) => Ok(ArchivedBatchPage {
+                envelopes: Vec::new(),
+                has_more: false,
+            }),
             StateBackend::Pgsql(pool) => {
-                // `u64::MAX` is the in-process sentinel for an unbounded archive
-                // scan when the warm-started in-memory ring is empty. A direct
-                // `as i64` cast turns that sentinel into -1 and makes the SQL
-                // predicate reject every persisted envelope.
                 let after_seq = pg_archive_seq_bound(after_seq);
+                let target_seq = pg_archive_seq_bound(target_seq);
                 let before_seq = pg_archive_seq_bound(before_seq);
-                let rows: Vec<NoteRow> = sqlx::query_as(&format!(
+                let sql_limit = i64::try_from(limit).context("batch page limit exceeds i64")?;
+                let mut rows: Vec<NoteRow> = sqlx::query_as(&format!(
                     "SELECT {NOTE_SELECT_COLUMNS} FROM notes \
-                     WHERE pool_address=$1 AND seq > $2 AND seq < $3 ORDER BY seq"
+                     WHERE pool_address=$1 AND seq > $2 AND seq <= $3 AND seq < $4 \
+                     ORDER BY seq, cmx_hex LIMIT $5"
                 ))
                 .bind(pool_address)
                 .bind(after_seq)
+                .bind(target_seq)
                 .bind(before_seq)
+                .bind(sql_limit)
                 .fetch_all(pool)
                 .await
-                .unwrap_or_default();
-                note_rows_into_envelopes(rows, pool_address)
+                .context("load bounded archived batch page")?;
+
+                let mut has_more = false;
+                if rows.len() == limit {
+                    let boundary_seq = rows.last().map(|row| row.1).unwrap_or(after_seq);
+                    let boundary_cmx = rows.last().map(|row| row.0.clone()).unwrap_or_default();
+                    let mut boundary_tail: Vec<NoteRow> = sqlx::query_as(&format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes \
+                         WHERE pool_address=$1 AND seq=$2 AND cmx_hex > $3 \
+                         ORDER BY cmx_hex"
+                    ))
+                    .bind(pool_address)
+                    .bind(boundary_seq)
+                    .bind(boundary_cmx)
+                    .fetch_all(pool)
+                    .await
+                    .context("extend archived page through equal-sequence boundary")?;
+                    rows.append(&mut boundary_tail);
+                    has_more = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM notes \
+                         WHERE pool_address=$1 AND seq > $2 AND seq <= $3 AND seq < $4)",
+                    )
+                    .bind(pool_address)
+                    .bind(boundary_seq)
+                    .bind(target_seq)
+                    .bind(before_seq)
+                    .fetch_one(pool)
+                    .await
+                    .context("check archived batch page continuation")?;
+                }
+                Ok(ArchivedBatchPage {
+                    envelopes: note_rows_into_envelopes(rows, pool_address),
+                    has_more,
+                })
+            }
+        }
+    }
+
+    /// Bounded archive page for the explorer's block cursor. The final block is
+    /// always complete, even when that soft-extends `limit`.
+    async fn load_archived_batches_before_block(
+        &self,
+        pool_address: &str,
+        before_block: u64,
+        limit: usize,
+    ) -> Result<ArchivedBatchPage> {
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let mut candidates: Vec<_> = Self::read_json_archive(path, pool_address)
+                    .into_iter()
+                    .filter(|env| {
+                        env.batch
+                            .abi_notes
+                            .first()
+                            .is_some_and(|note| note.block_number < before_block)
+                    })
+                    .collect();
+                candidates.sort_by(|left, right| {
+                    let left_note = left.batch.abi_notes.first();
+                    let right_note = right.batch.abi_notes.first();
+                    right_note
+                        .map(|note| (note.block_number, note.log_index))
+                        .cmp(&left_note.map(|note| (note.block_number, note.log_index)))
+                });
+                let mut end = limit.min(candidates.len());
+                if end > 0 && end < candidates.len() {
+                    let boundary = candidates[end - 1].batch.abi_notes[0].block_number;
+                    while end < candidates.len()
+                        && candidates[end].batch.abi_notes[0].block_number == boundary
+                    {
+                        end += 1;
+                    }
+                }
+                let has_more = end < candidates.len();
+                candidates.truncate(end);
+                Ok(ArchivedBatchPage {
+                    envelopes: candidates,
+                    has_more,
+                })
+            }
+            StateBackend::Json(None) => Ok(ArchivedBatchPage {
+                envelopes: Vec::new(),
+                has_more: false,
+            }),
+            StateBackend::Pgsql(pool) => {
+                let before_block = pg_archive_seq_bound(before_block);
+                let sql_limit = i64::try_from(limit).context("tx history limit exceeds i64")?;
+                let mut rows: Vec<NoteRow> = sqlx::query_as(&format!(
+                    "SELECT {NOTE_SELECT_COLUMNS} FROM notes \
+                     WHERE pool_address=$1 AND block_number < $2 \
+                     ORDER BY block_number DESC, log_index DESC, cmx_hex LIMIT $3"
+                ))
+                .bind(pool_address)
+                .bind(before_block)
+                .bind(sql_limit)
+                .fetch_all(pool)
+                .await
+                .context("load bounded transaction history")?;
+                let mut has_more = false;
+                if rows.len() == limit {
+                    let boundary_block = rows.last().map(|row| row.2).unwrap_or(before_block);
+                    rows.retain(|row| row.2 != boundary_block);
+                    let mut boundary_rows: Vec<NoteRow> = sqlx::query_as(&format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes \
+                         WHERE pool_address=$1 AND block_number=$2 \
+                         ORDER BY log_index DESC, cmx_hex"
+                    ))
+                    .bind(pool_address)
+                    .bind(boundary_block)
+                    .fetch_all(pool)
+                    .await
+                    .context("extend transaction history through block boundary")?;
+                    rows.append(&mut boundary_rows);
+                    has_more = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM notes \
+                         WHERE pool_address=$1 AND block_number < $2)",
+                    )
+                    .bind(pool_address)
+                    .bind(boundary_block)
+                    .fetch_one(pool)
+                    .await
+                    .context("check transaction history continuation")?;
+                }
+                Ok(ArchivedBatchPage {
+                    envelopes: note_rows_into_envelopes(rows, pool_address),
+                    has_more,
+                })
             }
         }
     }
@@ -4827,6 +5082,11 @@ impl StateBackend {
         }
     }
     async fn save(&self, pool_address: &str, snap: &CheckpointSnapshot) -> Result<()> {
+        if !snap.is_complete_finalized_boundary() {
+            return Err(anyhow!(
+                "refusing to save an incomplete finalized checkpoint for {pool_address}"
+            ));
+        }
         match self {
             StateBackend::Json(Some(path)) => save_checkpoint(path, snap),
             StateBackend::Json(None) => Ok(()),
@@ -4921,7 +5181,14 @@ impl Persist {
     }
 
     fn notify(&self, s: &SharedState) {
-        if self.read_only || self.is_paused() {
+        if self.read_only
+            || self.is_paused()
+            || !checkpoint_is_complete_finalized_boundary(
+                s.next_block,
+                s.last_finalized_block,
+                s.last_finalized_block_hash.as_deref(),
+            )
+        {
             return;
         }
         let epoch = self.epoch.load(AtomicOrdering::Acquire);
@@ -4935,7 +5202,7 @@ impl Persist {
     }
     /// Persist an already-built snapshot (for sites that dropped the lock first).
     fn notify_owned(&self, snap: CheckpointSnapshot) {
-        if self.read_only || self.is_paused() {
+        if self.read_only || self.is_paused() || !snap.is_complete_finalized_boundary() {
             return;
         }
         let epoch = self.epoch.load(AtomicOrdering::Acquire);
@@ -6097,6 +6364,15 @@ impl PollContext {
     }
 
     async fn finish_incremental_replay(&self, snap: &CheckpointSnapshot) -> Result<usize> {
+        if !snap.is_complete_finalized_boundary() {
+            self.incremental_replay_mutations.lock().await.take();
+            self.persist.resume();
+            return Err(anyhow!(
+                "refusing to persist an incomplete finalized checkpoint: next_block={}, last_finalized={:?}",
+                snap.next_block,
+                snap.last_finalized_block
+            ));
+        }
         let mutations = self.incremental_replay_mutations.lock().await.take();
         let Some(mutations) = mutations else {
             self.persist.resume();
@@ -6710,16 +6986,10 @@ async fn catchup_from_chain(ctx: &PollContext) {
     }
 }
 
-/// Fetch every watched log in the inclusive block range `[from, to]` and replay
-/// them through `process_single_log` in strict (block, log_index) order.
-///
-/// The caller MUST hold `ctx.ingest_lock`. Returns the number of logs processed,
-/// or `Err(())` if a getLogs window failed (the cursor must not advance then).
-async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()> {
-    let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
+fn watched_topic0s(ctx: &PollContext) -> Vec<String> {
     let mut topic0s: Vec<String> = note_added_topic0_alternatives()
         .iter()
-        .map(|t| normalize_hex_0x(t))
+        .map(|topic| normalize_hex_0x(topic))
         .collect();
     topic0s.push(normalize_hex_0x(&shield_completed_topic0_hex()));
     topic0s.push(normalize_hex_0x(&ctx.note_confirmed_topic0));
@@ -6727,6 +6997,17 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
     topic0s.push(normalize_hex_0x(&frozen_root_updated_topic0()));
     topic0s.push(normalize_hex_0x(&shielded_topic0_hex()));
     topic0s.push(normalize_hex_0x(&unshielded_topic0_hex()));
+    topic0s
+}
+
+/// Fetch every watched log in the inclusive block range `[from, to]` and replay
+/// them through `process_single_log` in strict (block, log_index) order.
+///
+/// The caller MUST hold `ctx.ingest_lock`. Returns the number of logs processed,
+/// or `Err(())` if a getLogs window failed (the cursor must not advance then).
+async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()> {
+    let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
+    let topic0s = watched_topic0s(ctx);
 
     let mut total = 0usize;
     let mut lo = from;
@@ -6809,24 +7090,67 @@ fn is_watched_pool_log(ctx: &PollContext, log: &EthLog) -> bool {
         .contains(&topic0)
 }
 
-/// Ingest a live WS log while preserving strict on-chain ordering.
-///
-/// The pushed log is used ONLY as a wake-up signal + coverage marker — it is
-/// never processed directly. All appends flow through `replay_range`, which
-/// fetches `eth_getLogs` and processes strictly in (block, log_index) order.
-///
-/// Two provider behaviours make direct processing unsafe:
-/// - the WS can silently drop logs, so a pushed log for block B may have
-///   dropped predecessors in `[next_block, B]` that must be ingested first;
-/// - the provider's getLogs view can LAG its own WS push (observed on anvil
-///   under load): a replay right after the push may come back empty. If we
-///   then appended the pushed log directly, a later replay would insert the
-///   siblings BEHIND it — out of order — permanently corrupting the tree.
-///
-/// So: replay the window, check whether this log's event id got ingested, and
-/// if not, sleep briefly and retry until the getLogs view catches up. If it
-/// never does, leave the cursor untouched and let the periodic catchup replay
-/// the window in order later.
+fn state_has_event_id(state: &SharedState, event_id: &str) -> bool {
+    state.seen_event_ids.contains(event_id)
+        || state.confirm_seen_ids.contains(event_id)
+        || state.shield_seen_ids.contains(event_id)
+        || state.accounting_seen_ids.contains(event_id)
+}
+
+fn finalized_cursor_covers_block(
+    next_block: u64,
+    last_finalized_block: Option<u64>,
+    last_finalized_block_hash: Option<&str>,
+    tree_out_of_order: bool,
+    block_number: u64,
+) -> bool {
+    !tree_out_of_order
+        && checkpoint_is_complete_finalized_boundary(
+            next_block,
+            last_finalized_block,
+            last_finalized_block_hash,
+        )
+        && last_finalized_block.is_some_and(|finalized| finalized >= block_number)
+}
+
+fn state_covers_finalized_block(state: &SharedState, block_number: u64) -> bool {
+    finalized_cursor_covers_block(
+        state.next_block,
+        state.last_finalized_block,
+        state.last_finalized_block_hash.as_deref(),
+        state.tree_out_of_order,
+        block_number,
+    )
+}
+
+async fn canonical_ws_log_is_visible(
+    ctx: &PollContext,
+    block_number: u64,
+    transaction_hash: &str,
+    log_index: &str,
+) -> Result<bool> {
+    let logs = ctx
+        .rpc
+        .fetch_logs_topic0_or(
+            block_number,
+            block_number,
+            &ctx.contract_address,
+            &watched_topic0s(ctx),
+        )
+        .await?;
+    ctx.rpc.validate_canonical_logs(&logs).await?;
+    Ok(logs.iter().any(|candidate| {
+        candidate.transaction_hash.eq_ignore_ascii_case(transaction_hash)
+            && candidate.log_index.eq_ignore_ascii_case(log_index)
+    }))
+}
+
+/// Treat a live WS log only as a wake-up hint. Once the same finalized log is
+/// visible through canonical `eth_getLogs`, run the ordinary catch-up all the
+/// way to one finalized head and atomically publish that complete boundary.
+/// This prevents the old WS fast path from persisting `next_block=B` beside an
+/// older `last_finalized_block`, which made every restart in that window reject
+/// warm-start and fall back to a full replay.
 async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
     if log.removed {
         return Err(anyhow!(
@@ -6835,92 +7159,70 @@ async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             log.log_index
         ));
     }
-    let _ingest = ctx.ingest_lock.lock().await;
     let block_number = parse_hex_u64(&log.block_number)
         .with_context(|| format!("invalid blockNumber: {}", log.block_number))?;
-    let (finalized_head, finalized_hash) = ctx.rpc.finalized_block().await?;
-    if block_number > finalized_head {
-        // Monad publishes Voted logs before finalization. The push remains a
-        // wake-up hint only; periodic catch-up will ingest it once finalized.
+    let event_id = format!("{}:{}", log.transaction_hash, log.log_index);
+    if {
+        let state = ctx.shared.read().await;
+        state_has_event_id(&state, &event_id)
+    } {
         return Ok(());
     }
-    let event_id = format!("{}:{}", log.transaction_hash, log.log_index);
 
-    let covered = |s: &SharedState| {
-        s.seen_event_ids.contains(&event_id)
-            || s.confirm_seen_ids.contains(&event_id)
-            || s.shield_seen_ids.contains(&event_id)
-            || s.accounting_seen_ids.contains(&event_id)
-    };
-
+    let mut visible = false;
     for attempt in 0u64..6 {
-        {
-            let s = ctx.shared.read().await;
-            if covered(&s) {
-                return Ok(());
-            }
-        }
-        let cursor = { ctx.shared.read().await.next_block };
-        let from = cursor.min(block_number);
-        let starting_seq = ctx.shared.read().await.latest_seq;
-        ctx.begin_incremental_replay()
-            .await
-            .context("begin canonical WS replay")?;
-        ctx.broadcast_paused.store(true, AtomicOrdering::Release);
-        if replay_range(ctx, from, block_number).await.is_err() {
-            ctx.abort_incremental_replay().await;
-            ctx.mark_canonical_unready().await;
-            ctx.broadcast_paused.store(false, AtomicOrdering::Release);
-            return Err(anyhow!(
-                "canonical replay failed while ingesting WS hint {event_id}"
-            ));
-        }
-        match ctx.rpc.block_hash(finalized_head).await {
-            Ok(hash) if hash == finalized_hash => {}
-            Ok(hash) => {
-                ctx.abort_incremental_replay().await;
-                ctx.mark_canonical_unready().await;
-                ctx.broadcast_paused.store(false, AtomicOrdering::Release);
-                return Err(anyhow!(
-                    "finalized boundary changed during WS replay: head={finalized_head}, \
-                     before={finalized_hash}, after={hash}"
-                ));
-            }
-            Err(error) => {
-                ctx.abort_incremental_replay().await;
-                ctx.mark_canonical_unready().await;
-                ctx.broadcast_paused.store(false, AtomicOrdering::Release);
-                return Err(error).context("recheck finalized boundary during WS replay");
-            }
-        }
-        let mut s = ctx.shared.write().await;
-        let is_covered = covered(&s);
-        if is_covered {
-            // Cursor moves to B (not past it): later same-block pushes trigger
-            // a cheap dedup-only replay of B, never a skip.
-            s.next_block = s.next_block.max(block_number);
-        }
-        let snap = CheckpointSnapshot::from_state(&s);
-        drop(s);
-        if let Err(e) = ctx.finish_incremental_replay(&snap).await {
-            ctx.mark_canonical_unready().await;
-            ctx.broadcast_paused.store(false, AtomicOrdering::Release);
-            return Err(e).context("commit canonical WS replay");
-        }
-        ctx.broadcast_paused.store(false, AtomicOrdering::Release);
-        ctx.broadcast_batches_after(starting_seq).await;
-        if is_covered {
+        let (finalized_head, _) = ctx.rpc.finalized_block().await?;
+        if block_number > finalized_head {
+            // Monad publishes Voted logs before finalization. The periodic
+            // catch-up will ingest this block after it becomes finalized.
             return Ok(());
         }
-        // getLogs has not caught up with the WS push yet.
+        if canonical_ws_log_is_visible(
+            ctx,
+            block_number,
+            &log.transaction_hash,
+            &log.log_index,
+        )
+        .await?
+        {
+            visible = true;
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
     }
-    eprintln!(
-        "[indexer] WS log {event_id} (block {block_number}) still not visible via eth_getLogs; \
-         deferring to the periodic catchup"
-    );
+    if !visible {
+        return Err(anyhow!(
+            "WS hint {event_id} is finalized but not visible through canonical eth_getLogs"
+        ));
+    }
+
+    // Dedup sets are intentionally not persisted. After a restart, a delayed WS
+    // delivery or pending-receipt recovery can therefore refer to a block that a
+    // valid finalized checkpoint already covers. The sealed cursor is the durable
+    // proof of coverage; do not turn that benign replay into a full rebuild.
+    if {
+        let state = ctx.shared.read().await;
+        state_has_event_id(&state, &event_id)
+            || state_covers_finalized_block(&state, block_number)
+    } {
+        return Ok(());
+    }
+
+    catchup_from_chain(ctx).await;
+    if {
+        let state = ctx.shared.read().await;
+        state_has_event_id(&state, &event_id)
+            || state_covers_finalized_block(&state, block_number)
+    } {
+        return Ok(());
+    }
+
+    // A transient canonical RPC failure leaves the cursor at/before this block.
+    // Preserve the last valid checkpoint and let periodic catch-up retry. If the
+    // catch-up detected an actual cursor/hash mismatch it already marked the
+    // state unready itself.
     Err(anyhow!(
-        "WS hint {event_id} was not visible through canonical eth_getLogs"
+        "canonical catch-up did not yet cover finalized WS hint {event_id}; retry deferred"
     ))
 }
 
@@ -7451,7 +7753,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         //
         // Without a fallback the confirmation is applied to state and to the
         // archive but never republished with a fresh seq. Consumers track this
-        // feed by a monotonic cursor (`/batches?after_seq=`), so a note whose
+        // feed by a monotonic `/batches/page` cursor, so a note whose
         // confirmation never reaches the head of the feed is skipped forever:
         // wallets never see it become spendable, and the official prover's
         // successor scan walks its cursor past it.
@@ -8618,12 +8920,13 @@ fn strip_0x(s: &str) -> &str {
 mod tests {
     use super::{
         advance_cursor, batch_page_end, beacon_words_match, canonical_guard, classify_selector,
-        compact_note_mutations, crank_gas_limit, crank_next_delay_secs,
+        checkpoint_is_complete_finalized_boundary, compact_note_mutations, crank_gas_limit,
+        crank_next_delay_secs,
         decode_frozen_root_updated_log, decode_json_note_archive, eip1967_beacon_slot,
         encode_crank_root_calldata, factory_log_matches, frontier_from_ordered_leaves,
-        frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error, nonempty_trimmed,
-        normalize_hex_0x, parse_address_set, parse_bytes32_strict, parse_tx_meta,
-        perc20_deployed_topic0,
+        finalized_cursor_covers_block, frozen_root_updated_topic0, getlogs_window_end,
+        is_getlogs_range_error, nonempty_trimmed, normalize_hex_0x, parse_address_set,
+        parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
         persist_request_is_current, pg_apply_note_mutations, pg_archive_seq_bound,
         pg_begin_canonical_rebuild, pg_commit_incremental_replay, pg_finish_canonical_rebuild,
         pg_load,
@@ -8652,6 +8955,80 @@ mod tests {
         assert_eq!(pg_archive_seq_bound(0), 0);
         assert_eq!(pg_archive_seq_bound(i64::MAX as u64), i64::MAX);
         assert_eq!(pg_archive_seq_bound(u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn only_complete_finalized_boundaries_are_checkpoint_eligible() {
+        assert!(checkpoint_is_complete_finalized_boundary(
+            102,
+            Some(101),
+            Some("0xabc")
+        ));
+        assert!(!checkpoint_is_complete_finalized_boundary(
+            101,
+            Some(101),
+            Some("0xabc")
+        ));
+        assert!(!checkpoint_is_complete_finalized_boundary(
+            102,
+            Some(100),
+            Some("0xabc")
+        ));
+        assert!(!checkpoint_is_complete_finalized_boundary(102, Some(101), None));
+    }
+
+    #[test]
+    fn sealed_finalized_cursor_deduplicates_delayed_ws_logs_after_restart() {
+        let hash = format!("0x{}", "ab".repeat(32));
+        assert!(finalized_cursor_covers_block(
+            102,
+            Some(101),
+            Some(&hash),
+            false,
+            100,
+        ));
+        assert!(!finalized_cursor_covers_block(
+            102,
+            Some(101),
+            Some(&hash),
+            false,
+            102,
+        ));
+        assert!(!finalized_cursor_covers_block(
+            102,
+            Some(101),
+            Some(&hash),
+            true,
+            100,
+        ));
+        assert!(!finalized_cursor_covers_block(
+            101,
+            Some(101),
+            Some(&hash),
+            false,
+            100,
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_archive_database_errors_fail_closed() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres@127.0.0.1:1/unreachable")
+            .unwrap();
+        pool.close().await;
+        let result = StateBackend::Pgsql(pool)
+            .load_archived_batch_page(
+                &format!("0x{}", "11".repeat(20)),
+                0,
+                100,
+                u64::MAX,
+                10,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "archive errors must never look like an empty page"
+        );
     }
 
     fn frozen_update(cmx: &[&str], is_add: &[bool]) -> FrozenUpdate {
@@ -9505,9 +9882,19 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
+        // Other indexes also lead with `pool_address`, so on a tiny fixture the
+        // planner may legitimately scan one of them and filter `tx_hash`. Disable
+        // an explicit sort and request the expression-index order to turn this
+        // EXPLAIN into a deterministic *index usability* probe. The production
+        // query above is still exercised separately for result correctness.
+        sqlx::query("SET LOCAL enable_sort = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
         let forced: Vec<(String,)> = sqlx::query_as(
             "EXPLAIN SELECT cmx_hex FROM notes \
-             WHERE pool_address=$1 AND lower(tx_hash) = ANY($2::text[])",
+             WHERE pool_address=$1 AND lower(tx_hash) = ANY($2::text[]) \
+             ORDER BY pool_address, lower(tx_hash)",
         )
         .bind(&pool_address)
         .bind(vec![shared_tx.to_lowercase()])
@@ -9545,6 +9932,96 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn pg_batch_history_is_keyset_paged_and_keeps_boundary_sequence_whole() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let pool_address = format!("0x{}", "e9".repeat(20));
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
+
+        let mut mutations: Vec<NoteArchiveMutation> = (1..=2_505u64)
+            .map(|seq| {
+                NoteArchiveMutation::Upsert(sample_note_envelope_for_cmx(
+                    unique_cmx(seq),
+                    seq,
+                ))
+            })
+            .collect();
+        for suffix in 1..=3u64 {
+            mutations.push(NoteArchiveMutation::Upsert(
+                sample_note_envelope_for_cmx(unique_cmx(10_000 + suffix), 1_000),
+            ));
+        }
+        pg_apply_note_mutations(&pool, &pool_address, None, &mutations)
+            .await
+            .unwrap();
+
+        let backend = StateBackend::Pgsql(pool.clone());
+        let first = backend
+            .load_archived_batch_page(&pool_address, 0, 2_505, u64::MAX, 1_000)
+            .await
+            .unwrap();
+        assert!(first.has_more);
+        assert_eq!(first.envelopes.len(), 1_003);
+        assert!(first.envelopes.iter().all(|envelope| envelope.seq <= 1_000));
+        assert_eq!(
+            first
+                .envelopes
+                .iter()
+                .filter(|envelope| envelope.seq == 1_000)
+                .count(),
+            4
+        );
+
+        let second = backend
+            .load_archived_batch_page(&pool_address, 1_000, 2_505, u64::MAX, 1_000)
+            .await
+            .unwrap();
+        assert!(second.has_more);
+        assert_eq!(second.envelopes.len(), 1_000);
+        assert_eq!(second.envelopes.first().unwrap().seq, 1_001);
+        assert_eq!(second.envelopes.last().unwrap().seq, 2_000);
+
+        let final_page = backend
+            .load_archived_batch_page(&pool_address, 2_000, 2_505, u64::MAX, 1_000)
+            .await
+            .unwrap();
+        assert!(!final_page.has_more);
+        assert_eq!(final_page.envelopes.len(), 505);
+        assert_eq!(final_page.envelopes.last().unwrap().seq, 2_505);
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let plan: Vec<(String,)> = sqlx::query_as(
+            "EXPLAIN SELECT cmx_hex FROM notes \
+             WHERE pool_address=$1 AND seq > $2 AND seq <= $3 AND seq < $4 \
+             ORDER BY seq, cmx_hex LIMIT $5",
+        )
+        .bind(&pool_address)
+        .bind(0i64)
+        .bind(2_505i64)
+        .bind(i64::MAX)
+        .bind(1_000i64)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        assert!(
+            plan.into_iter()
+                .map(|(line,)| line)
+                .any(|line| line.contains("notes_history_seq_idx")),
+            "bounded history query must use the composite keyset index"
+        );
+
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
     }
 
     #[tokio::test]
@@ -9588,11 +10065,19 @@ mod tests {
         assert_eq!(loaded.confirmed_count, 1);
         assert_eq!(loaded.last_leaf_key, Some((101, 1)));
         assert!(loaded.confirmed_cmx.contains(&cmx));
-        let archived = StateBackend::Pgsql(pool.clone())
-            .load_archived_batches(&pool_address, 0, u64::MAX)
-            .await;
-        assert_eq!(archived.len(), 1);
-        assert_eq!(archived[0].seq, 1);
+        let backend = StateBackend::Pgsql(pool.clone());
+        let mut incomplete = snap.clone();
+        incomplete.next_block = 101;
+        assert!(backend.save(&pool_address, &incomplete).await.is_err());
+        assert!(pg_load(&pool, &pool_address, 1).await.warm_start_candidate);
+
+        let archived = backend
+            .load_archived_batch_page(&pool_address, 0, u64::MAX, u64::MAX, 10)
+            .await
+            .unwrap();
+        assert!(!archived.has_more);
+        assert_eq!(archived.envelopes.len(), 1);
+        assert_eq!(archived.envelopes[0].seq, 1);
 
         // Version 0 models an old writer that cannot maintain the new scalar
         // columns. The read-only snapshot derives them from the atomic note
