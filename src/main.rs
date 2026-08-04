@@ -1,3 +1,5 @@
+mod compact_tree;
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
@@ -12,23 +14,19 @@ use axum::{
     extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, Method, Request, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
     response::sse::{Event, KeepAlive, Sse},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use clap::Parser;
-use ff::{Field, PrimeField};
 use futures_util::stream::{self, StreamExt};
 use futures_util::SinkExt;
-use halo2curves::bn256::Fr;
 use k256::ecdsa::{RecoveryId, SigningKey};
-use privacy_core::commitment_tree::frontier::{
-    CmxConfirmWitnessInput, FrontierTree, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX,
+use privacy_core::commitment_tree::{
+    frontier::{CmxConfirmWitnessInput, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX},
+    OrchardMerklePath,
 };
-use privacy_core::commitment_tree::frozen::{fr_from_be_bytes, fr_to_be_bytes};
-use privacy_core::commitment_tree::poseidon::{merkle_compress, MERKLE_DEPTH_EVM};
-use privacy_core::commitment_tree::OrchardCommitmentTree;
 use privacy_core::ethereum::{
     bundle_actions_by_cmx,
     decode_note_added_log,
@@ -76,6 +74,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 
+use compact_tree::{
+    frontier_from_leaves, required_witness_nodes, witness_from_nodes, witness_root_be,
+    CompactFrontier, MerkleNode, MerkleNodeKey, StreamingFrontierBuilder,
+};
+
 /// BN254 Poseidon incremental tree (depth 32) with **zero leaves**, matching
 /// `IncrementalMerkleTree.init()` / `PrivacyBTC` constructor (`_tree.root` on-chain).
 /// See `contracts/IncrementalMerkleTree.sol` (`_empty(DEPTH)`).
@@ -104,10 +107,7 @@ fn http_root_hex(state: &SharedState) -> Option<String> {
         return None;
     }
     if state.confirmed_count > 0 {
-        // Prefix root at the confirmed watermark (LE bytes, consistent with /merkle_path).
-        // `None` here means the local tree has fewer leaves than the chain has confirmed
-        // (mid-backfill or out-of-order): serve nothing rather than a wrong anchor.
-        return state.tree.root_at(state.confirmed_count).map(hex::encode);
+        return Some(hex::encode(state.confirmed_frontier.root_le()));
     }
     // Nothing confirmed — the on-chain confirmedRoot is the empty-tree root.
     let mut le = EVM_EMPTY_IMT_ROOT;
@@ -119,6 +119,11 @@ fn http_root_hex(state: &SharedState) -> Option<String> {
 
 const DEFAULT_MAX_BATCHES_IN_MEMORY: usize = 4_096;
 const MAX_INCREMENTAL_REPLAY_MUTATIONS: usize = 8_192;
+const MAX_RECENT_EVENT_IDS: usize = 65_536;
+const MAX_BUNDLE_OUT_CACHE: usize = 4_096;
+const DEFAULT_FROZEN_UPDATE_PAGE: usize = 1_000;
+const MAX_FROZEN_UPDATE_PAGE: usize = 4_096;
+const MAX_FROZEN_LEAVES_RESPONSE: usize = 100_000;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -416,6 +421,39 @@ struct BatchEnvelope {
 
 // ─── Shared state ────────────────────────────────────────────────────────────
 
+/// Bounded overlap/reconnect dedup.  The finalized cursor is the durable proof
+/// that older logs were processed; only a recent window is needed to absorb WS,
+/// receipt-recovery, and catch-up overlap inside the current process lifetime.
+#[derive(Default)]
+struct RecentEventIds {
+    order: VecDeque<String>,
+    set: HashSet<String>,
+}
+
+impl RecentEventIds {
+    fn contains(&self, event_id: &str) -> bool {
+        self.set.contains(event_id)
+    }
+
+    fn insert(&mut self, event_id: String) -> bool {
+        if !self.set.insert(event_id.clone()) {
+            return false;
+        }
+        self.order.push_back(event_id);
+        while self.order.len() > MAX_RECENT_EVENT_IDS {
+            if let Some(expired) = self.order.pop_front() {
+                self.set.remove(&expired);
+            }
+        }
+        true
+    }
+
+    fn clear(&mut self) {
+        self.order.clear();
+        self.set.clear();
+    }
+}
+
 struct SharedState {
     next_block: u64,
     /// Last fully scanned Monad-finalized block and its canonical hash.
@@ -425,15 +463,7 @@ struct SharedState {
     last_finalized_block: Option<u64>,
     last_finalized_block_hash: Option<String>,
     latest_seq: u64,
-    /// Dedup set for Phase 1 (NoteAdded) events.
-    seen_event_ids: HashSet<String>,
-    /// Dedup set for Phase 2 (NoteConfirmed) events.
-    confirm_seen_ids: HashSet<String>,
-    /// Dedup set for ShieldCompleted events (they re-emit a batch envelope, so
-    /// WS/catchup overlap must not process them twice).
-    shield_seen_ids: HashSet<String>,
-    /// Dedup set for ERC20Shield accounting events (`Shielded` / `Unshielded`).
-    accounting_seen_ids: HashSet<String>,
+    recent_event_ids: RecentEventIds,
     /// Public aggregate totals for backed shield pools. Values are event-derived:
     /// `current = total_shielded - total_unshielded`.
     shield_accounting: ShieldAccounting,
@@ -451,25 +481,17 @@ struct SharedState {
     tree_out_of_order: bool,
     batches: VecDeque<BatchEnvelope>,
     max_batches: usize,
-    /// Orchard note commitment tree (all cmx, pending + confirmed).
-    tree: OrchardCommitmentTree,
-    /// cmx → leaf position in the commitment tree.
-    cmx_to_position: HashMap<[u8; 32], u64>,
-    /// All cmx leaves in insertion order (big-endian bytes, as from EVM logs).
-    /// Kept in sync with every `tree.append` call; serialised into the checkpoint
-    /// so the tree can be rebuilt from scratch on restart without re-scanning.
-    cmx_ordered: Vec<[u8; 32]>,
-    /// Confirmed cmx set (Phase 2 complete).
-    confirmed_cmx: HashSet<[u8; 32]>,
+    /// O(depth) frontier over all ingested leaves (pending included).
+    tree_frontier: CompactFrontier,
     /// Batch-update watermark: number of leaves folded into the on-chain
     /// `confirmedRoot` (event-derived from `NoteConfirmed` positions and
     /// `RootUpdated.to_count`; rebuilt by the startup backfill replay).
     /// Leaves at positions `>= confirmed_count` are pending — excluded from
     /// `/root` anchors and `/merkle_path` witnesses.
     confirmed_count: u64,
-    /// Restored confirmed frontier. This is populated by warm-start validation
-    /// so the crank need not replay every confirmed leaf on the async runtime.
-    confirmed_frontier: Option<FrontierTree>,
+    /// O(depth) frontier over the confirmed prefix. This is both the `/root`
+    /// source and the crank's exact starting state.
+    confirmed_frontier: CompactFrontier,
     /// Latest confirmed Orchard commitment tree root.
     /// Updated only when a NoteConfirmed event is processed (Phase 2).
     active_root: Option<[u8; 32]>,
@@ -478,11 +500,13 @@ struct SharedState {
     pending_tx_hashes: VecDeque<String>,
     /// Parsed `bundle()` calldata per tx (for OVK `out_ciphertext` + `cv_net_x`).
     bundle_out_cache: HashMap<String, HashMap<[u8; 32], BundleActionCiphertexts>>,
-    /// Ordered feed of compliance blacklist leaf deltas, ingested from on-chain
-    /// `FrozenRootUpdated` events (frozen-tree-execution-plan PR2). The indexer no longer
-    /// maintains the Frozen IMT or serves witnesses — wallets pull this feed and rebuild the
-    /// tree locally. Append-only, in `(block_number, log_index)` order.
-    frozen_updates: Vec<FrozenUpdate>,
+    bundle_out_order: VecDeque<String>,
+    /// Bounded in-memory compliance summary. Historical deltas and the current
+    /// leaf set live in PostgreSQL; no full compliance history is replayed into
+    /// the process on restart.
+    frozen_root_hex: String,
+    frozen_count: u64,
+    frozen_update_count: u64,
 }
 
 // ─── Signing (ETH transaction relay) ─────────────────────────────────────────
@@ -525,6 +549,8 @@ struct AppContext {
     /// in-memory ring (the ring is a hot cache, NOT the source of truth).
     backend: StateBackend,
     shadow_mode: bool,
+    /// Ring-miss / recovery-source counters, shared with this pool's event loop.
+    ring_recovery: Arc<RingRecoveryMetrics>,
 }
 
 /// Everything required to construct a per-pool `AppContext` and spawn its WS
@@ -569,6 +595,17 @@ impl PoolBuilder {
             Some(p) => StateBackend::Pgsql(p.clone()),
             None => StateBackend::Json(self.state_file_for(contract_address)),
         };
+        if !self.shadow_mode {
+            if let Err(error) = backend
+                .upgrade_legacy_compact_checkpoint(contract_address, start_block)
+                .await
+            {
+                eprintln!(
+                    "[indexer][{}] compact checkpoint upgrade did not complete: {error:#}",
+                    &contract_address[..10.min(contract_address.len())]
+                );
+            }
+        }
         let mut ck = backend.load(contract_address, start_block).await;
         if matches!(&backend, StateBackend::Pgsql(_))
             && ck.last_finalized_block.is_some()
@@ -592,7 +629,7 @@ impl PoolBuilder {
         }
         // A fresh checkpoint restarts sequence numbers from 0; a leftover batch
         // archive from an earlier run would collide with re-issued seqs.
-        if ck.latest_seq == 0 {
+        if ck.latest_seq == 0 && ck.tree_frontier.next_index() == 0 && ck.frozen_update_count == 0 {
             backend.reset_archive();
         }
         let persist_paused = Arc::new(AtomicBool::new(false));
@@ -620,55 +657,11 @@ impl PoolBuilder {
             read_only: self.shadow_mode,
         };
 
-        // Rebuild the in-memory tree. A warm candidate is pre-hashed in a
-        // blocking worker so root/path caches and the crank frontier are hot
-        // before canonical health can turn green.
-        let mut restored_frontier = None;
-        let mut restored_tree = OrchardCommitmentTree::new();
-        if ck.warm_start_candidate {
-            let leaves = ck.cmx_ordered.clone();
-            let confirmed_count = ck.confirmed_count;
-            match tokio::task::spawn_blocking(move || {
-                checkpoint_tree_and_frontier(&leaves, confirmed_count)
-            })
-            .await
-            {
-                Ok(Ok((tree, frontier))) => {
-                    restored_tree = tree;
-                    restored_frontier = Some(frontier);
-                }
-                Ok(Err(error)) => {
-                    eprintln!(
-                        "[indexer][{}] checkpoint tree prewarm rejected: {error:#}",
-                        &contract_address[..10.min(contract_address.len())]
-                    );
-                    ck.warm_start_candidate = false;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "[indexer][{}] checkpoint tree worker failed: {error}",
-                        &contract_address[..10.min(contract_address.len())]
-                    );
-                    ck.warm_start_candidate = false;
-                }
-            }
-        }
-        if restored_frontier.is_none() {
-            for cmx_be in &ck.cmx_ordered {
-                restored_tree.append(*cmx_be);
-            }
-        }
-        let restored_cmx_to_pos: HashMap<[u8; 32], u64> = ck
-            .cmx_ordered
-            .iter()
-            .enumerate()
-            .map(|(position, cmx)| (*cmx, position as u64))
-            .collect();
-        if !ck.cmx_ordered.is_empty() {
+        if ck.tree_frontier.next_index() > 0 {
             println!(
-                "[indexer][{}] rebuilt tree with {} leaves through block {}",
+                "[indexer][{}] restored compact frontier with {} leaves through block {}",
                 &contract_address[..10.min(contract_address.len())],
-                ck.cmx_ordered.len(),
+                ck.tree_frontier.next_index(),
                 ck.next_block.saturating_sub(1)
             );
         }
@@ -678,10 +671,7 @@ impl PoolBuilder {
             last_finalized_block: ck.last_finalized_block,
             last_finalized_block_hash: ck.last_finalized_block_hash,
             latest_seq: ck.latest_seq,
-            seen_event_ids: HashSet::new(),
-            confirm_seen_ids: HashSet::new(),
-            shield_seen_ids: HashSet::new(),
-            accounting_seen_ids: HashSet::new(),
+            recent_event_ids: RecentEventIds::default(),
             shield_accounting: ck.shield_accounting,
             last_leaf_key: ck.last_leaf_key,
             warm_start_candidate: ck.warm_start_candidate,
@@ -691,22 +681,23 @@ impl PoolBuilder {
             tree_out_of_order: true,
             batches: ck.batches,
             max_batches: self.max_batches,
-            tree: restored_tree,
-            cmx_to_position: restored_cmx_to_pos,
-            cmx_ordered: ck.cmx_ordered,
-            confirmed_cmx: ck.confirmed_cmx,
+            tree_frontier: ck.tree_frontier,
             confirmed_count: ck.confirmed_count,
-            confirmed_frontier: restored_frontier,
+            confirmed_frontier: ck.confirmed_frontier,
             active_root: ck.active_root,
             pending_tx_hashes: ck.pending_tx_hashes,
             bundle_out_cache: HashMap::new(),
-            frozen_updates: ck.frozen_updates,
+            bundle_out_order: VecDeque::new(),
+            frozen_root_hex: ck.frozen_root_hex,
+            frozen_count: ck.frozen_count,
+            frozen_update_count: ck.frozen_update_count,
         }));
 
         let (batch_tx, _) = broadcast::channel::<BatchEnvelope>(256);
         let recover_trigger = Arc::new(tokio::sync::Notify::new());
 
         let ingest_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let ring_recovery = Arc::new(RingRecoveryMetrics::default());
         let poll_ctx = PollContext {
             rpc: self.rpc.clone(),
             wss_url: self.wss_url.clone(),
@@ -725,6 +716,7 @@ impl PoolBuilder {
             incremental_replay_mutations: Arc::new(tokio::sync::Mutex::new(None)),
             broadcast_paused: Arc::new(AtomicBool::new(false)),
             shadow_mode: self.shadow_mode,
+            ring_recovery: Arc::clone(&ring_recovery),
         };
         let addr_label = contract_address.to_string();
         tokio::spawn(async move {
@@ -742,6 +734,7 @@ impl PoolBuilder {
             recover_trigger,
             backend,
             shadow_mode: self.shadow_mode,
+            ring_recovery,
         }
     }
 }
@@ -783,6 +776,10 @@ struct PoolRegistry {
     relayer_token: Option<Arc<str>>,
     /// Bounds expensive runtime registration RPC work.
     write_semaphore: Arc<Semaphore>,
+    /// Bounds archive reads and their JSON serialization. Historical catch-up
+    /// used to be unbounded, so a handful of concurrent clients could each
+    /// materialize the complete `notes` table and exhaust the process heap.
+    history_read_semaphore: Arc<Semaphore>,
 }
 
 #[derive(Clone, Debug)]
@@ -1438,6 +1435,8 @@ struct BatchesQuery {
 
 const DEFAULT_BATCH_PAGE_LIMIT: usize = 1_000;
 const MAX_BATCH_PAGE_LIMIT: usize = 2_000;
+const HISTORY_READ_CONCURRENCY: usize = 4;
+const MAX_TX_HISTORY_NOTE_ROWS: usize = 2_000;
 
 #[derive(Debug, Deserialize)]
 struct BatchesPageQuery {
@@ -1483,7 +1482,7 @@ struct StatusResponse {
     last_finalized_block_hash: Option<String>,
     latest_seq: u64,
     cached_batches: usize,
-    confirmed_notes: usize,
+    confirmed_notes: u64,
     /// Confirmed root (LE hex) at the batch-update watermark. This is what /root returns.
     active_root_hex: Option<String>,
     /// Local Poseidon tree root over ALL ingested leaves, pending included (LE hex).
@@ -1497,6 +1496,15 @@ struct StatusResponse {
     /// Pool contract address this indexer instance is watching (0x-prefixed lowercase).
     /// Allows clients querying multiple indexer instances to identify which pool each serves.
     pool_address: String,
+    /// Re-emission lookups the `batches` ring could not answer, and where the
+    /// payload came from instead. A steadily rising `ring_misses` means
+    /// `--max-batches-in-memory` no longer covers the lag between a note's
+    /// `NoteAdded` and its `NoteConfirmed`; `ring_recovery_unrecovered` rising
+    /// means the archive is incomplete and those notes were never republished.
+    ring_misses: u64,
+    ring_recovery_from_buffer: u64,
+    ring_recovery_from_archive: u64,
+    ring_recovery_unrecovered: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1711,6 +1719,7 @@ async fn main() -> Result<()> {
             .filter(|s| !s.is_empty())
             .map(Arc::<str>::from),
         write_semaphore: Arc::new(Semaphore::new(2)),
+        history_read_semaphore: Arc::new(Semaphore::new(HISTORY_READ_CONCURRENCY)),
     };
     registry.validate_trust_roots().await?;
 
@@ -2117,7 +2126,7 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
         .build()
         .expect("reqwest client");
     // Confirmed-state frontier per pool (advanced only after an on-chain success).
-    let mut frontiers: HashMap<String, FrontierTree> = HashMap::new();
+    let mut frontiers: HashMap<String, CompactFrontier> = HashMap::new();
     let mut tx_budget = HourlyTxBudget::new(cfg.max_tx_per_hour);
 
     println!(
@@ -2202,18 +2211,27 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
                 continue;
             }
 
-            // 3. Local leaves at the chain watermark.
-            let (leaves, local_len) = {
+            // 3. Local leaves at the chain watermark. Historical commitments
+            // stay in PostgreSQL; only this bounded crank window enters RAM.
+            let (local_len, restored) = {
                 let s = ctx.state.read().await;
-                let take =
-                    (chain_pending as usize).min(CMX_CONFIRM_MAX_BATCH * cfg.max_proofs_per_tx);
-                let end = ((chain_count as usize) + take).min(s.cmx_ordered.len());
-                let leaves: Vec<[u8; 32]> = s
-                    .cmx_ordered
-                    .get(chain_count as usize..end)
-                    .map(|x| x.to_vec())
-                    .unwrap_or_default();
-                (leaves, s.cmx_ordered.len() as u64)
+                let restored = (s.confirmed_frontier.next_index() == chain_count)
+                    .then(|| s.confirmed_frontier.clone());
+                (s.tree_frontier.next_index(), restored)
+            };
+            let take = (chain_pending as usize)
+                .min(CMX_CONFIRM_MAX_BATCH * cfg.max_proofs_per_tx)
+                .min(local_len.saturating_sub(chain_count) as usize);
+            let leaves = match ctx
+                .backend
+                .load_cmx_range(&ctx.contract_address, chain_count, take)
+                .await
+            {
+                Ok(leaves) => leaves,
+                Err(error) => {
+                    eprintln!("[crank][{label}] bounded cmx read failed: {error:#}");
+                    continue;
+                }
             };
             if leaves.is_empty() {
                 // Indexer has not ingested the pending NoteAdded events yet.
@@ -2224,57 +2242,27 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
                 continue;
             }
 
-            // Restore the exact confirmed-state frontier without monopolising a
-            // Tokio worker. Warm-start supplies it directly when counts match;
-            // otherwise derive it in a blocking worker from one final-leaf path
-            // (O(n), rather than replaying 32 hashes per historical leaf).
+            // Restore the exact compact confirmed-state frontier. A count
+            // mismatch is a canonical-state problem; never rebuild history in
+            // the crank hot path.
             let frontier_matches = frontiers
                 .get(&pool)
                 .is_some_and(|frontier| frontier.next_index() == chain_count);
             if !frontier_matches {
-                let (restored, confirmed_prefix): (Option<FrontierTree>, Option<Vec<[u8; 32]>>) = {
-                    let s = ctx.state.read().await;
-                    let restored = s
-                        .confirmed_frontier
-                        .as_ref()
-                        .filter(|frontier| frontier.next_index() == chain_count)
-                        .cloned();
-                    let prefix = s
-                        .cmx_ordered
-                        .get(..chain_count as usize)
-                        .map(ToOwned::to_owned);
-                    (restored, prefix)
-                };
-                let rebuilt = if let Some(frontier) = restored {
-                    Ok(frontier)
-                } else if let Some(prefix) = confirmed_prefix {
-                    println!(
-                        "[crank][{label}] deriving confirmed frontier at count {chain_count} in blocking worker"
-                    );
-                    match tokio::task::spawn_blocking(move || frontier_from_ordered_leaves(&prefix))
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(error) => Err(anyhow!("frontier worker failed: {error}")),
-                    }
+                if let Some(frontier) = restored {
+                    frontiers.insert(pool.clone(), frontier);
                 } else {
-                    Err(anyhow!("local tree behind chain watermark"))
-                };
-                match rebuilt {
-                    Ok(frontier) => {
-                        frontiers.insert(pool.clone(), frontier);
-                    }
-                    Err(error) => {
-                        eprintln!("[crank][{label}] cannot restore frontier: {error:#}");
-                        continue;
-                    }
+                    eprintln!(
+                        "[crank][{label}] compact frontier count does not match chain watermark {chain_count}"
+                    );
+                    continue;
                 }
             }
             let frontier = frontiers
                 .get_mut(&pool)
                 .expect("frontier inserted after successful restore");
             // Byte-identity guard: local frontier must reproduce the chain root.
-            let local_root = fr_to_be_bytes(frontier.root());
+            let local_root = frontier.root_be();
             if local_root != chain_root {
                 eprintln!(
                     "[crank][{label}] DESYNC: local confirmed root {} != chain {} at count {chain_count} — resetting frontier",
@@ -2289,7 +2277,13 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
             //    only after aggregate on-chain success), prove all segments
             //    concurrently, and submit one updateRoot/updateRoots transaction.
             let mut planned = frontier.clone();
-            let inputs = planned.plan_batches(&leaves, cfg.max_proofs_per_tx);
+            let inputs = match planned.plan_batches(&leaves, cfg.max_proofs_per_tx) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    eprintln!("[crank][{label}] compact frontier planning failed: {error:#}");
+                    continue;
+                }
+            };
             let total_j: u64 = inputs.iter().map(CmxConfirmWitnessInput::batch_size).sum();
             println!(
                 "[crank][{label}] confirming {} proof segment(s), leaves={total_j}, count={chain_count}, chain_pending={chain_pending}",
@@ -2564,10 +2558,19 @@ fn canonical_guard(tree_out_of_order: bool) -> Result<(), (StatusCode, String)> 
     }
 }
 
-async fn require_canonical_context(
-    ctx: &AppContext,
-) -> Result<(), (StatusCode, String)> {
+async fn require_canonical_context(ctx: &AppContext) -> Result<(), (StatusCode, String)> {
     canonical_guard(ctx.state.read().await.tree_out_of_order)
+}
+
+async fn acquire_history_read(
+    reg: &PoolRegistry,
+) -> Result<tokio::sync::SemaphorePermit<'_>, (StatusCode, String)> {
+    reg.history_read_semaphore.acquire().await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "historical batch reader is shutting down".to_string(),
+        )
+    })
 }
 
 async fn canonical_api_gate(
@@ -2588,9 +2591,7 @@ async fn canonical_api_gate(
     next.run(request).await
 }
 
-async fn healthz(
-    State(reg): State<PoolRegistry>,
-) -> Result<&'static str, (StatusCode, String)> {
+async fn healthz(State(reg): State<PoolRegistry>) -> Result<&'static str, (StatusCode, String)> {
     let contexts: Vec<AppContext> = reg.pools.read().await.values().cloned().collect();
     if contexts.is_empty() && reg.require_pool {
         return Err((
@@ -2792,7 +2793,8 @@ async fn status(
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let s = ctx.state.read().await;
-    let local_tree_root_hex = s.tree.latest_root().map(hex::encode);
+    let tree_size = s.tree_frontier.next_index();
+    let local_tree_root_hex = (tree_size > 0).then(|| hex::encode(s.tree_frontier.root_le()));
     Ok(Json(StatusResponse {
         next_block: s.next_block,
         canonical: !s.tree_out_of_order,
@@ -2802,13 +2804,21 @@ async fn status(
         last_finalized_block_hash: s.last_finalized_block_hash.clone(),
         latest_seq: s.latest_seq,
         cached_batches: s.batches.len(),
-        confirmed_notes: s.confirmed_cmx.len(),
+        confirmed_notes: s.confirmed_count,
         active_root_hex: http_root_hex(&s),
         local_tree_root_hex,
-        tree_size: s.tree.size(),
+        tree_size,
         confirmed_count: s.confirmed_count,
-        pending_cmx: s.tree.size().saturating_sub(s.confirmed_count),
+        pending_cmx: tree_size.saturating_sub(s.confirmed_count),
         pool_address: ctx.contract_address.clone(),
+        ring_misses: RingRecoveryMetrics::get(&ctx.ring_recovery.ring_misses),
+        ring_recovery_from_buffer: RingRecoveryMetrics::get(
+            &ctx.ring_recovery.recovered_from_buffer,
+        ),
+        ring_recovery_from_archive: RingRecoveryMetrics::get(
+            &ctx.ring_recovery.recovered_from_archive,
+        ),
+        ring_recovery_unrecovered: RingRecoveryMetrics::get(&ctx.ring_recovery.unrecovered),
     }))
 }
 
@@ -2816,9 +2826,17 @@ async fn get_batches(
     State(reg): State<PoolRegistry>,
     Query(q): Query<BatchesQuery>,
 ) -> Result<Json<Vec<BatchEnvelope>>, (StatusCode, String)> {
+    let _history_permit = acquire_history_read(&reg).await?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let after = q.after_seq.unwrap_or(0);
-    let out = collect_batches_since(&ctx, after).await?;
+    let target = ctx.state.read().await.latest_seq;
+    let (out, has_more) = collect_batch_page(&ctx, after, target, MAX_BATCH_PAGE_LIMIT).await?;
+    if has_more {
+        return Err((
+            StatusCode::CONFLICT,
+            "legacy /batches history exceeds the bounded response; use /batches/page".to_string(),
+        ));
+    }
     Ok(Json(out))
 }
 
@@ -2834,6 +2852,7 @@ async fn get_batches_page(
     State(reg): State<PoolRegistry>,
     Query(q): Query<BatchesPageQuery>,
 ) -> Result<Json<BatchesPageResponse>, (StatusCode, String)> {
+    let _history_permit = acquire_history_read(&reg).await?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let after_seq = q.after_seq.unwrap_or(0);
     let initial_latest_seq = {
@@ -2850,7 +2869,13 @@ async fn get_batches_page(
         .unwrap_or(DEFAULT_BATCH_PAGE_LIMIT)
         .clamp(1, MAX_BATCH_PAGE_LIMIT);
 
-    if after_seq >= target_seq {
+    if after_seq > target_seq {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "after_seq cannot exceed the fixed to_seq boundary".to_string(),
+        ));
+    }
+    if after_seq == target_seq {
         return Ok(Json(BatchesPageResponse {
             envelopes: Vec::new(),
             next_after_seq: after_seq,
@@ -2861,21 +2886,14 @@ async fn get_batches_page(
         }));
     }
 
-    let mut candidates = collect_batches_since(&ctx, after_seq).await?;
-    candidates.retain(|envelope| envelope.seq <= target_seq);
-    candidates.sort_by_key(|envelope| envelope.seq);
-
-    let sequences: Vec<u64> = candidates.iter().map(|envelope| envelope.seq).collect();
-    let page_end = batch_page_end(&sequences, limit);
-    let has_more = page_end < candidates.len();
-    let envelopes: Vec<BatchEnvelope> = candidates.into_iter().take(page_end).collect();
+    let (envelopes, has_more) = collect_batch_page(&ctx, after_seq, target_seq, limit).await?;
     let scanned_to_seq = if has_more {
         envelopes
             .last()
             .map(|envelope| envelope.seq)
             .unwrap_or(after_seq)
     } else {
-        // `collect_batches_since` inspected the complete retained window. Moving
+        // `collect_batch_page` inspected the complete retained window. Moving
         // to target is therefore safe even when confirmation upserts created
         // numeric gaps with no row at exactly target_seq.
         target_seq
@@ -2911,43 +2929,69 @@ fn batch_page_end(sequences: &[u64], limit: usize) -> usize {
     end
 }
 
-/// All batch envelopes with `seq > after`, oldest first. Recent envelopes come
-/// from the in-memory ring; anything older than the ring's front (evicted) is
-/// loaded from the persistent backend, so full-history scans never silently
-/// miss notes regardless of `--max-batches-in-memory`.
-async fn collect_batches_since(
+/// One bounded page with `after < seq <= target`, oldest first. The archive is
+/// read by keyset page and then joined to the finite in-memory ring. At most one
+/// equal-sequence group may extend `limit`.
+async fn collect_batch_page(
     ctx: &AppContext,
     after: u64,
-) -> Result<Vec<BatchEnvelope>, (StatusCode, String)> {
-    let (ring, ring_front, latest_seq) = {
+    target: u64,
+    limit: usize,
+) -> Result<(Vec<BatchEnvelope>, bool), (StatusCode, String)> {
+    let (mut ring, ring_front, latest_seq) = {
         let s = ctx.state.read().await;
         canonical_guard(s.tree_out_of_order)?;
         let ring: Vec<BatchEnvelope> = s
             .batches
             .iter()
-            .filter(|b| b.seq > after)
+            .filter(|b| b.seq > after && b.seq <= target)
             .cloned()
             .collect();
         (ring, s.batches.front().map(|b| b.seq), s.latest_seq)
     };
+    ring.sort_by_key(|envelope| envelope.seq);
     // The ring covers (front..=latest); anything in (after..front) was evicted.
     let missing_before = match ring_front {
         Some(front) if front > after.saturating_add(1) => Some(front),
         None if latest_seq > after => Some(u64::MAX),
         _ => None,
     };
-    let Some(before) = missing_before else {
-        return Ok(ring);
-    };
-    let mut out = ctx
-        .backend
-        .load_archived_batches(&ctx.contract_address, after, before)
-        .await;
-    out.extend(ring);
+    let mut out = Vec::new();
+    if let Some(before) = missing_before {
+        let archived = ctx
+            .backend
+            .load_archived_batch_page(&ctx.contract_address, after, target, before, limit)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("bounded batch archive read failed: {error:#}"),
+                )
+            })?;
+        out = archived.envelopes;
+        if archived.has_more {
+            require_canonical_context(ctx).await?;
+            return Ok((out, true));
+        }
+    }
+
+    if out.len() >= limit {
+        let has_more = !ring.is_empty();
+        require_canonical_context(ctx).await?;
+        return Ok((out, has_more));
+    }
+
+    let remaining = limit - out.len();
+    let ring_end = batch_page_end(
+        &ring.iter().map(|envelope| envelope.seq).collect::<Vec<_>>(),
+        remaining,
+    );
+    let has_more = ring_end < ring.len();
+    out.extend(ring.into_iter().take(ring_end));
     // A cursor mismatch may be detected while the archive query is in flight.
     // Recheck before returning any historical rows.
     require_canonical_context(ctx).await?;
-    Ok(out)
+    Ok((out, has_more))
 }
 
 /// SSE endpoint: streams BatchEnvelopes to the client as they arrive.
@@ -2964,6 +3008,7 @@ async fn get_batches_stream(
     headers: HeaderMap,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)>
 {
+    let _history_permit = acquire_history_read(&reg).await?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
 
     // Determine after_seq: Last-Event-ID (reconnect) takes priority over query param.
@@ -2977,9 +3022,18 @@ async fn get_batches_stream(
     // Subscribe FIRST so no live batch is missed while we read history.
     let live_rx = ctx.batch_tx.subscribe();
 
-    // Collect historical batches (seq > after_seq), including archived ones the
-    // in-memory ring has already evicted.
-    let historical: Vec<BatchEnvelope> = collect_batches_since(&ctx, after_seq).await?;
+    // The legacy SSE endpoint keeps only a bounded compatibility window. New
+    // clients must catch up through `/batches/page` before opening a live feed.
+    let target = ctx.state.read().await.latest_seq;
+    let (historical, has_more) =
+        collect_batch_page(&ctx, after_seq, target, MAX_BATCH_PAGE_LIMIT).await?;
+    if has_more {
+        return Err((
+            StatusCode::CONFLICT,
+            "SSE backlog exceeds the bounded compatibility window; catch up with /batches/page"
+                .to_string(),
+        ));
+    }
     let max_hist_seq = historical.last().map(|b| b.seq).unwrap_or(after_seq);
 
     // Build SSE event from a BatchEnvelope.
@@ -3014,7 +3068,7 @@ async fn get_root(
     }
     Ok(Json(RootResponse {
         root_hex: http_root_hex(&s),
-        tree_size: s.tree.size(),
+        tree_size: s.tree_frontier.next_index(),
         confirmed_count: s.confirmed_count,
     }))
 }
@@ -3037,24 +3091,29 @@ async fn get_note(
     let cmx = parse_hex32(&q.cmx)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx hex".to_owned()))?;
 
-    let s = ctx.state.read().await;
-    if s.tree_out_of_order {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "indexer canonical cursor is not verified".to_owned(),
-        ));
-    }
-    for batch in s.batches.iter().rev() {
-        for note in &batch.batch.abi_notes {
-            if note.cmx == cmx {
-                return Ok(Json(note.clone()));
+    {
+        let s = ctx.state.read().await;
+        canonical_guard(s.tree_out_of_order)?;
+        for batch in s.batches.iter().rev() {
+            for note in &batch.batch.abi_notes {
+                if note.cmx == cmx {
+                    return Ok(Json(note.clone()));
+                }
             }
         }
     }
-    Err((
-        StatusCode::NOT_FOUND,
-        "cmx not found in indexer batches".to_owned(),
-    ))
+    // Ring miss: the note is older than the most recent `max_batches` envelopes.
+    // The ring is a hot cache, not the source of truth — answering 404 here would
+    // make an evicted note unspendable (the prover refreshes its witness fields
+    // through this endpoint) and break the wallet's history decrypt.
+    let note = ctx
+        .backend
+        .load_note_by_cmx(&ctx.contract_address, None, cmx)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "cmx not found in indexer".to_owned()))?;
+    // A cursor mismatch may be detected while the archive query is in flight.
+    require_canonical_context(&ctx).await?;
+    Ok(Json(note))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3088,20 +3147,43 @@ async fn get_tx(
     let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     for ctx in contexts {
         let pool_lc = ctx.contract_address.to_lowercase();
-        let s = ctx.state.read().await;
-        canonical_guard(s.tree_out_of_order)?;
-        for batch in s.batches.iter() {
-            for note in &batch.batch.abi_notes {
-                if normalize_hex_0x(&note.tx_hash).to_lowercase() == want && seen.insert(note.cmx) {
-                    out.push(TxNote {
-                        note: note.clone(),
-                        pool: pool_lc.clone(),
-                        symbol: None,
-                        decimals: None,
-                    });
+        {
+            let s = ctx.state.read().await;
+            canonical_guard(s.tree_out_of_order)?;
+            for batch in s.batches.iter() {
+                for note in &batch.batch.abi_notes {
+                    if normalize_hex_0x(&note.tx_hash).to_lowercase() == want
+                        && seen.insert(note.cmx)
+                    {
+                        out.push(TxNote {
+                            note: note.clone(),
+                            pool: pool_lc.clone(),
+                            symbol: None,
+                            decimals: None,
+                        });
+                    }
                 }
             }
         }
+        // Then the archive, for notes this pool's ring has already evicted. The ring
+        // pass runs first and `seen` dedupes, so an in-ring note keeps its (fresher)
+        // in-memory copy and the archive only ever *adds* rows. A tx whose notes
+        // straddle the eviction boundary would otherwise return a partial list.
+        for note in ctx
+            .backend
+            .load_notes_by_tx_hash(&ctx.contract_address, &want)
+            .await
+        {
+            if seen.insert(note.cmx) {
+                out.push(TxNote {
+                    note,
+                    pool: pool_lc.clone(),
+                    symbol: None,
+                    decimals: None,
+                });
+            }
+        }
+        require_canonical_context(&ctx).await?;
     }
     let pools: std::collections::HashSet<String> = out.iter().map(|n| n.pool.clone()).collect();
     for pool in pools {
@@ -3311,6 +3393,7 @@ async fn get_txs(
     State(reg): State<PoolRegistry>,
     Query(q): Query<TxsListQuery>,
 ) -> Result<Json<TxsListResponse>, (StatusCode, String)> {
+    let _history_permit = acquire_history_read(&reg).await?;
     let limit = q.limit.unwrap_or(25).clamp(1, 100);
     let before = q.before_block.unwrap_or(u64::MAX);
     let contexts: Vec<AppContext> = match q.pool.as_deref() {
@@ -3322,8 +3405,8 @@ async fn get_txs(
     // settle emits a note in each leg's pool), so key by hash and merge.
     // Newest page (no cursor) reads only the in-memory ring — cheap, and it's the
     // hot path the live poll hits every few seconds. Any older page (cursor set)
-    // pulls FULL history (ring + persisted archive) via collect_batches_since, so
-    // deep pagination reaches beyond the ring instead of dead-ending at its edge.
+    // reads a bounded PostgreSQL block page, so deep pagination reaches beyond
+    // the ring without materializing the full archive.
     let full_history = q.before_block.is_some();
     let mut by_tx: HashMap<String, TxSummary> = HashMap::new();
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
@@ -3335,10 +3418,27 @@ async fn get_txs(
     // floors. Blocks at/below it are deferred to the next (full-history) page.
     let mut ring_has_older = false;
     let mut ring_cutoff: Option<u64> = None;
+    let mut archive_has_older = false;
+    let per_pool_note_limit = MAX_TX_HISTORY_NOTE_ROWS.div_ceil(contexts.len().max(1));
     for ctx in &contexts {
         let pool_lc = ctx.contract_address.to_lowercase();
         let batches: Vec<BatchEnvelope> = if full_history {
-            collect_batches_since(ctx, 0).await?
+            let page = ctx
+                .backend
+                .load_archived_batches_before_block(
+                    &ctx.contract_address,
+                    before,
+                    per_pool_note_limit,
+                )
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("bounded transaction archive read failed: {error:#}"),
+                    )
+                })?;
+            archive_has_older |= page.has_more;
+            page.envelopes
         } else {
             let s = ctx.state.read().await;
             canonical_guard(s.tree_out_of_order)?;
@@ -3414,7 +3514,7 @@ async fn get_txs(
     // full-history page, preserving "a block is never split across a cursor boundary".
     let mut items: Vec<TxSummary> = Vec::new();
     let mut last_block: Option<u64> = None;
-    let mut truncated = false;
+    let mut truncated = archive_has_older;
     for tx in txs
         .into_iter()
         .filter(|t| t.block_number < before && ring_cutoff.is_none_or(|c| t.block_number > c))
@@ -3713,14 +3813,12 @@ async fn get_swap(
         )
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("eth_getLogs: {e:#}")))?;
-    rpc.validate_canonical_logs(&logs)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("canonical log validation: {e:#}"),
-            )
-        })?;
+    rpc.validate_canonical_logs(&logs).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("canonical log validation: {e:#}"),
+        )
+    })?;
     if logs.is_empty() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -3814,43 +3912,86 @@ async fn get_merkle_path(
     State(reg): State<PoolRegistry>,
     Query(q): Query<MerklePathQuery>,
 ) -> Result<Json<privacy_core::commitment_tree::OrchardMerklePath>, (StatusCode, String)> {
+    let _history_permit = acquire_history_read(&reg).await?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let cmx = parse_hex32(&q.cmx)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid cmx hex".to_owned()))?;
-    let s = ctx.state.read().await;
-    if s.tree_out_of_order {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "indexer canonical cursor is not verified".to_owned(),
-        ));
-    }
-    let &position = s
-        .cmx_to_position
-        .get(&cmx)
+
+    // Serializing with canonical ingestion closes the short interval between a
+    // NoteConfirmed state update and its immutable-node transaction. The lock is
+    // held only across bounded point/node reads, never a historical scan.
+    let _ingest = ctx.ingest_lock.lock().await;
+    let (confirmed_count, expected_root) = {
+        let state = ctx.state.read().await;
+        canonical_guard(state.tree_out_of_order)?;
+        (state.confirmed_count, state.confirmed_frontier.root_be())
+    };
+    let position = ctx
+        .backend
+        .load_cmx_position(&ctx.contract_address, cmx)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("cmx position archive unavailable: {error:#}"),
+            )
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "cmx not found in tree".to_owned()))?;
 
     // Batch-update model: witnesses must open to the CONFIRMED root (`/root`), so they
     // are computed over the confirmed prefix only. A pending note (position >= watermark)
     // has no anchor that includes it yet — it becomes spendable after the next updateRoot.
-    if position >= s.confirmed_count {
+    if position >= confirmed_count {
         return Err((
             StatusCode::CONFLICT,
             format!(
                 "note is pending batch confirmation (position {position}, confirmed {}); retry after the next updateRoot",
-                s.confirmed_count
+                confirmed_count
             ),
         ));
     }
 
-    s.tree
-        .merkle_path_at(position, s.confirmed_count)
-        .ok_or_else(|| {
+    let keys = required_witness_nodes(position, confirmed_count).map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("cannot plan Merkle witness: {error:#}"),
+        )
+    })?;
+    let nodes = ctx
+        .backend
+        .load_merkle_nodes(&ctx.contract_address, &keys)
+        .await
+        .map_err(|error| {
             (
-                StatusCode::NOT_FOUND,
-                "merkle path not available for this position".to_owned(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Merkle node archive unavailable: {error:#}"),
             )
-        })
-        .map(Json)
+        })?;
+    let siblings = witness_from_nodes(position, confirmed_count, &nodes).map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Merkle witness archive is incomplete: {error:#}"),
+        )
+    })?;
+    let actual_root = witness_root_be(cmx, position, &siblings).map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Merkle witness validation failed: {error:#}"),
+        )
+    })?;
+    if actual_root != expected_root {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Merkle witness does not open to the canonical confirmed root".to_owned(),
+        ));
+    }
+    let position = u32::try_from(position).map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Merkle position exceeds the depth-32 tree capacity".to_owned(),
+        )
+    })?;
+    Ok(Json(OrchardMerklePath { position, siblings }))
 }
 
 // ─── Compliance frozen Indexed-MT (rt_frozen) ────────────────────────────────
@@ -3860,7 +4001,7 @@ struct FrozenRootResponse {
     /// Set this on-chain via `setFrozenRoot(rt_frozen)`.
     root_hex: String,
     /// Number of frozen `cmx` (excludes the `{0,0}` sentinel).
-    frozen_count: usize,
+    frozen_count: u64,
 }
 
 // ─── Frozen leaf-delta feed (frozen-tree-execution-plan PR2) ──────────────────
@@ -3875,7 +4016,7 @@ struct FrozenRootResponse {
 // do NOT add indexer-side reorg logic for this feature (see ENG-03/PRO-14 scope).
 
 /// One ingested `FrozenRootUpdated` leaf delta.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct FrozenUpdate {
     /// Cursor components (strictly increasing in on-chain order).
     block_number: u64,
@@ -3986,6 +4127,36 @@ fn replay_frozen_set(updates: &[FrozenUpdate]) -> Vec<String> {
     set
 }
 
+/// Apply one disclosed frozen delta to a bounded membership projection. The
+/// projection contains exactly the cmx values referenced by this event, while
+/// `current_count` is the cardinality of the complete persisted set. This keeps
+/// idempotent re-add/remove semantics without retaining the whole set in RAM.
+fn frozen_count_after_delta(
+    current_count: u64,
+    mut projected_membership: HashSet<String>,
+    update: &FrozenUpdate,
+) -> Result<u64> {
+    if update.cmx_changed_hex.len() != update.is_add.len() {
+        bail!("frozen update cmx/op length mismatch");
+    }
+    let mut next_count = current_count;
+    for (raw_cmx, is_add) in update.cmx_changed_hex.iter().zip(&update.is_add) {
+        let cmx =
+            parse_hex32(raw_cmx).ok_or_else(|| anyhow!("invalid frozen cmx in disclosed delta"))?;
+        let canonical = format!("0x{}", hex::encode(cmx));
+        if *is_add {
+            if projected_membership.insert(canonical) {
+                next_count = next_count.checked_add(1).context("frozen count overflow")?;
+            }
+        } else if projected_membership.remove(&canonical) {
+            next_count = next_count
+                .checked_sub(1)
+                .context("materialized frozen count underflow")?;
+        }
+    }
+    Ok(next_count)
+}
+
 /// Latest `newRoot` disclosed on-chain (from the feed), or the all-zero placeholder if no
 /// update has been ingested yet. The AUTHORITATIVE root is always the pool's on-chain
 /// `cmxFrozenRoot()`; this is a feed-derived convenience.
@@ -4006,9 +4177,10 @@ async fn get_frozen_root(
 ) -> Result<Json<FrozenRootResponse>, (StatusCode, String)> {
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let s = ctx.state.read().await;
+    canonical_guard(s.tree_out_of_order)?;
     Ok(Json(FrozenRootResponse {
-        root_hex: latest_frozen_root_hex(&s.frozen_updates),
-        frozen_count: replay_frozen_set(&s.frozen_updates).len(),
+        root_hex: s.frozen_root_hex.clone(),
+        frozen_count: s.frozen_count,
     }))
 }
 
@@ -4034,12 +4206,41 @@ async fn get_frozen_leaves(
     State(reg): State<PoolRegistry>,
     Query(q): Query<SimplePoolQuery>,
 ) -> Result<Json<FrozenLeavesResponse>, (StatusCode, String)> {
+    let _history_permit = acquire_history_read(&reg).await?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
-    let s = ctx.state.read().await;
-    let leaves = replay_frozen_set(&s.frozen_updates);
+    let _ingest = ctx.ingest_lock.lock().await;
+    let (root_hex, frozen_count) = {
+        let state = ctx.state.read().await;
+        canonical_guard(state.tree_out_of_order)?;
+        (state.frozen_root_hex.clone(), state.frozen_count)
+    };
+    if frozen_count > MAX_FROZEN_LEAVES_RESPONSE as u64 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "frozen set has {frozen_count} leaves; compatibility response limit is {MAX_FROZEN_LEAVES_RESPONSE}"
+            ),
+        ));
+    }
+    let leaves = ctx
+        .backend
+        .load_frozen_leaves(&ctx.contract_address, MAX_FROZEN_LEAVES_RESPONSE)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("frozen current set unavailable: {error:#}"),
+            )
+        })?;
+    if leaves.len() as u64 != frozen_count {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "frozen current set does not match the sealed checkpoint".to_owned(),
+        ));
+    }
     Ok(Json(FrozenLeavesResponse {
         count: leaves.len(),
-        root_hex: latest_frozen_root_hex(&s.frozen_updates),
+        root_hex,
         leaves,
     }))
 }
@@ -4051,6 +4252,10 @@ struct FrozenUpdatesQuery {
     /// Cursor `"<block>:<logIndex>"`; only deltas strictly after it are returned. Omit for all.
     #[serde(default)]
     since: Option<String>,
+    /// Maximum deltas returned. The cursor always points at the final returned
+    /// delta, so existing polling clients can continue until the page is empty.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// `GET /frozen_updates?pool=&since=cursor` — the compliance leaf-delta feed (PR2 main path).
@@ -4061,22 +4266,46 @@ async fn get_frozen_updates(
     State(reg): State<PoolRegistry>,
     Query(q): Query<FrozenUpdatesQuery>,
 ) -> Result<Json<FrozenUpdatesResponse>, (StatusCode, String)> {
+    let _history_permit = acquire_history_read(&reg).await?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
-    // Parse the cursor into (block, logIndex); malformed/absent = from the beginning.
-    let after = q.since.as_deref().and_then(|s| {
-        let (b, l) = s.split_once(':')?;
-        Some((b.parse::<u64>().ok()?, l.parse::<u64>().ok()?))
-    });
-    let s = ctx.state.read().await;
-    let updates: Vec<FrozenUpdate> = s
-        .frozen_updates
-        .iter()
-        .filter(|u| match after {
-            Some((b, l)) => (u.block_number, u.log_index) > (b, l),
-            None => true,
-        })
-        .cloned()
-        .collect();
+    let after = match q.since.as_deref() {
+        Some(value) => {
+            let (block, log) = value
+                .split_once(':')
+                .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid frozen cursor".to_owned()))?;
+            Some((
+                block.parse::<u64>().map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "invalid frozen cursor block".to_owned(),
+                    )
+                })?,
+                log.parse::<u64>().map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "invalid frozen cursor log index".to_owned(),
+                    )
+                })?,
+            ))
+        }
+        None => None,
+    };
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_FROZEN_UPDATE_PAGE)
+        .clamp(1, MAX_FROZEN_UPDATE_PAGE);
+    let _ingest = ctx.ingest_lock.lock().await;
+    canonical_guard(ctx.state.read().await.tree_out_of_order)?;
+    let updates = ctx
+        .backend
+        .load_frozen_updates_after(&ctx.contract_address, after, limit)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("frozen update archive unavailable: {error:#}"),
+            )
+        })?;
     let cursor = updates
         .last()
         .map(|u| format!("{}:{}", u.block_number, u.log_index))
@@ -4145,6 +4374,8 @@ async fn post_notify_tx(
 
 #[derive(Serialize, Deserialize)]
 struct IndexerCheckpoint {
+    #[serde(default)]
+    checkpoint_version: u8,
     next_block: u64,
     #[serde(default)]
     last_finalized_block: Option<u64>,
@@ -4152,6 +4383,14 @@ struct IndexerCheckpoint {
     last_finalized_block_hash: Option<String>,
     #[serde(default)]
     cmx_leaves_hex: Vec<String>,
+    #[serde(default)]
+    tree_size: Option<u64>,
+    #[serde(default)]
+    tree_root_hex: Option<String>,
+    #[serde(default)]
+    tree_frontier_hex: Vec<String>,
+    #[serde(default)]
+    confirmed_frontier_hex: Vec<String>,
     #[serde(default)]
     active_root_hex: Option<String>,
     #[serde(default)]
@@ -4168,9 +4407,15 @@ struct IndexerCheckpoint {
     #[serde(default)]
     pending_tx_hashes: Vec<String>,
     /// Frozen leaf-delta feed ingested from `FrozenRootUpdated` events (PR2). Persisted verbatim
-    /// so the feed survives restarts and wallets can pull from any cursor.
+    /// in legacy JSON checkpoints only. V2 stores the feed in the backend archive.
     #[serde(default)]
     frozen_updates: Vec<FrozenUpdate>,
+    #[serde(default)]
+    frozen_root_hex: Option<String>,
+    #[serde(default)]
+    frozen_count: Option<u64>,
+    #[serde(default)]
+    frozen_update_count: Option<u64>,
     /// Event-derived ERC20Shield aggregate accounting.
     #[serde(default)]
     shield_accounting: ShieldAccounting,
@@ -4181,120 +4426,127 @@ struct CheckpointData {
     next_block: u64,
     last_finalized_block: Option<u64>,
     last_finalized_block_hash: Option<String>,
-    cmx_ordered: Vec<[u8; 32]>,
+    tree_frontier: CompactFrontier,
     active_root: Option<[u8; 32]>,
     confirmed_count: u64,
-    confirmed_cmx: HashSet<[u8; 32]>,
+    confirmed_frontier: CompactFrontier,
     last_leaf_key: Option<(u64, u64)>,
     warm_start_candidate: bool,
     latest_seq: u64,
     batches: VecDeque<BatchEnvelope>,
     pending_tx_hashes: VecDeque<String>,
-    frozen_updates: Vec<FrozenUpdate>,
+    frozen_root_hex: String,
+    frozen_count: u64,
+    frozen_update_count: u64,
     shield_accounting: ShieldAccounting,
 }
 
 fn load_checkpoint(path: &str, start_block: u64) -> CheckpointData {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => match serde_json::from_str::<IndexerCheckpoint>(&raw) {
-            Ok(ck) => {
-                let resumed = ck.next_block.max(start_block);
-                let cmx_ordered: Vec<[u8; 32]> = ck
-                    .cmx_leaves_hex
-                    .iter()
-                    .filter_map(|h| {
-                        let bytes = hex::decode(h.trim_start_matches("0x")).ok()?;
-                        if bytes.len() != 32 {
-                            return None;
-                        }
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&bytes);
-                        Some(arr)
-                    })
-                    .collect();
-                let active_root: Option<[u8; 32]> = ck.active_root_hex.as_deref().and_then(|h| {
-                    let bytes = hex::decode(h.trim_start_matches("0x")).ok()?;
-                    if bytes.len() != 32 {
-                        return None;
-                    }
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    Some(arr)
-                });
-                println!(
-                    "[indexer] resumed from checkpoint {path}: next_block={resumed}, leaves={}",
-                    cmx_ordered.len()
-                );
-                let batches = VecDeque::from(ck.batches);
-                let pending_tx_hashes = VecDeque::from(ck.pending_tx_hashes);
-                CheckpointData {
-                    next_block: resumed,
-                    last_finalized_block: ck.last_finalized_block,
-                    last_finalized_block_hash: ck
-                        .last_finalized_block_hash
-                        .and_then(|hash| normalize_block_hash(&hash).ok()),
-                    cmx_ordered,
-                    active_root,
-                    confirmed_count: ck.confirmed_count.unwrap_or(0),
-                    confirmed_cmx: HashSet::new(),
-                    last_leaf_key: ck.last_leaf_block.zip(ck.last_leaf_log_index),
-                    // JSON checkpoints do not have a transactional note archive,
-                    // so they deliberately retain the full-replay startup path.
-                    warm_start_candidate: false,
-                    latest_seq: ck.latest_seq,
-                    batches,
-                    pending_tx_hashes,
-                    frozen_updates: ck.frozen_updates,
-                    shield_accounting: ck.shield_accounting,
-                }
+    let loaded = (|| -> Result<CheckpointData> {
+        let raw = std::fs::read_to_string(path).context("read JSON checkpoint")?;
+        let ck: IndexerCheckpoint = serde_json::from_str(&raw).context("parse JSON checkpoint")?;
+        let resumed = ck.next_block.max(start_block);
+        let active_root = ck.active_root_hex.as_deref().and_then(parse_hex32);
+        let confirmed_count = ck.confirmed_count.unwrap_or(0);
+
+        let (tree_frontier, confirmed_frontier) = if ck.checkpoint_version >= 2 {
+            let tree_size = ck.tree_size.context("missing compact tree_size")?;
+            let tree_root = ck
+                .tree_root_hex
+                .as_deref()
+                .and_then(parse_hex32)
+                .context("missing compact tree root")?;
+            let tree_filled = parse_hex32_vec(&ck.tree_frontier_hex)?;
+            let confirmed_filled = parse_hex32_vec(&ck.confirmed_frontier_hex)?;
+            let confirmed_root = active_root.unwrap_or(EVM_EMPTY_IMT_ROOT);
+            (
+                CompactFrontier::from_parts_be(&tree_filled, tree_size, tree_root)?,
+                CompactFrontier::from_parts_be(&confirmed_filled, confirmed_count, confirmed_root)?,
+            )
+        } else {
+            // Legacy JSON is a development-only compatibility path. Rebuild the
+            // compact frontier once and immediately discard the historical vector.
+            let leaves = parse_hex32_vec(&ck.cmx_leaves_hex)?;
+            if confirmed_count > leaves.len() as u64 {
+                bail!("legacy confirmed_count exceeds tree size");
             }
-            Err(e) => {
-                eprintln!(
-                    "[indexer] checkpoint parse error ({e}), starting from block {start_block}"
-                );
-                CheckpointData {
-                    next_block: start_block,
-                    last_finalized_block: None,
-                    last_finalized_block_hash: None,
-                    cmx_ordered: vec![],
-                    active_root: None,
-                    confirmed_count: 0,
-                    confirmed_cmx: HashSet::new(),
-                    last_leaf_key: None,
-                    warm_start_candidate: false,
-                    latest_seq: 0,
-                    batches: VecDeque::new(),
-                    pending_tx_hashes: VecDeque::new(),
-                    frozen_updates: vec![],
-                    shield_accounting: ShieldAccounting::default(),
-                }
-            }
-        },
-        Err(_) => CheckpointData {
-            next_block: start_block,
-            last_finalized_block: None,
-            last_finalized_block_hash: None,
-            cmx_ordered: vec![],
-            active_root: None,
-            confirmed_count: 0,
-            confirmed_cmx: HashSet::new(),
-            last_leaf_key: None,
+            (
+                frontier_from_leaves(&leaves)?,
+                frontier_from_leaves(&leaves[..confirmed_count as usize])?,
+            )
+        };
+        let legacy_frozen_root = latest_frozen_root_hex(&ck.frozen_updates);
+        let legacy_frozen_count = replay_frozen_set(&ck.frozen_updates).len() as u64;
+        let legacy_frozen_update_count = ck.frozen_updates.len() as u64;
+        let frozen_root_hex = ck.frozen_root_hex.unwrap_or(legacy_frozen_root);
+        let frozen_count = ck.frozen_count.unwrap_or(legacy_frozen_count);
+        let frozen_update_count = ck.frozen_update_count.unwrap_or(legacy_frozen_update_count);
+        println!(
+            "[indexer] resumed compact checkpoint {path}: next_block={resumed}, leaves={}",
+            tree_frontier.next_index()
+        );
+        Ok(CheckpointData {
+            next_block: resumed,
+            last_finalized_block: ck.last_finalized_block,
+            last_finalized_block_hash: ck
+                .last_finalized_block_hash
+                .and_then(|hash| normalize_block_hash(&hash).ok()),
+            tree_frontier,
+            active_root,
+            confirmed_count,
+            confirmed_frontier,
+            last_leaf_key: ck.last_leaf_block.zip(ck.last_leaf_log_index),
+            // JSON note history and its checkpoint are separate files, so JSON
+            // mode remains ineligible for transactional warm-start.
             warm_start_candidate: false,
-            latest_seq: 0,
-            batches: VecDeque::new(),
-            pending_tx_hashes: VecDeque::new(),
-            frozen_updates: vec![],
-            shield_accounting: ShieldAccounting::default(),
-        },
+            latest_seq: ck.latest_seq,
+            batches: VecDeque::from(ck.batches),
+            pending_tx_hashes: VecDeque::from(ck.pending_tx_hashes),
+            frozen_root_hex,
+            frozen_count,
+            frozen_update_count,
+            shield_accounting: ck.shield_accounting,
+        })
+    })();
+    match loaded {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            eprintln!(
+                "[indexer] checkpoint unavailable ({error:#}), starting from block {start_block}"
+            );
+            empty_checkpoint(start_block)
+        }
     }
+}
+
+fn parse_hex32_vec(values: &[String]) -> Result<Vec<[u8; 32]>> {
+    values
+        .iter()
+        .map(|value| parse_hex32(value).ok_or_else(|| anyhow!("invalid 32-byte hex value")))
+        .collect()
 }
 
 fn save_checkpoint(path: &str, snap: &CheckpointSnapshot) -> Result<()> {
     let ck = IndexerCheckpoint {
+        checkpoint_version: 2,
         next_block: snap.next_block,
         last_finalized_block: snap.last_finalized_block,
         last_finalized_block_hash: snap.last_finalized_block_hash.clone(),
-        cmx_leaves_hex: snap.cmx_ordered.iter().map(hex::encode).collect(),
+        cmx_leaves_hex: Vec::new(),
+        tree_size: Some(snap.tree_frontier.next_index()),
+        tree_root_hex: Some(hex::encode(snap.tree_frontier.root_be())),
+        tree_frontier_hex: snap
+            .tree_frontier
+            .filled_be()
+            .into_iter()
+            .map(hex::encode)
+            .collect(),
+        confirmed_frontier_hex: snap
+            .confirmed_frontier
+            .filled_be()
+            .into_iter()
+            .map(hex::encode)
+            .collect(),
         active_root_hex: snap.active_root.map(hex::encode),
         confirmed_count: Some(snap.confirmed_count),
         last_leaf_block: snap.last_leaf_key.map(|(block, _)| block),
@@ -4302,7 +4554,10 @@ fn save_checkpoint(path: &str, snap: &CheckpointSnapshot) -> Result<()> {
         latest_seq: snap.latest_seq,
         batches: snap.batches.clone(),
         pending_tx_hashes: snap.pending_tx_hashes.clone(),
-        frozen_updates: snap.frozen_updates.clone(),
+        frozen_updates: Vec::new(),
+        frozen_root_hex: Some(snap.frozen_root_hex.clone()),
+        frozen_count: Some(snap.frozen_count),
+        frozen_update_count: Some(snap.frozen_update_count),
         shield_accounting: snap.shield_accounting,
     };
     let json = serde_json::to_string(&ck).context("serialize indexer checkpoint")?;
@@ -4316,36 +4571,72 @@ fn save_checkpoint(path: &str, snap: &CheckpointSnapshot) -> Result<()> {
 
 /// A point-in-time copy of the persistable state, built from `SharedState` while a
 /// lock is held, then handed off (no await needed at the call site).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct CheckpointSnapshot {
     next_block: u64,
     last_finalized_block: Option<u64>,
     last_finalized_block_hash: Option<String>,
-    cmx_ordered: Vec<[u8; 32]>,
+    tree_frontier: CompactFrontier,
     active_root: Option<[u8; 32]>,
     confirmed_count: u64,
+    confirmed_frontier: CompactFrontier,
     last_leaf_key: Option<(u64, u64)>,
     latest_seq: u64,
     batches: Vec<BatchEnvelope>,
     pending_tx_hashes: Vec<String>,
-    frozen_updates: Vec<FrozenUpdate>,
+    frozen_root_hex: String,
+    frozen_count: u64,
+    frozen_update_count: u64,
     shield_accounting: ShieldAccounting,
 }
 
+impl Default for CheckpointSnapshot {
+    fn default() -> Self {
+        Self {
+            next_block: 0,
+            last_finalized_block: None,
+            last_finalized_block_hash: None,
+            tree_frontier: CompactFrontier::new(),
+            active_root: None,
+            confirmed_count: 0,
+            confirmed_frontier: CompactFrontier::new(),
+            last_leaf_key: None,
+            latest_seq: 0,
+            batches: Vec::new(),
+            pending_tx_hashes: Vec::new(),
+            frozen_root_hex: format!("0x{}", "00".repeat(32)),
+            frozen_count: 0,
+            frozen_update_count: 0,
+            shield_accounting: ShieldAccounting::default(),
+        }
+    }
+}
+
 impl CheckpointSnapshot {
+    fn is_complete_finalized_boundary(&self) -> bool {
+        checkpoint_is_complete_finalized_boundary(
+            self.next_block,
+            self.last_finalized_block,
+            self.last_finalized_block_hash.as_deref(),
+        )
+    }
+
     fn from_state(s: &SharedState) -> Self {
         Self {
             next_block: s.next_block,
             last_finalized_block: s.last_finalized_block,
             last_finalized_block_hash: s.last_finalized_block_hash.clone(),
-            cmx_ordered: s.cmx_ordered.clone(),
+            tree_frontier: s.tree_frontier.clone(),
             active_root: s.active_root,
             confirmed_count: s.confirmed_count,
+            confirmed_frontier: s.confirmed_frontier.clone(),
             last_leaf_key: s.last_leaf_key,
             latest_seq: s.latest_seq,
             batches: s.batches.iter().cloned().collect(),
             pending_tx_hashes: s.pending_tx_hashes.iter().cloned().collect(),
-            frozen_updates: s.frozen_updates.clone(),
+            frozen_root_hex: s.frozen_root_hex.clone(),
+            frozen_count: s.frozen_count,
+            frozen_update_count: s.frozen_update_count,
             shield_accounting: s.shield_accounting,
         }
     }
@@ -4354,17 +4645,32 @@ impl CheckpointSnapshot {
             next_block: ck.next_block,
             last_finalized_block: ck.last_finalized_block,
             last_finalized_block_hash: ck.last_finalized_block_hash.clone(),
-            cmx_ordered: ck.cmx_ordered.clone(),
+            tree_frontier: ck.tree_frontier.clone(),
             active_root: ck.active_root,
             confirmed_count: ck.confirmed_count,
+            confirmed_frontier: ck.confirmed_frontier.clone(),
             last_leaf_key: ck.last_leaf_key,
             latest_seq: ck.latest_seq,
             batches: ck.batches.iter().cloned().collect(),
             pending_tx_hashes: ck.pending_tx_hashes.iter().cloned().collect(),
-            frozen_updates: ck.frozen_updates.clone(),
+            frozen_root_hex: ck.frozen_root_hex.clone(),
+            frozen_count: ck.frozen_count,
+            frozen_update_count: ck.frozen_update_count,
             shield_accounting: ck.shield_accounting,
         }
     }
+}
+
+fn checkpoint_is_complete_finalized_boundary(
+    next_block: u64,
+    last_finalized_block: Option<u64>,
+    last_finalized_block_hash: Option<&str>,
+) -> bool {
+    matches!(
+        (last_finalized_block, last_finalized_block_hash),
+        (Some(block), Some(hash))
+            if !hash.is_empty() && next_block == block.saturating_add(1)
+    )
 }
 
 /// Where persisted state lives. `Json` is per-pool (its own file); `Pgsql` is one shared
@@ -4375,11 +4681,64 @@ enum NoteArchiveMutation {
     Confirm {
         cmx: [u8; 32],
         position: u64,
+        nodes: Vec<MerkleNode>,
     },
     ShieldAmount {
         cmx: [u8; 32],
         amount: u64,
     },
+    Frozen {
+        position: u64,
+        update: FrozenUpdate,
+    },
+}
+
+/// How often the `batches` ring failed to answer a re-emission lookup, and where
+/// the payload was recovered from instead.
+///
+/// A ring miss is not an error — the archive fallback makes it correct — but the
+/// rate is the signal for sizing `--max-batches-in-memory`: a steadily non-zero
+/// `ring_misses` means the ring no longer covers the lag between a note's
+/// `NoteAdded` and its `NoteConfirmed`. `unrecovered` is the one that indicates a
+/// real problem: the payload was in neither the ring nor the archive, so the
+/// confirmation could not be republished at all.
+#[derive(Debug, Default)]
+struct RingRecoveryMetrics {
+    /// Re-emission lookups the ring could not answer (all event kinds).
+    ring_misses: AtomicU64,
+    /// Recovered from the uncommitted rebuild/incremental-replay buffer.
+    recovered_from_buffer: AtomicU64,
+    /// Recovered from the persisted archive (PostgreSQL row or JSON line).
+    recovered_from_archive: AtomicU64,
+    /// Found in neither. The note is not republished with a new seq.
+    unrecovered: AtomicU64,
+}
+
+impl RingRecoveryMetrics {
+    fn get(counter: &AtomicU64) -> u64 {
+        counter.load(AtomicOrdering::Relaxed)
+    }
+
+    fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Newest buffered `Upsert` payload for `cmx`, if any. Scans in reverse because a
+/// note can be upserted more than once in a batch and the last write is current.
+fn latest_upserted_note(
+    mutations: &[NoteArchiveMutation],
+    cmx: [u8; 32],
+) -> Option<OrchardIndexedAbiNote> {
+    mutations.iter().rev().find_map(|mutation| match mutation {
+        NoteArchiveMutation::Upsert(env) => env
+            .batch
+            .abi_notes
+            .iter()
+            .find(|note| note.cmx == cmx)
+            .cloned(),
+        _ => None,
+    })
 }
 
 fn push_incremental_replay_mutation(
@@ -4399,14 +4758,9 @@ fn push_incremental_replay_mutation(
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "record_type", rename_all = "snake_case")]
 enum JsonNoteArchiveUpdate {
-    Confirm {
-        cmx_hex: String,
-        position: u64,
-    },
-    ShieldAmount {
-        cmx_hex: String,
-        amount: u64,
-    },
+    Confirm { cmx_hex: String, position: u64 },
+    ShieldAmount { cmx_hex: String, amount: u64 },
+    Frozen { position: u64, update: FrozenUpdate },
 }
 
 #[derive(Clone)]
@@ -4415,10 +4769,15 @@ enum StateBackend {
     Pgsql(sqlx::PgPool),
 }
 
+struct ArchivedBatchPage {
+    envelopes: Vec<BatchEnvelope>,
+    has_more: bool,
+}
+
 impl StateBackend {
     /// Sidecar JSONL file holding every batch envelope ever emitted (JSON mode).
     /// The in-memory ring only caches the most recent `max_batches`; this archive
-    /// is what lets `/batches?after_seq=0` serve full history after eviction.
+    /// is what lets `/batches/page` traverse history after eviction.
     fn json_archive_path(state_path: &str) -> String {
         format!("{state_path}.batches.jsonl")
     }
@@ -4462,7 +4821,7 @@ impl StateBackend {
                         NoteArchiveMutation::Upsert(env) => {
                             Self::append_json_line(&archive_path, env)?;
                         }
-                        NoteArchiveMutation::Confirm { cmx, position } => {
+                        NoteArchiveMutation::Confirm { cmx, position, .. } => {
                             Self::append_json_line(
                                 &archive_path,
                                 &JsonNoteArchiveUpdate::Confirm {
@@ -4480,19 +4839,22 @@ impl StateBackend {
                                 },
                             )?;
                         }
+                        NoteArchiveMutation::Frozen { position, update } => {
+                            Self::append_json_line(
+                                &archive_path,
+                                &JsonNoteArchiveUpdate::Frozen {
+                                    position: *position,
+                                    update: update.clone(),
+                                },
+                            )?;
+                        }
                     }
                 }
                 Ok(())
             }
             StateBackend::Json(None) => Ok(()),
             StateBackend::Pgsql(pool) => {
-                pg_apply_note_mutations(
-                    pool,
-                    pool_address,
-                    rebuild_generation,
-                    mutations,
-                )
-                .await
+                pg_apply_note_mutations(pool, pool_address, rebuild_generation, mutations).await
             }
         }
     }
@@ -4517,11 +4879,7 @@ impl StateBackend {
         }
     }
 
-    async fn begin_canonical_rebuild(
-        &self,
-        pool_address: &str,
-        generation: &str,
-    ) -> Result<()> {
+    async fn begin_canonical_rebuild(&self, pool_address: &str, generation: &str) -> Result<()> {
         match self {
             StateBackend::Json(Some(path)) => {
                 std::fs::write(Self::json_rebuild_archive_path(path), [])
@@ -4546,20 +4904,17 @@ impl StateBackend {
                 let rebuild_path = Self::json_rebuild_archive_path(path);
                 let staged_raw = std::fs::read_to_string(&rebuild_path)
                     .with_context(|| format!("read staged note archive for {pool_address}"))?;
-                let staged_notes =
-                    decode_json_note_archive(&staged_raw, pool_address).len();
-                if staged_notes != snap.cmx_ordered.len() {
+                let staged_notes = decode_json_note_archive(&staged_raw, pool_address).len();
+                if staged_notes as u64 != snap.tree_frontier.next_index() {
                     return Err(anyhow!(
                         "canonical note activation mismatch: staged={staged_notes}, tree_leaves={}",
-                        snap.cmx_ordered.len()
+                        snap.tree_frontier.next_index()
                     ));
                 }
                 save_checkpoint(path, snap)?;
-                std::fs::rename(
-                    rebuild_path,
-                    Self::json_archive_path(path),
-                )
-                .with_context(|| format!("activate finalized note archive for {pool_address}"))?;
+                std::fs::rename(rebuild_path, Self::json_archive_path(path)).with_context(
+                    || format!("activate finalized note archive for {pool_address}"),
+                )?;
                 Ok(())
             }
             StateBackend::Json(None) => Ok(()),
@@ -4579,110 +4934,640 @@ impl StateBackend {
         }
     }
 
-    /// Load archived envelopes with `after_seq < seq < before_seq`, oldest first.
-    /// Complements the in-memory ring when a client asks for history that has
-    /// already been evicted from it.
-    async fn load_archived_batches(
+    /// Load one bounded keyset page with `after_seq < seq <= target_seq` and
+    /// `seq < before_seq`, oldest first. PostgreSQL applies the limit before
+    /// decoding rows; only the final equal-sequence group may extend the soft
+    /// limit so clients never split one logical batch across cursors.
+    async fn load_archived_batch_page(
         &self,
         pool_address: &str,
         after_seq: u64,
+        target_seq: u64,
         before_seq: u64,
-    ) -> Vec<BatchEnvelope> {
+        limit: usize,
+    ) -> Result<ArchivedBatchPage> {
         match self {
             StateBackend::Json(Some(path)) => {
-                let raw = match std::fs::read_to_string(Self::json_archive_path(path)) {
-                    Ok(r) => r,
-                    Err(_) => return Vec::new(),
-                };
-                decode_json_note_archive(&raw, pool_address)
+                // JSON is a development backend whose update records require a
+                // full fold. Keep response size bounded even though decoding it
+                // remains O(history); production PostgreSQL is truly keyset-paged.
+                let mut candidates: Vec<_> = Self::read_json_archive(path, pool_address)
                     .into_iter()
-                    .filter(|env| env.seq > after_seq && env.seq < before_seq)
-                    .collect()
-            }
-            StateBackend::Json(None) => Vec::new(),
-            StateBackend::Pgsql(pool) => {
-                // `u64::MAX` is the in-process sentinel for an unbounded archive
-                // scan when the warm-started in-memory ring is empty.  A direct
-                // `as i64` cast turns that sentinel into -1 and makes the SQL
-                // predicate reject every persisted envelope.
-                let after_seq = pg_archive_seq_bound(after_seq);
-                let before_seq = pg_archive_seq_bound(before_seq);
-                type NoteRow = (
-                    String,         // cmx_hex
-                    i64,            // seq
-                    i64,            // block_number
-                    String,         // tx_hash
-                    i64,            // log_index
-                    Option<i64>,    // position
-                    String,         // enc_ciphertext_hex
-                    String,         // epk_hex
-                    String,         // out_ciphertext_hex
-                    Option<String>, // cv_net_x_hex
-                    String,         // nf_old_hex
-                    String,         // ack_hash_hex
-                    Option<i64>,    // shield_amount_sats
-                    bool,           // is_confirmed
+                    .filter(|env| {
+                        env.seq > after_seq && env.seq <= target_seq && env.seq < before_seq
+                    })
+                    .collect();
+                candidates.sort_by_key(|env| env.seq);
+                let end = batch_page_end(
+                    &candidates.iter().map(|env| env.seq).collect::<Vec<_>>(),
+                    limit,
                 );
-                let rows: Vec<NoteRow> = sqlx::query_as(
-                    "SELECT cmx_hex, seq, block_number, tx_hash, log_index, position, \
-                       enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, \
-                       nf_old_hex, ack_hash_hex, shield_amount_sats, is_confirmed \
-                     FROM notes WHERE pool_address=$1 AND seq > $2 AND seq < $3 ORDER BY seq",
-                )
+                let has_more = end < candidates.len();
+                candidates.truncate(end);
+                Ok(ArchivedBatchPage {
+                    envelopes: candidates,
+                    has_more,
+                })
+            }
+            StateBackend::Json(None) => Ok(ArchivedBatchPage {
+                envelopes: Vec::new(),
+                has_more: false,
+            }),
+            StateBackend::Pgsql(pool) => {
+                let after_seq = pg_archive_seq_bound(after_seq);
+                let target_seq = pg_archive_seq_bound(target_seq);
+                let before_seq = pg_archive_seq_bound(before_seq);
+                let sql_limit = i64::try_from(limit).context("batch page limit exceeds i64")?;
+                let mut rows: Vec<NoteRow> = sqlx::query_as(&format!(
+                    "SELECT {NOTE_SELECT_COLUMNS} FROM notes \
+                     WHERE pool_address=$1 AND seq > $2 AND seq <= $3 AND seq < $4 \
+                     ORDER BY seq, cmx_hex LIMIT $5"
+                ))
                 .bind(pool_address)
                 .bind(after_seq)
+                .bind(target_seq)
                 .bind(before_seq)
+                .bind(sql_limit)
+                .fetch_all(pool)
+                .await
+                .context("load bounded archived batch page")?;
+
+                let mut has_more = false;
+                if rows.len() == limit {
+                    let boundary_seq = rows.last().map(|row| row.1).unwrap_or(after_seq);
+                    let boundary_cmx = rows.last().map(|row| row.0.clone()).unwrap_or_default();
+                    let mut boundary_tail: Vec<NoteRow> = sqlx::query_as(&format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes \
+                         WHERE pool_address=$1 AND seq=$2 AND cmx_hex > $3 \
+                         ORDER BY cmx_hex"
+                    ))
+                    .bind(pool_address)
+                    .bind(boundary_seq)
+                    .bind(boundary_cmx)
+                    .fetch_all(pool)
+                    .await
+                    .context("extend archived page through equal-sequence boundary")?;
+                    rows.append(&mut boundary_tail);
+                    has_more = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM notes \
+                         WHERE pool_address=$1 AND seq > $2 AND seq <= $3 AND seq < $4)",
+                    )
+                    .bind(pool_address)
+                    .bind(boundary_seq)
+                    .bind(target_seq)
+                    .bind(before_seq)
+                    .fetch_one(pool)
+                    .await
+                    .context("check archived batch page continuation")?;
+                }
+                Ok(ArchivedBatchPage {
+                    envelopes: note_rows_into_envelopes(rows, pool_address),
+                    has_more,
+                })
+            }
+        }
+    }
+
+    /// Bounded archive page for the explorer's block cursor. The final block is
+    /// always complete, even when that soft-extends `limit`.
+    async fn load_archived_batches_before_block(
+        &self,
+        pool_address: &str,
+        before_block: u64,
+        limit: usize,
+    ) -> Result<ArchivedBatchPage> {
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let mut candidates: Vec<_> = Self::read_json_archive(path, pool_address)
+                    .into_iter()
+                    .filter(|env| {
+                        env.batch
+                            .abi_notes
+                            .first()
+                            .is_some_and(|note| note.block_number < before_block)
+                    })
+                    .collect();
+                candidates.sort_by(|left, right| {
+                    let left_note = left.batch.abi_notes.first();
+                    let right_note = right.batch.abi_notes.first();
+                    right_note
+                        .map(|note| (note.block_number, note.log_index))
+                        .cmp(&left_note.map(|note| (note.block_number, note.log_index)))
+                });
+                let mut end = limit.min(candidates.len());
+                if end > 0 && end < candidates.len() {
+                    let boundary = candidates[end - 1].batch.abi_notes[0].block_number;
+                    while end < candidates.len()
+                        && candidates[end].batch.abi_notes[0].block_number == boundary
+                    {
+                        end += 1;
+                    }
+                }
+                let has_more = end < candidates.len();
+                candidates.truncate(end);
+                Ok(ArchivedBatchPage {
+                    envelopes: candidates,
+                    has_more,
+                })
+            }
+            StateBackend::Json(None) => Ok(ArchivedBatchPage {
+                envelopes: Vec::new(),
+                has_more: false,
+            }),
+            StateBackend::Pgsql(pool) => {
+                let before_block = pg_archive_seq_bound(before_block);
+                let sql_limit = i64::try_from(limit).context("tx history limit exceeds i64")?;
+                let mut rows: Vec<NoteRow> = sqlx::query_as(&format!(
+                    "SELECT {NOTE_SELECT_COLUMNS} FROM notes \
+                     WHERE pool_address=$1 AND block_number < $2 \
+                     ORDER BY block_number DESC, log_index DESC, cmx_hex LIMIT $3"
+                ))
+                .bind(pool_address)
+                .bind(before_block)
+                .bind(sql_limit)
+                .fetch_all(pool)
+                .await
+                .context("load bounded transaction history")?;
+                let mut has_more = false;
+                if rows.len() == limit {
+                    let boundary_block = rows.last().map(|row| row.2).unwrap_or(before_block);
+                    rows.retain(|row| row.2 != boundary_block);
+                    let mut boundary_rows: Vec<NoteRow> = sqlx::query_as(&format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes \
+                         WHERE pool_address=$1 AND block_number=$2 \
+                         ORDER BY log_index DESC, cmx_hex"
+                    ))
+                    .bind(pool_address)
+                    .bind(boundary_block)
+                    .fetch_all(pool)
+                    .await
+                    .context("extend transaction history through block boundary")?;
+                    rows.append(&mut boundary_rows);
+                    has_more = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM notes \
+                         WHERE pool_address=$1 AND block_number < $2)",
+                    )
+                    .bind(pool_address)
+                    .bind(boundary_block)
+                    .fetch_one(pool)
+                    .await
+                    .context("check transaction history continuation")?;
+                }
+                Ok(ArchivedBatchPage {
+                    envelopes: note_rows_into_envelopes(rows, pool_address),
+                    has_more,
+                })
+            }
+        }
+    }
+
+    /// Read + decode the whole JSON note archive. JSON mode is a development
+    /// backend: this is O(total history) per call, which is why production must
+    /// run on PostgreSQL (see `load_note_by_cmx` / `load_notes_by_tx_hash`).
+    fn read_json_archive(path: &str, pool_address: &str) -> Vec<BatchEnvelope> {
+        match std::fs::read_to_string(Self::json_archive_path(path)) {
+            Ok(raw) => decode_json_note_archive(&raw, pool_address),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn read_json_frozen_updates(path: &str) -> Vec<(u64, FrozenUpdate)> {
+        Self::read_json_frozen_updates_at(&Self::json_archive_path(path))
+    }
+
+    fn read_json_frozen_updates_at(archive_path: &str) -> Vec<(u64, FrozenUpdate)> {
+        let Ok(raw) = std::fs::read_to_string(archive_path) else {
+            return Vec::new();
+        };
+        let mut updates = Vec::new();
+        for line in raw.lines() {
+            if let Ok(JsonNoteArchiveUpdate::Frozen { position, update }) =
+                serde_json::from_str::<JsonNoteArchiveUpdate>(line)
+            {
+                updates.push((position, update));
+            }
+        }
+        updates.sort_by_key(|(position, _)| *position);
+        updates
+    }
+
+    /// Read the persisted membership of only the requested frozen commitments.
+    /// Production executes one indexed query; JSON remains a development-only
+    /// full replay and never affects the PostgreSQL memory bound.
+    async fn load_frozen_membership(
+        &self,
+        pool_address: &str,
+        rebuild_generation: Option<&str>,
+        wanted: &HashSet<String>,
+    ) -> Result<HashSet<String>> {
+        if wanted.is_empty() {
+            return Ok(HashSet::new());
+        }
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let archive_path = if rebuild_generation.is_some() {
+                    Self::json_rebuild_archive_path(path)
+                } else {
+                    Self::json_archive_path(path)
+                };
+                let updates: Vec<_> = Self::read_json_frozen_updates_at(&archive_path)
+                    .into_iter()
+                    .map(|(_, update)| update)
+                    .collect();
+                Ok(replay_frozen_set(&updates)
+                    .into_iter()
+                    .filter(|cmx| wanted.contains(cmx))
+                    .collect())
+            }
+            StateBackend::Json(None) => Ok(HashSet::new()),
+            StateBackend::Pgsql(pool) => {
+                let wanted: Vec<String> = wanted.iter().cloned().collect();
+                let rows: Vec<String> = if let Some(generation) = rebuild_generation {
+                    sqlx::query_scalar(
+                        "SELECT cmx_hex FROM frozen_current_rebuild \
+                         WHERE pool_address=$1 AND rebuild_generation=$2 \
+                           AND cmx_hex = ANY($3::text[])",
+                    )
+                    .bind(pool_address)
+                    .bind(generation)
+                    .bind(&wanted)
+                    .fetch_all(pool)
+                    .await
+                    .context("load staged frozen membership")?
+                } else {
+                    sqlx::query_scalar(
+                        "SELECT cmx_hex FROM frozen_current \
+                         WHERE pool_address=$1 AND cmx_hex = ANY($2::text[])",
+                    )
+                    .bind(pool_address)
+                    .bind(&wanted)
+                    .fetch_all(pool)
+                    .await
+                    .context("load frozen membership")?
+                };
+                Ok(rows.into_iter().collect())
+            }
+        }
+    }
+
+    /// Point lookup of one archived note by cmx.
+    ///
+    /// The in-memory ring only holds the most recent `max_batches` envelopes, so a
+    /// ring scan alone answers `/note` with a false 404 for any note the ring has
+    /// already evicted. `notes` is keyed by `(pool_address, cmx_hex)`, so on
+    /// PostgreSQL this is a primary-key hit — cheaper than the ring scan it backs up.
+    /// `rebuild_generation` selects the staging table a canonical rebuild writes
+    /// to. Passing `None` during a rebuild would read the *previous* generation:
+    /// same cmx means the same note, so the payload would still be correct, but
+    /// the read is kept inside the active generation so an isolated rebuild stays
+    /// isolated.
+    async fn load_note_by_cmx(
+        &self,
+        pool_address: &str,
+        rebuild_generation: Option<&str>,
+        cmx: [u8; 32],
+    ) -> Option<OrchardIndexedAbiNote> {
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let path = match rebuild_generation {
+                    Some(_) => Self::json_rebuild_archive_path(path),
+                    None => Self::json_archive_path(path),
+                };
+                let raw = std::fs::read_to_string(path).ok()?;
+                decode_json_note_archive(&raw, pool_address)
+                    .into_iter()
+                    .find_map(|env| env.batch.abi_notes.into_iter().find(|note| note.cmx == cmx))
+            }
+            StateBackend::Json(None) => None,
+            StateBackend::Pgsql(pool) => {
+                let row: Option<NoteRow> = match rebuild_generation {
+                    Some(generation) => sqlx::query_as(&format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes_rebuild \
+                           WHERE pool_address=$1 AND rebuild_generation=$2 AND cmx_hex=$3"
+                    ))
+                    .bind(pool_address)
+                    .bind(generation)
+                    .bind(hex::encode(cmx))
+                    .fetch_optional(pool)
+                    .await,
+                    None => sqlx::query_as(&format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes WHERE pool_address=$1 AND cmx_hex=$2"
+                    ))
+                    .bind(pool_address)
+                    .bind(hex::encode(cmx))
+                    .fetch_optional(pool)
+                    .await,
+                }
+                .ok()
+                .flatten();
+                row.and_then(note_row_into_note)
+            }
+        }
+    }
+
+    /// Every archived note added by one transaction, oldest first.
+    ///
+    /// `tx_hash` is stored verbatim as it came off the log, so both sides are
+    /// normalised the same way the in-memory scan normalises them. The PostgreSQL
+    /// predicate matches `notes_tx_hash_idx` (`lower(tx_hash)`, migration 0007) —
+    /// changing it without changing the index turns this into a sequential scan.
+    async fn load_notes_by_tx_hash(
+        &self,
+        pool_address: &str,
+        tx_hash: &str,
+    ) -> Vec<OrchardIndexedAbiNote> {
+        let want = normalize_hex_0x(tx_hash).to_lowercase();
+        match self {
+            StateBackend::Json(Some(path)) => Self::read_json_archive(path, pool_address)
+                .into_iter()
+                .flat_map(|env| env.batch.abi_notes)
+                .filter(|note| normalize_hex_0x(&note.tx_hash).to_lowercase() == want)
+                .collect(),
+            StateBackend::Json(None) => Vec::new(),
+            StateBackend::Pgsql(pool) => {
+                // Accept either storage convention (`0x`-prefixed or bare) so the
+                // lookup cannot miss rows written before any normalisation existed.
+                let candidates = vec![want.clone(), strip_0x(&want).to_owned()];
+                let rows: Vec<NoteRow> = sqlx::query_as(&format!(
+                    "SELECT {NOTE_SELECT_COLUMNS} FROM notes WHERE pool_address=$1 \
+                       AND lower(tx_hash) = ANY($2::text[]) ORDER BY seq"
+                ))
+                .bind(pool_address)
+                .bind(&candidates)
                 .fetch_all(pool)
                 .await
                 .unwrap_or_default();
+                rows.into_iter().filter_map(note_row_into_note).collect()
+            }
+        }
+    }
 
+    /// Load a contiguous, bounded leaf window for crank planning. Production
+    /// PostgreSQL applies the range and limit before decoding, so pending-CMX
+    /// planning never materializes historical leaves in the process.
+    async fn load_cmx_range(
+        &self,
+        pool_address: &str,
+        start: u64,
+        limit: usize,
+    ) -> Result<Vec<[u8; 32]>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let start_i64 = i64::try_from(start).context("cmx range start exceeds i64")?;
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let mut positioned: Vec<_> = Self::read_json_archive(path, pool_address)
+                    .into_iter()
+                    .flat_map(|envelope| envelope.batch.abi_notes)
+                    .filter_map(|note| note.cmx_position.map(|position| (position, note.cmx)))
+                    .filter(|(position, _)| *position >= start)
+                    .collect();
+                positioned.sort_unstable_by_key(|(position, _)| *position);
+                positioned.truncate(limit);
+                let mut leaves = Vec::with_capacity(positioned.len());
+                for (offset, (position, cmx)) in positioned.into_iter().enumerate() {
+                    let expected = start.saturating_add(offset as u64);
+                    if position != expected {
+                        bail!(
+                            "JSON cmx archive is not contiguous at position {expected}: found {position}"
+                        );
+                    }
+                    leaves.push(cmx);
+                }
+                Ok(leaves)
+            }
+            StateBackend::Json(None) => Ok(Vec::new()),
+            StateBackend::Pgsql(pool) => {
+                let sql_limit = i64::try_from(limit).context("cmx range limit exceeds i64")?;
+                let rows: Vec<(i64, String)> = sqlx::query_as(
+                    "SELECT position, cmx_hex FROM cmx_leaves \
+                     WHERE pool_address=$1 AND position >= $2 \
+                     ORDER BY position LIMIT $3",
+                )
+                .bind(pool_address)
+                .bind(start_i64)
+                .bind(sql_limit)
+                .fetch_all(pool)
+                .await
+                .context("load bounded cmx range")?;
+                let mut leaves = Vec::with_capacity(rows.len());
+                for (offset, (position, encoded)) in rows.into_iter().enumerate() {
+                    let expected = start_i64
+                        .checked_add(offset as i64)
+                        .context("cmx range position overflow")?;
+                    if position != expected {
+                        bail!(
+                            "cmx archive is not contiguous at position {expected}: found {position}"
+                        );
+                    }
+                    leaves.push(
+                        parse_hex32(&encoded)
+                            .ok_or_else(|| anyhow!("invalid cmx at position {position}"))?,
+                    );
+                }
+                Ok(leaves)
+            }
+        }
+    }
+
+    /// Point lookup used by the compatibility `/merkle_path` endpoint. No
+    /// historical position map is retained in RAM.
+    async fn load_cmx_position(&self, pool_address: &str, cmx: [u8; 32]) -> Result<Option<u64>> {
+        match self {
+            StateBackend::Json(Some(path)) => Ok(Self::read_json_archive(path, pool_address)
+                .into_iter()
+                .flat_map(|envelope| envelope.batch.abi_notes)
+                .find(|note| note.cmx == cmx)
+                .and_then(|note| note.cmx_position)),
+            StateBackend::Json(None) => Ok(None),
+            StateBackend::Pgsql(pool) => {
+                let position: Option<i64> = sqlx::query_scalar(
+                    "SELECT position FROM notes WHERE pool_address=$1 AND cmx_hex=$2",
+                )
+                .bind(pool_address)
+                .bind(hex::encode(cmx))
+                .fetch_optional(pool)
+                .await
+                .context("load cmx position")?;
+                position
+                    .map(|value| u64::try_from(value).context("negative cmx position"))
+                    .transpose()
+            }
+        }
+    }
+
+    /// Fetch only the immutable complete nodes needed for one authentication
+    /// path. The PostgreSQL query is one bounded round trip (normally tens of
+    /// rows), independent of total tree size.
+    async fn load_merkle_nodes(
+        &self,
+        pool_address: &str,
+        keys: &[MerkleNodeKey],
+    ) -> Result<HashMap<MerkleNodeKey, [u8; 32]>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        match self {
+            StateBackend::Json(Some(path)) => {
+                // JSON is a development-only backend. Preserve endpoint behavior
+                // without retaining a tree between requests; production uses the
+                // indexed PostgreSQL node archive below.
+                let wanted: HashSet<_> = keys.iter().copied().collect();
+                let mut positioned: Vec<_> = Self::read_json_archive(path, pool_address)
+                    .into_iter()
+                    .flat_map(|envelope| envelope.batch.abi_notes)
+                    .filter(|note| note.is_confirmed)
+                    .filter_map(|note| note.cmx_position.map(|position| (position, note.cmx)))
+                    .collect();
+                positioned.sort_unstable_by_key(|(position, _)| *position);
+                let mut builder = StreamingFrontierBuilder::new();
+                let mut found = HashMap::with_capacity(keys.len());
+                for (expected, (position, cmx)) in positioned.into_iter().enumerate() {
+                    if position != expected as u64 {
+                        bail!(
+                            "JSON confirmed archive is not contiguous at position {expected}: found {position}"
+                        );
+                    }
+                    for node in builder.push_nonfinal_be(cmx)? {
+                        if wanted.contains(&node.key) {
+                            found.insert(node.key, node.hash_be);
+                        }
+                    }
+                }
+                Ok(found)
+            }
+            StateBackend::Json(None) => Ok(HashMap::new()),
+            StateBackend::Pgsql(pool) => {
+                let levels: Vec<i16> = keys.iter().map(|key| i16::from(key.level)).collect();
+                let indices: Vec<i64> = keys
+                    .iter()
+                    .map(|key| i64::try_from(key.index).context("Merkle node index exceeds i64"))
+                    .collect::<Result<_>>()?;
+                let rows: Vec<(i16, i64, String)> = sqlx::query_as(
+                    "SELECT node.level, node.node_index, node.hash_hex \
+                     FROM merkle_nodes AS node \
+                     JOIN UNNEST($2::smallint[], $3::bigint[]) AS wanted(level, node_index) \
+                       ON node.level=wanted.level AND node.node_index=wanted.node_index \
+                     WHERE node.pool_address=$1",
+                )
+                .bind(pool_address)
+                .bind(&levels)
+                .bind(&indices)
+                .fetch_all(pool)
+                .await
+                .context("load bounded Merkle witness nodes")?;
+                let mut found = HashMap::with_capacity(rows.len());
+                for (level, index, encoded) in rows {
+                    let key = MerkleNodeKey {
+                        level: u8::try_from(level).context("invalid archived Merkle level")?,
+                        index: u64::try_from(index).context("negative archived Merkle index")?,
+                    };
+                    let hash = parse_hex32(&encoded)
+                        .ok_or_else(|| anyhow!("invalid archived Merkle node {level}/{index}"))?;
+                    if found.insert(key, hash).is_some() {
+                        bail!("duplicate archived Merkle node {level}/{index}");
+                    }
+                }
+                Ok(found)
+            }
+        }
+    }
+
+    async fn load_frozen_updates_after(
+        &self,
+        pool_address: &str,
+        after: Option<(u64, u64)>,
+        limit: usize,
+    ) -> Result<Vec<FrozenUpdate>> {
+        let limit = limit.clamp(1, MAX_FROZEN_UPDATE_PAGE);
+        match self {
+            StateBackend::Json(Some(path)) => Ok(Self::read_json_frozen_updates(path)
+                .into_iter()
+                .map(|(_, update)| update)
+                .filter(|update| {
+                    after.is_none_or(|cursor| (update.block_number, update.log_index) > cursor)
+                })
+                .take(limit)
+                .collect()),
+            StateBackend::Json(None) => Ok(Vec::new()),
+            StateBackend::Pgsql(pool) => {
+                let (after_block, after_log) = after.unwrap_or((0, 0));
+                let rows: Vec<(String,)> = sqlx::query_as(
+                    "SELECT update_json FROM frozen_updates \
+                     WHERE pool_address=$1 \
+                       AND ($2::boolean OR (block_number, log_index) > ($3,$4)) \
+                     ORDER BY block_number, log_index LIMIT $5",
+                )
+                .bind(pool_address)
+                .bind(after.is_none())
+                .bind(after_block as i64)
+                .bind(after_log as i64)
+                .bind(limit as i64)
+                .fetch_all(pool)
+                .await
+                .context("load bounded frozen update page")?;
                 rows.into_iter()
-                    .filter_map(|r| {
-                        let (
-                            cmx_hex,
-                            seq,
-                            block_number,
-                            tx_hash,
-                            log_index,
-                            position,
-                            enc_hex,
-                            epk_hex,
-                            out_hex,
-                            cv_hex,
-                            nf_hex,
-                            ack_hex,
-                            shield,
-                            confirmed,
-                        ) = r;
-                        let note = OrchardIndexedAbiNote {
-                            block_number: block_number as u64,
-                            tx_hash,
-                            log_index: log_index as u64,
-                            cmx: parse_hex32(&cmx_hex)?,
-                            enc_ciphertext: hex::decode(strip_0x(&enc_hex)).ok()?,
-                            epk: parse_hex32(&epk_hex)?,
-                            out_ciphertext: hex::decode(strip_0x(&out_hex)).unwrap_or_default(),
-                            cv_net_x: cv_hex.as_deref().and_then(parse_hex32),
-                            nf_old: parse_hex32(&nf_hex)?,
-                            ack_hash: parse_hex32(&ack_hex)?,
-                            cmx_position: position.map(|p| p as u64),
-                            shield_amount_sats: shield.map(|v| v as u64),
-                            is_confirmed: confirmed,
-                        };
-                        Some(BatchEnvelope {
-                            seq: seq as u64,
-                            pool_address: Some(pool_address.to_string()),
-                            batch: OrchardIndexBatch {
-                                from_block: note.block_number,
-                                to_block: note.block_number,
-                                abi_notes: vec![note],
-                                bundles: vec![],
-                                latest_root: None,
-                            },
-                        })
+                    .map(|(encoded,)| {
+                        serde_json::from_str(&encoded).context("decode archived frozen update")
                     })
                     .collect()
             }
+        }
+    }
+
+    async fn load_frozen_leaves(&self, pool_address: &str, limit: usize) -> Result<Vec<String>> {
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let updates: Vec<_> = Self::read_json_frozen_updates(path)
+                    .into_iter()
+                    .map(|(_, update)| update)
+                    .collect();
+                let leaves = replay_frozen_set(&updates);
+                if leaves.len() > limit {
+                    bail!("frozen leaf response exceeds configured limit {limit}");
+                }
+                Ok(leaves)
+            }
+            StateBackend::Json(None) => Ok(Vec::new()),
+            StateBackend::Pgsql(pool) => {
+                let sql_limit = i64::try_from(limit.saturating_add(1))
+                    .context("frozen leaf limit exceeds i64")?;
+                let mut leaves: Vec<String> = sqlx::query_scalar(
+                    "SELECT cmx_hex FROM frozen_current WHERE pool_address=$1 \
+                     ORDER BY cmx_hex LIMIT $2",
+                )
+                .bind(pool_address)
+                .bind(sql_limit)
+                .fetch_all(pool)
+                .await
+                .context("load bounded frozen current set")?;
+                if leaves.len() > limit {
+                    bail!("frozen leaf response exceeds configured limit {limit}");
+                }
+                for leaf in &mut leaves {
+                    let cmx = parse_hex32(leaf)
+                        .ok_or_else(|| anyhow!("invalid materialized frozen cmx"))?;
+                    *leaf = format!("0x{}", hex::encode(cmx));
+                }
+                Ok(leaves)
+            }
+        }
+    }
+
+    /// Upgrade a sealed v1 PostgreSQL checkpoint to the compact v2 format
+    /// without replaying chain history. JSON checkpoints are development-only
+    /// and retain their existing compatibility conversion.
+    async fn upgrade_legacy_compact_checkpoint(
+        &self,
+        pool_address: &str,
+        start_block: u64,
+    ) -> Result<bool> {
+        match self {
+            StateBackend::Pgsql(pool) => {
+                pg_upgrade_legacy_compact_checkpoint(pool, pool_address, start_block).await
+            }
+            StateBackend::Json(_) => Ok(false),
         }
     }
 
@@ -4694,6 +5579,11 @@ impl StateBackend {
         }
     }
     async fn save(&self, pool_address: &str, snap: &CheckpointSnapshot) -> Result<()> {
+        if !snap.is_complete_finalized_boundary() {
+            return Err(anyhow!(
+                "refusing to save an incomplete finalized checkpoint for {pool_address}"
+            ));
+        }
         match self {
             StateBackend::Json(Some(path)) => save_checkpoint(path, snap),
             StateBackend::Json(None) => Ok(()),
@@ -4739,6 +5629,7 @@ fn decode_json_note_archive(raw: &str, pool_address: &str) -> Vec<BatchEnvelope>
                     }
                 }
             }
+            JsonNoteArchiveUpdate::Frozen { .. } => {}
         }
     }
     let mut out: Vec<BatchEnvelope> = by_cmx.into_values().collect();
@@ -4751,16 +5642,18 @@ fn empty_checkpoint(start_block: u64) -> CheckpointData {
         next_block: start_block,
         last_finalized_block: None,
         last_finalized_block_hash: None,
-        cmx_ordered: vec![],
+        tree_frontier: CompactFrontier::new(),
         active_root: None,
         confirmed_count: 0,
-        confirmed_cmx: HashSet::new(),
+        confirmed_frontier: CompactFrontier::new(),
         last_leaf_key: None,
         warm_start_candidate: false,
         latest_seq: 0,
         batches: VecDeque::new(),
         pending_tx_hashes: VecDeque::new(),
-        frozen_updates: vec![],
+        frozen_root_hex: format!("0x{}", "00".repeat(32)),
+        frozen_count: 0,
+        frozen_update_count: 0,
         shield_accounting: ShieldAccounting::default(),
     }
 }
@@ -4788,7 +5681,14 @@ impl Persist {
     }
 
     fn notify(&self, s: &SharedState) {
-        if self.read_only || self.is_paused() {
+        if self.read_only
+            || self.is_paused()
+            || !checkpoint_is_complete_finalized_boundary(
+                s.next_block,
+                s.last_finalized_block,
+                s.last_finalized_block_hash.as_deref(),
+            )
+        {
             return;
         }
         let epoch = self.epoch.load(AtomicOrdering::Acquire);
@@ -4802,7 +5702,7 @@ impl Persist {
     }
     /// Persist an already-built snapshot (for sites that dropped the lock first).
     fn notify_owned(&self, snap: CheckpointSnapshot) {
-        if self.read_only || self.is_paused() {
+        if self.read_only || self.is_paused() || !snap.is_complete_finalized_boundary() {
             return;
         }
         let epoch = self.epoch.load(AtomicOrdering::Acquire);
@@ -4872,13 +5772,17 @@ struct ArchivedNoteRow {
 struct CompactedNoteMutations {
     upserts: Vec<ArchivedNoteRow>,
     confirmations: Vec<([u8; 32], u64)>,
+    merkle_nodes: Vec<MerkleNode>,
     shield_amounts: Vec<([u8; 32], u64)>,
+    frozen_updates: Vec<(u64, FrozenUpdate)>,
 }
 
 fn compact_note_mutations(mutations: &[NoteArchiveMutation]) -> CompactedNoteMutations {
     let mut upserts: HashMap<[u8; 32], ArchivedNoteRow> = HashMap::new();
     let mut confirmations: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut merkle_nodes: HashMap<MerkleNodeKey, MerkleNode> = HashMap::new();
     let mut shield_amounts: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut frozen_updates: HashMap<u64, FrozenUpdate> = HashMap::new();
     for mutation in mutations {
         match mutation {
             NoteArchiveMutation::Upsert(env) => {
@@ -4892,11 +5796,21 @@ fn compact_note_mutations(mutations: &[NoteArchiveMutation]) -> CompactedNoteMut
                     );
                 }
             }
-            NoteArchiveMutation::Confirm { cmx, position } => {
+            NoteArchiveMutation::Confirm {
+                cmx,
+                position,
+                nodes,
+            } => {
                 confirmations.insert(*cmx, *position);
+                for node in nodes {
+                    merkle_nodes.insert(node.key, *node);
+                }
             }
             NoteArchiveMutation::ShieldAmount { cmx, amount } => {
                 shield_amounts.insert(*cmx, *amount);
+            }
+            NoteArchiveMutation::Frozen { position, update } => {
+                frozen_updates.insert(*position, update.clone());
             }
         }
     }
@@ -4904,12 +5818,18 @@ fn compact_note_mutations(mutations: &[NoteArchiveMutation]) -> CompactedNoteMut
     upserts.sort_by_key(|row| row.seq);
     let mut confirmations: Vec<([u8; 32], u64)> = confirmations.into_iter().collect();
     confirmations.sort_by_key(|(cmx, _)| *cmx);
+    let mut merkle_nodes: Vec<MerkleNode> = merkle_nodes.into_values().collect();
+    merkle_nodes.sort_by_key(|node| node.key);
     let mut shield_amounts: Vec<([u8; 32], u64)> = shield_amounts.into_iter().collect();
     shield_amounts.sort_by_key(|(cmx, _)| *cmx);
+    let mut frozen_updates: Vec<(u64, FrozenUpdate)> = frozen_updates.into_iter().collect();
+    frozen_updates.sort_by_key(|(position, _)| *position);
     CompactedNoteMutations {
         upserts,
         confirmations,
+        merkle_nodes,
         shield_amounts,
+        frozen_updates,
     }
 }
 
@@ -4917,6 +5837,88 @@ const NOTE_COLUMNS: &str = "\
 pool_address, cmx_hex, seq, block_number, tx_hash, log_index, position, \
 enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, nf_old_hex, ack_hash_hex, \
 shield_amount_sats, is_confirmed";
+
+/// Column list for every note read, in the order `NoteRow` decodes them — the two
+/// must be changed together. `notes` and `notes_rebuild` share these columns.
+const NOTE_SELECT_COLUMNS: &str = "\
+cmx_hex, seq, block_number, tx_hash, log_index, position, \
+enc_ciphertext_hex, epk_hex, out_ciphertext_hex, cv_net_x_hex, \
+nf_old_hex, ack_hash_hex, shield_amount_sats, is_confirmed";
+
+/// One note row in `NOTE_SELECT_COLUMNS` order.
+type NoteRow = (
+    String,         // cmx_hex
+    i64,            // seq
+    i64,            // block_number
+    String,         // tx_hash
+    i64,            // log_index
+    Option<i64>,    // position
+    String,         // enc_ciphertext_hex
+    String,         // epk_hex
+    String,         // out_ciphertext_hex
+    Option<String>, // cv_net_x_hex
+    String,         // nf_old_hex
+    String,         // ack_hash_hex
+    Option<i64>,    // shield_amount_sats
+    bool,           // is_confirmed
+);
+
+/// Decode a `notes` row. Returns `None` for a row whose hex columns are malformed,
+/// so one corrupt row cannot fail an entire query.
+fn note_row_into_note(row: NoteRow) -> Option<OrchardIndexedAbiNote> {
+    let (
+        cmx_hex,
+        _seq,
+        block_number,
+        tx_hash,
+        log_index,
+        position,
+        enc_hex,
+        epk_hex,
+        out_hex,
+        cv_hex,
+        nf_hex,
+        ack_hex,
+        shield,
+        confirmed,
+    ) = row;
+    Some(OrchardIndexedAbiNote {
+        block_number: block_number as u64,
+        tx_hash,
+        log_index: log_index as u64,
+        cmx: parse_hex32(&cmx_hex)?,
+        enc_ciphertext: hex::decode(strip_0x(&enc_hex)).ok()?,
+        epk: parse_hex32(&epk_hex)?,
+        out_ciphertext: hex::decode(strip_0x(&out_hex)).unwrap_or_default(),
+        cv_net_x: cv_hex.as_deref().and_then(parse_hex32),
+        nf_old: parse_hex32(&nf_hex)?,
+        ack_hash: parse_hex32(&ack_hex)?,
+        cmx_position: position.map(|p| p as u64),
+        shield_amount_sats: shield.map(|v| v as u64),
+        is_confirmed: confirmed,
+    })
+}
+
+/// Wrap `notes` rows back into the one-note-per-envelope shape `/batches` serves.
+fn note_rows_into_envelopes(rows: Vec<NoteRow>, pool_address: &str) -> Vec<BatchEnvelope> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let seq = row.1 as u64;
+            let note = note_row_into_note(row)?;
+            Some(BatchEnvelope {
+                seq,
+                pool_address: Some(pool_address.to_string()),
+                batch: OrchardIndexBatch {
+                    from_block: note.block_number,
+                    to_block: note.block_number,
+                    abi_notes: vec![note],
+                    bundles: vec![],
+                    latest_root: None,
+                },
+            })
+        })
+        .collect()
+}
 
 const NOTE_UPDATE_FROM_EXCLUDED: &str = "\
 seq=EXCLUDED.seq, block_number=EXCLUDED.block_number, tx_hash=EXCLUDED.tx_hash, \
@@ -4965,9 +5967,7 @@ async fn pg_bulk_upsert_notes(
                 .push_bind(note.is_confirmed);
         });
         if rebuild_generation.is_some() {
-            query.push(
-                " ON CONFLICT (pool_address, rebuild_generation, cmx_hex) DO UPDATE SET ",
-            );
+            query.push(" ON CONFLICT (pool_address, rebuild_generation, cmx_hex) DO UPDATE SET ");
         } else {
             query.push(" ON CONFLICT (pool_address, cmx_hex) DO UPDATE SET ");
         }
@@ -4981,6 +5981,205 @@ async fn pg_bulk_upsert_notes(
     Ok(())
 }
 
+async fn pg_append_cmx_leaves(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pool_address: &str,
+    rows: &[ArchivedNoteRow],
+) -> Result<()> {
+    let positioned: Vec<_> = rows
+        .iter()
+        .filter_map(|row| {
+            row.note
+                .cmx_position
+                .map(|position| (position, row.note.cmx))
+        })
+        .collect();
+    for chunk in positioned.chunks(500) {
+        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "INSERT INTO cmx_leaves (pool_address, position, cmx_hex) ",
+        );
+        query.push_values(chunk, |mut row, (position, cmx)| {
+            row.push_bind(pool_address)
+                .push_bind(*position as i64)
+                .push_bind(hex::encode(cmx));
+        });
+        query.push(
+            " ON CONFLICT (pool_address, position) DO UPDATE SET cmx_hex=EXCLUDED.cmx_hex \
+             WHERE cmx_leaves.cmx_hex=EXCLUDED.cmx_hex",
+        );
+        let affected = query
+            .build()
+            .execute(&mut **tx)
+            .await
+            .context("append compact cmx leaves")?
+            .rows_affected();
+        if affected != chunk.len() as u64 {
+            bail!("cmx leaf append conflicted with an existing position or commitment");
+        }
+    }
+    Ok(())
+}
+
+async fn pg_append_merkle_nodes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pool_address: &str,
+    rebuild_generation: Option<&str>,
+    nodes: &[MerkleNode],
+) -> Result<()> {
+    for chunk in nodes.chunks(500) {
+        let prefix = if rebuild_generation.is_some() {
+            "INSERT INTO merkle_nodes_rebuild \
+             (pool_address, rebuild_generation, level, node_index, hash_hex) "
+        } else {
+            "INSERT INTO merkle_nodes (pool_address, level, node_index, hash_hex) "
+        };
+        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(prefix);
+        query.push_values(chunk, |mut row, node| {
+            row.push_bind(pool_address);
+            if let Some(generation) = rebuild_generation {
+                row.push_bind(generation);
+            }
+            row.push_bind(node.key.level as i16)
+                .push_bind(node.key.index as i64)
+                .push_bind(hex::encode(node.hash_be));
+        });
+        if rebuild_generation.is_some() {
+            query.push(
+                " ON CONFLICT (pool_address, rebuild_generation, level, node_index) \
+                 DO UPDATE SET hash_hex=EXCLUDED.hash_hex \
+                 WHERE merkle_nodes_rebuild.hash_hex=EXCLUDED.hash_hex",
+            );
+        } else {
+            query.push(
+                " ON CONFLICT (pool_address, level, node_index) \
+                 DO UPDATE SET hash_hex=EXCLUDED.hash_hex \
+                 WHERE merkle_nodes.hash_hex=EXCLUDED.hash_hex",
+            );
+        }
+        let affected = query
+            .build()
+            .execute(&mut **tx)
+            .await
+            .context("append complete Merkle nodes")?
+            .rows_affected();
+        if affected != chunk.len() as u64 {
+            bail!("Merkle node archive conflicted with an existing hash");
+        }
+    }
+    Ok(())
+}
+
+async fn pg_apply_frozen_updates(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pool_address: &str,
+    rebuild_generation: Option<&str>,
+    updates: &[(u64, FrozenUpdate)],
+) -> Result<()> {
+    for (position, update) in updates {
+        if update.cmx_changed_hex.len() != update.is_add.len() {
+            bail!("frozen update cmx/op length mismatch");
+        }
+        let encoded = serde_json::to_string(update).context("serialize frozen update")?;
+        let affected = if let Some(generation) = rebuild_generation {
+            sqlx::query(
+                "INSERT INTO frozen_updates_rebuild \
+                   (pool_address, rebuild_generation, position, block_number, log_index, update_json) \
+                 VALUES ($1,$2,$3,$4,$5,$6) \
+                 ON CONFLICT (pool_address, rebuild_generation, position) DO UPDATE SET \
+                   block_number=EXCLUDED.block_number, log_index=EXCLUDED.log_index, \
+                   update_json=EXCLUDED.update_json \
+                 WHERE frozen_updates_rebuild.block_number=EXCLUDED.block_number \
+                   AND frozen_updates_rebuild.log_index=EXCLUDED.log_index \
+                   AND frozen_updates_rebuild.update_json=EXCLUDED.update_json",
+            )
+            .bind(pool_address)
+            .bind(generation)
+            .bind(*position as i64)
+            .bind(update.block_number as i64)
+            .bind(update.log_index as i64)
+            .bind(&encoded)
+            .execute(&mut **tx)
+            .await
+            .context("append staged frozen update")?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "INSERT INTO frozen_updates \
+                   (pool_address, position, block_number, log_index, update_json) \
+                 VALUES ($1,$2,$3,$4,$5) \
+                 ON CONFLICT (pool_address, position) DO UPDATE SET \
+                   block_number=EXCLUDED.block_number, log_index=EXCLUDED.log_index, \
+                   update_json=EXCLUDED.update_json \
+                 WHERE frozen_updates.block_number=EXCLUDED.block_number \
+                   AND frozen_updates.log_index=EXCLUDED.log_index \
+                   AND frozen_updates.update_json=EXCLUDED.update_json",
+            )
+            .bind(pool_address)
+            .bind(*position as i64)
+            .bind(update.block_number as i64)
+            .bind(update.log_index as i64)
+            .bind(&encoded)
+            .execute(&mut **tx)
+            .await
+            .context("append frozen update")?
+            .rows_affected()
+        };
+        if affected != 1 {
+            bail!("frozen update conflicts with an existing archive position");
+        }
+
+        for (raw_cmx, is_add) in update.cmx_changed_hex.iter().zip(&update.is_add) {
+            let cmx =
+                parse_hex32(raw_cmx).ok_or_else(|| anyhow!("invalid frozen cmx in update"))?;
+            let canonical = format!("0x{}", hex::encode(cmx));
+            if let Some(generation) = rebuild_generation {
+                if *is_add {
+                    sqlx::query(
+                        "INSERT INTO frozen_current_rebuild \
+                           (pool_address, rebuild_generation, cmx_hex) VALUES ($1,$2,$3) \
+                         ON CONFLICT DO NOTHING",
+                    )
+                    .bind(pool_address)
+                    .bind(generation)
+                    .bind(&canonical)
+                    .execute(&mut **tx)
+                    .await?
+                    .rows_affected();
+                } else {
+                    sqlx::query(
+                        "DELETE FROM frozen_current_rebuild \
+                         WHERE pool_address=$1 AND rebuild_generation=$2 AND cmx_hex=$3",
+                    )
+                    .bind(pool_address)
+                    .bind(generation)
+                    .bind(&canonical)
+                    .execute(&mut **tx)
+                    .await?
+                    .rows_affected();
+                }
+            } else if *is_add {
+                sqlx::query(
+                    "INSERT INTO frozen_current (pool_address, cmx_hex) VALUES ($1,$2) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(pool_address)
+                .bind(&canonical)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+            } else {
+                sqlx::query("DELETE FROM frozen_current WHERE pool_address=$1 AND cmx_hex=$2")
+                    .bind(pool_address)
+                    .bind(&canonical)
+                    .execute(&mut **tx)
+                    .await?
+                    .rows_affected();
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn pg_apply_compacted_note_mutations_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     pool_address: &str,
@@ -4988,6 +6187,23 @@ async fn pg_apply_compacted_note_mutations_tx(
     compacted: &CompactedNoteMutations,
 ) -> Result<()> {
     pg_bulk_upsert_notes(tx, pool_address, rebuild_generation, &compacted.upserts).await?;
+    if rebuild_generation.is_none() {
+        pg_append_cmx_leaves(tx, pool_address, &compacted.upserts).await?;
+    }
+    pg_append_merkle_nodes(
+        tx,
+        pool_address,
+        rebuild_generation,
+        &compacted.merkle_nodes,
+    )
+    .await?;
+    pg_apply_frozen_updates(
+        tx,
+        pool_address,
+        rebuild_generation,
+        &compacted.frozen_updates,
+    )
+    .await?;
 
     if !compacted.confirmations.is_empty() {
         let cmx_values: Vec<String> = compacted
@@ -5005,7 +6221,8 @@ async fn pg_apply_compacted_note_mutations_tx(
                 "UPDATE notes_rebuild AS n \
                  SET position=u.position, is_confirmed=TRUE \
                  FROM UNNEST($3::text[], $4::bigint[]) AS u(cmx_hex, position) \
-                 WHERE n.pool_address=$1 AND n.rebuild_generation=$2 AND n.cmx_hex=u.cmx_hex",
+                 WHERE n.pool_address=$1 AND n.rebuild_generation=$2 AND n.cmx_hex=u.cmx_hex \
+                   AND n.position=u.position",
             )
             .bind(pool_address)
             .bind(generation)
@@ -5019,7 +6236,7 @@ async fn pg_apply_compacted_note_mutations_tx(
                 "UPDATE notes AS n \
                  SET position=u.position, is_confirmed=TRUE \
                  FROM UNNEST($2::text[], $3::bigint[]) AS u(cmx_hex, position) \
-                 WHERE n.pool_address=$1 AND n.cmx_hex=u.cmx_hex",
+                 WHERE n.pool_address=$1 AND n.cmx_hex=u.cmx_hex AND n.position=u.position",
             )
             .bind(pool_address)
             .bind(&cmx_values)
@@ -5114,6 +6331,21 @@ async fn pg_begin_canonical_rebuild(
         .execute(pool)
         .await
         .context("clear stale note rebuild generations")?;
+    sqlx::query("DELETE FROM merkle_nodes_rebuild WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(pool)
+        .await
+        .context("clear stale Merkle-node rebuild generations")?;
+    sqlx::query("DELETE FROM frozen_updates_rebuild WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(pool)
+        .await
+        .context("clear stale frozen-update rebuild generations")?;
+    sqlx::query("DELETE FROM frozen_current_rebuild WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(pool)
+        .await
+        .context("clear stale frozen-current rebuild generations")?;
     Ok(())
 }
 
@@ -5123,65 +6355,37 @@ enum SnapshotSaveMode {
     AppendOnly,
 }
 
-async fn pg_existing_cmx_prefix_len(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    pool_address: &str,
-    snap: &CheckpointSnapshot,
-) -> Result<usize> {
-    let (count, max_position): (i64, Option<i64>) =
-        sqlx::query_as("SELECT count(*), max(position) FROM cmx_leaves WHERE pool_address=$1")
-            .bind(pool_address)
-            .fetch_one(&mut **tx)
-            .await
-            .context("inspect persisted cmx prefix")?;
-    let count = usize::try_from(count).context("negative persisted cmx count")?;
-    let expected_max = count.checked_sub(1).map(|position| position as i64);
-    if max_position != expected_max {
-        return Err(anyhow!(
-            "persisted cmx positions are not contiguous: count={count}, max={max_position:?}"
-        ));
-    }
-    if count > snap.cmx_ordered.len() {
-        return Err(anyhow!(
-            "append-only cmx checkpoint would shrink persisted state: persisted={count}, snapshot={}",
-            snap.cmx_ordered.len()
-        ));
-    }
-    if count > 0 {
-        let last_hex: String = sqlx::query_scalar(
-            "SELECT cmx_hex FROM cmx_leaves WHERE pool_address=$1 AND position=$2",
-        )
-        .bind(pool_address)
-        .bind((count - 1) as i64)
-        .fetch_one(&mut **tx)
-        .await
-        .context("load persisted cmx prefix boundary")?;
-        let expected = hex::encode(snap.cmx_ordered[count - 1]);
-        if !last_hex.eq_ignore_ascii_case(&expected) {
-            return Err(anyhow!(
-                "append-only cmx checkpoint prefix mismatch at position {}",
-                count - 1
-            ));
-        }
-    }
-    Ok(count)
-}
-
 async fn pg_save_snapshot_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     pool_address: &str,
     snap: &CheckpointSnapshot,
-    mode: SnapshotSaveMode,
+    _mode: SnapshotSaveMode,
 ) -> Result<()> {
+    let tree_frontier_hex: Vec<String> = snap
+        .tree_frontier
+        .filled_be()
+        .into_iter()
+        .map(hex::encode)
+        .collect();
+    let confirmed_frontier_hex: Vec<String> = snap
+        .confirmed_frontier
+        .filled_be()
+        .into_iter()
+        .map(hex::encode)
+        .collect();
     sqlx::query(
         "INSERT INTO indexer_meta \
            (pool_address, next_block, active_root_hex, latest_seq, last_finalized_block, last_finalized_block_hash, \
-            confirmed_count, last_leaf_block, last_leaf_log_index, checkpoint_version, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1, now()) \
+            confirmed_count, last_leaf_block, last_leaf_log_index, tree_size, tree_root_hex, \
+            tree_frontier_hex, confirmed_frontier_hex, frozen_root_hex, frozen_count, \
+            frozen_update_count, checkpoint_version, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,2, now()) \
          ON CONFLICT (pool_address) DO UPDATE SET \
            next_block=$2, active_root_hex=$3, latest_seq=$4, \
            last_finalized_block=$5, last_finalized_block_hash=$6, confirmed_count=$7, \
-           last_leaf_block=$8, last_leaf_log_index=$9, checkpoint_version=1, updated_at=now()",
+           last_leaf_block=$8, last_leaf_log_index=$9, tree_size=$10, tree_root_hex=$11, \
+           tree_frontier_hex=$12, confirmed_frontier_hex=$13, frozen_root_hex=$14, \
+           frozen_count=$15, frozen_update_count=$16, checkpoint_version=2, updated_at=now()",
     )
     .bind(pool_address)
     .bind(snap.next_block as i64)
@@ -5192,62 +6396,16 @@ async fn pg_save_snapshot_tx(
     .bind(snap.confirmed_count as i64)
     .bind(snap.last_leaf_key.map(|(block, _)| block as i64))
     .bind(snap.last_leaf_key.map(|(_, log_index)| log_index as i64))
+    .bind(snap.tree_frontier.next_index() as i64)
+    .bind(hex::encode(snap.tree_frontier.root_be()))
+    .bind(&tree_frontier_hex)
+    .bind(&confirmed_frontier_hex)
+    .bind(&snap.frozen_root_hex)
+    .bind(snap.frozen_count as i64)
+    .bind(snap.frozen_update_count as i64)
     .execute(&mut **tx)
     .await
     .context("upsert indexer_meta")?;
-
-    let cmx_start = match mode {
-        SnapshotSaveMode::ReplaceDerivedState => {
-            sqlx::query("DELETE FROM cmx_leaves WHERE pool_address=$1")
-                .bind(pool_address)
-                .execute(&mut **tx)
-                .await
-                .context("replace cmx_leaves")?;
-            0
-        }
-        SnapshotSaveMode::AppendOnly => pg_existing_cmx_prefix_len(tx, pool_address, snap).await?,
-    };
-    sqlx::query("DELETE FROM frozen_updates WHERE pool_address=$1")
-        .bind(pool_address)
-        .execute(&mut **tx)
-        .await
-        .context("replace frozen_updates")?;
-
-    for (chunk_number, chunk) in snap.cmx_ordered[cmx_start..].chunks(1_000).enumerate() {
-        let base = cmx_start + chunk_number * 1_000;
-        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-            "INSERT INTO cmx_leaves (pool_address, position, cmx_hex) ",
-        );
-        query.push_values(chunk.iter().enumerate(), |mut row, (offset, cmx)| {
-            row.push_bind(pool_address)
-                .push_bind((base + offset) as i64)
-                .push_bind(hex::encode(cmx));
-        });
-        query
-            .build()
-            .execute(&mut **tx)
-            .await
-            .context("bulk insert cmx_leaves")?;
-    }
-
-    // Frozen leaf-delta feed (append-only, on-chain order) — one JSON row per ingested
-    // `FrozenRootUpdated`, replayed by wallets to rebuild the Frozen IMT (PR2). Note persistence
-    // moved out of the snapshot in origin's canonical-rebuild refactor (`pg_load` leaves batches
-    // empty and `backfill_from_chain` re-derives notes from the finalized chain), so this function
-    // no longer inlines a notes upsert.
-    for (pos, upd) in snap.frozen_updates.iter().enumerate() {
-        let json = serde_json::to_string(upd).context("serialize frozen_update")?;
-        sqlx::query(
-            "INSERT INTO frozen_updates (pool_address, position, update_json) VALUES ($1,$2,$3) \
-             ON CONFLICT (pool_address, position) DO NOTHING",
-        )
-        .bind(pool_address)
-        .bind(pos as i64)
-        .bind(json)
-        .execute(&mut **tx)
-        .await
-        .context("insert frozen_updates")?;
-    }
 
     sqlx::query("DELETE FROM pending_tx WHERE pool_address=$1")
         .bind(pool_address)
@@ -5293,7 +6451,10 @@ async fn pg_finish_canonical_rebuild(
     generation: &str,
     snap: &CheckpointSnapshot,
 ) -> Result<()> {
-    let mut tx = pool.begin().await.context("begin canonical rebuild activation")?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin canonical rebuild activation")?;
     let staged: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM notes_rebuild \
          WHERE pool_address=$1 AND rebuild_generation=$2",
@@ -5303,11 +6464,53 @@ async fn pg_finish_canonical_rebuild(
     .fetch_one(&mut *tx)
     .await
     .context("count staged canonical notes")?;
-    if staged as usize != snap.cmx_ordered.len() {
+    if staged as u64 != snap.tree_frontier.next_index() {
         return Err(anyhow!(
             "canonical note activation mismatch: staged={staged}, tree_leaves={}",
-            snap.cmx_ordered.len()
+            snap.tree_frontier.next_index()
         ));
+    }
+    let staged_leaf_nodes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM merkle_nodes_rebuild \
+         WHERE pool_address=$1 AND rebuild_generation=$2 AND level=0",
+    )
+    .bind(pool_address)
+    .bind(generation)
+    .fetch_one(&mut *tx)
+    .await
+    .context("count staged confirmed Merkle leaves")?;
+    if staged_leaf_nodes as u64 != snap.confirmed_count {
+        bail!(
+            "canonical Merkle activation mismatch: staged_leaves={staged_leaf_nodes}, confirmed={}",
+            snap.confirmed_count
+        );
+    }
+    let staged_frozen_updates: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM frozen_updates_rebuild \
+         WHERE pool_address=$1 AND rebuild_generation=$2",
+    )
+    .bind(pool_address)
+    .bind(generation)
+    .fetch_one(&mut *tx)
+    .await
+    .context("count staged frozen updates")?;
+    let staged_frozen_current: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM frozen_current_rebuild \
+         WHERE pool_address=$1 AND rebuild_generation=$2",
+    )
+    .bind(pool_address)
+    .bind(generation)
+    .fetch_one(&mut *tx)
+    .await
+    .context("count staged frozen current set")?;
+    if staged_frozen_updates as u64 != snap.frozen_update_count
+        || staged_frozen_current as u64 != snap.frozen_count
+    {
+        bail!(
+            "canonical frozen activation mismatch: updates={staged_frozen_updates}/{}, current={staged_frozen_current}/{}",
+            snap.frozen_update_count,
+            snap.frozen_count
+        );
     }
 
     sqlx::query("DELETE FROM notes WHERE pool_address=$1")
@@ -5338,6 +6541,79 @@ async fn pg_finish_canonical_rebuild(
         ));
     }
 
+    sqlx::query("DELETE FROM cmx_leaves WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear previous canonical cmx leaves")?;
+    let inserted_leaves = sqlx::query(
+        "INSERT INTO cmx_leaves (pool_address, position, cmx_hex) \
+         SELECT pool_address, position, cmx_hex FROM notes_rebuild \
+         WHERE pool_address=$1 AND rebuild_generation=$2 AND position IS NOT NULL \
+         ORDER BY position",
+    )
+    .bind(pool_address)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await
+    .context("activate staged canonical cmx leaves")?
+    .rows_affected();
+    if inserted_leaves != snap.tree_frontier.next_index() {
+        bail!(
+            "canonical cmx activation mismatch: inserted={inserted_leaves}, tree_leaves={}",
+            snap.tree_frontier.next_index()
+        );
+    }
+
+    sqlx::query("DELETE FROM merkle_nodes WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear previous canonical Merkle nodes")?;
+    sqlx::query(
+        "INSERT INTO merkle_nodes (pool_address, level, node_index, hash_hex) \
+         SELECT pool_address, level, node_index, hash_hex FROM merkle_nodes_rebuild \
+         WHERE pool_address=$1 AND rebuild_generation=$2",
+    )
+    .bind(pool_address)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await
+    .context("activate staged canonical Merkle nodes")?;
+
+    sqlx::query("DELETE FROM frozen_updates WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear previous frozen update archive")?;
+    sqlx::query(
+        "INSERT INTO frozen_updates \
+           (pool_address, position, block_number, log_index, update_json) \
+         SELECT pool_address, position, block_number, log_index, update_json \
+         FROM frozen_updates_rebuild \
+         WHERE pool_address=$1 AND rebuild_generation=$2 ORDER BY position",
+    )
+    .bind(pool_address)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await
+    .context("activate staged frozen update archive")?;
+    sqlx::query("DELETE FROM frozen_current WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear previous frozen current set")?;
+    sqlx::query(
+        "INSERT INTO frozen_current (pool_address, cmx_hex) \
+         SELECT pool_address, cmx_hex FROM frozen_current_rebuild \
+         WHERE pool_address=$1 AND rebuild_generation=$2",
+    )
+    .bind(pool_address)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await
+    .context("activate staged frozen current set")?;
+
     pg_save_snapshot_tx(
         &mut tx,
         pool_address,
@@ -5350,6 +6626,21 @@ async fn pg_finish_canonical_rebuild(
         .execute(&mut *tx)
         .await
         .context("clear activated note staging rows")?;
+    sqlx::query("DELETE FROM merkle_nodes_rebuild WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear activated Merkle-node staging rows")?;
+    sqlx::query("DELETE FROM frozen_updates_rebuild WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear activated frozen-update staging rows")?;
+    sqlx::query("DELETE FROM frozen_current_rebuild WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear activated frozen-current staging rows")?;
     tx.commit()
         .await
         .context("commit canonical rebuild activation")
@@ -5379,6 +6670,343 @@ async fn pg_commit_incremental_replay(
         .context("commit incremental replay transaction")
 }
 
+/// Convert one sealed v1 checkpoint to the v2 compact-frontier/node-archive
+/// representation. The source is the transactional PostgreSQL leaf archive, not
+/// RPC, so a routine binary restart does not trigger a historical chain replay.
+///
+/// Memory is bounded by one 4K leaf page, two depth-32 builders, and one page of
+/// complete nodes. All writes live in the same transaction as the v2 metadata
+/// seal; any validation or insertion failure rolls back to the untouched v1 row.
+async fn pg_upgrade_legacy_compact_checkpoint(
+    pool: &sqlx::PgPool,
+    pool_address: &str,
+    start_block: u64,
+) -> Result<bool> {
+    type LegacyMeta = (
+        i16,
+        i64,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    );
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin compact checkpoint upgrade")?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .execute(&mut *tx)
+        .await
+        .context("pin compact checkpoint upgrade transaction")?;
+    let Some((
+        version,
+        next_block,
+        active_root_hex,
+        raw_confirmed_count,
+        last_leaf_block,
+        last_leaf_log_index,
+        last_finalized_block,
+        last_finalized_block_hash,
+    )) = sqlx::query_as::<_, LegacyMeta>(
+        "SELECT checkpoint_version, next_block, active_root_hex, confirmed_count, \
+                last_leaf_block, last_leaf_log_index, last_finalized_block, \
+                last_finalized_block_hash \
+         FROM indexer_meta WHERE pool_address=$1 FOR UPDATE",
+    )
+    .bind(pool_address)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("lock legacy checkpoint metadata")?
+    else {
+        tx.rollback().await.ok();
+        return Ok(false);
+    };
+    if version == 2 {
+        tx.rollback().await.ok();
+        return Ok(false);
+    }
+    if version != 1 {
+        tx.rollback().await.ok();
+        return Ok(false);
+    }
+    if next_block < i64::try_from(start_block).unwrap_or(i64::MAX) {
+        bail!("legacy checkpoint cursor precedes configured start block");
+    }
+    let finalized = last_finalized_block
+        .and_then(|value| u64::try_from(value).ok())
+        .context("legacy checkpoint has no valid finalized block")?;
+    let finalized_hash = last_finalized_block_hash
+        .as_deref()
+        .map(normalize_block_hash)
+        .transpose()?
+        .context("legacy checkpoint has no finalized block hash")?;
+    if next_block as u64 != finalized.saturating_add(1) || finalized_hash.is_empty() {
+        bail!("legacy checkpoint is not sealed at a complete finalized boundary");
+    }
+    let confirmed_count = raw_confirmed_count
+        .and_then(|value| u64::try_from(value).ok())
+        .context("legacy checkpoint has no valid confirmed_count")?;
+    let tree_size_i64: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cmx_leaves WHERE pool_address=$1")
+            .bind(pool_address)
+            .fetch_one(&mut *tx)
+            .await
+            .context("count legacy cmx leaves")?;
+    let tree_size = u64::try_from(tree_size_i64).context("negative legacy tree size")?;
+    if confirmed_count > tree_size {
+        bail!("legacy confirmed_count exceeds tree size");
+    }
+
+    let leaf_shape: (i64, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT count(*), min(position), max(position) \
+         FROM cmx_leaves WHERE pool_address=$1",
+    )
+    .bind(pool_address)
+    .fetch_one(&mut *tx)
+    .await
+    .context("validate legacy cmx leaf shape")?;
+    let expected_min = (tree_size > 0).then_some(0i64);
+    let expected_max = tree_size.checked_sub(1).map(|value| value as i64);
+    if leaf_shape != (tree_size_i64, expected_min, expected_max) {
+        bail!("legacy cmx leaves are not a contiguous prefix");
+    }
+    let note_shape: (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE is_confirmed), \
+                count(*) FILTER (WHERE position IS NULL) \
+         FROM notes WHERE pool_address=$1",
+    )
+    .bind(pool_address)
+    .fetch_one(&mut *tx)
+    .await
+    .context("validate legacy note shape")?;
+    if note_shape != (tree_size_i64, confirmed_count as i64, 0) {
+        bail!("legacy note/leaf/confirmation cardinality mismatch");
+    }
+    let note_leaf_mismatch: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+           SELECT 1 FROM cmx_leaves AS leaf \
+           FULL OUTER JOIN notes AS note \
+             ON note.pool_address=leaf.pool_address \
+            AND note.position=leaf.position AND lower(note.cmx_hex)=lower(leaf.cmx_hex) \
+           WHERE COALESCE(leaf.pool_address, note.pool_address)=$1 \
+             AND (leaf.position IS NULL OR note.position IS NULL \
+                  OR note.is_confirmed IS DISTINCT FROM (note.position < $2)) \
+         )",
+    )
+    .bind(pool_address)
+    .bind(confirmed_count as i64)
+    .fetch_one(&mut *tx)
+    .await
+    .context("validate legacy note/leaf mapping")?;
+    if note_leaf_mismatch {
+        bail!("legacy note and cmx leaf archives diverge");
+    }
+    let archived_last_leaf: Option<(i64, i64)> = if tree_size == 0 {
+        None
+    } else {
+        sqlx::query_as(
+            "SELECT block_number, log_index FROM notes \
+             WHERE pool_address=$1 AND position=$2",
+        )
+        .bind(pool_address)
+        .bind((tree_size - 1) as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("load legacy last-leaf cursor")?
+    };
+    if archived_last_leaf != last_leaf_block.zip(last_leaf_log_index) {
+        bail!("legacy last-leaf cursor does not match the note archive");
+    }
+
+    // Rebuild the immutable confirmed node archive transactionally. A rollback
+    // restores the old rows if any later validation fails.
+    sqlx::query("DELETE FROM merkle_nodes WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear incomplete compact node archive")?;
+
+    const UPGRADE_PAGE: i64 = 4_096;
+    let mut all_builder = StreamingFrontierBuilder::new();
+    let mut confirmed_builder = StreamingFrontierBuilder::new();
+    let mut tree_frontier = (tree_size == 0).then(CompactFrontier::new);
+    let mut confirmed_frontier = (confirmed_count == 0).then(CompactFrontier::new);
+    let mut next_position = 0u64;
+    while next_position < tree_size {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT position, cmx_hex FROM cmx_leaves \
+             WHERE pool_address=$1 AND position >= $2 \
+             ORDER BY position LIMIT $3",
+        )
+        .bind(pool_address)
+        .bind(next_position as i64)
+        .bind(UPGRADE_PAGE)
+        .fetch_all(&mut *tx)
+        .await
+        .context("page legacy cmx leaves")?;
+        if rows.is_empty() {
+            bail!("legacy cmx archive ended before tree_size");
+        }
+        let mut page_nodes = Vec::with_capacity(rows.len().saturating_mul(2));
+        for (position, encoded) in rows {
+            if position != next_position as i64 {
+                bail!("legacy cmx archive gap at position {next_position}: found {position}");
+            }
+            let cmx = parse_hex32(&encoded)
+                .ok_or_else(|| anyhow!("invalid legacy cmx at position {position}"))?;
+            if next_position + 1 == tree_size {
+                let (frontier, _) = all_builder.finish_with_last_be(cmx)?;
+                tree_frontier = Some(frontier);
+            } else {
+                all_builder.push_nonfinal_be(cmx)?;
+            }
+            if next_position < confirmed_count {
+                let generated = if next_position + 1 == confirmed_count {
+                    let (frontier, nodes) = confirmed_builder.finish_with_last_be(cmx)?;
+                    confirmed_frontier = Some(frontier);
+                    nodes
+                } else {
+                    confirmed_builder.push_nonfinal_be(cmx)?
+                };
+                page_nodes.extend(generated);
+            }
+            next_position += 1;
+        }
+        pg_append_merkle_nodes(&mut tx, pool_address, None, &page_nodes).await?;
+    }
+    let tree_frontier = tree_frontier.context("compact all-leaf frontier was not completed")?;
+    let confirmed_frontier =
+        confirmed_frontier.context("compact confirmed frontier was not completed")?;
+    let expected_confirmed_root = match (confirmed_count, active_root_hex.as_deref()) {
+        (0, None) => EVM_EMPTY_IMT_ROOT,
+        (0, Some(value)) => {
+            let root = parse_hex32(value).context("invalid legacy active root")?;
+            if root != EVM_EMPTY_IMT_ROOT {
+                bail!("legacy active root is non-empty at confirmed_count zero");
+            }
+            root
+        }
+        (_, Some(value)) => parse_hex32(value).context("invalid legacy active root")?,
+        (_, None) => bail!("legacy checkpoint is missing its confirmed root"),
+    };
+    if confirmed_frontier.root_be() != expected_confirmed_root {
+        bail!(
+            "legacy confirmed frontier root mismatch: rebuilt={}, checkpoint={}",
+            hex::encode(confirmed_frontier.root_be()),
+            hex::encode(expected_confirmed_root)
+        );
+    }
+    let archived_confirmed_leaves: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM merkle_nodes WHERE pool_address=$1 AND level=0")
+            .bind(pool_address)
+            .fetch_one(&mut *tx)
+            .await
+            .context("verify upgraded Merkle leaf archive")?;
+    if archived_confirmed_leaves != confirmed_count as i64 {
+        bail!("upgraded Merkle leaf archive is incomplete");
+    }
+
+    // Materialize the compliance current set while upgrading. The historical
+    // feed stays in PostgreSQL and is paged; only one bounded page is decoded.
+    sqlx::query("DELETE FROM frozen_current WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("reset legacy frozen current set")?;
+    let mut frozen_update_count = 0u64;
+    let mut frozen_root_hex = format!("0x{}", "00".repeat(32));
+    loop {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT position, update_json FROM frozen_updates \
+             WHERE pool_address=$1 AND position >= $2 \
+             ORDER BY position LIMIT $3",
+        )
+        .bind(pool_address)
+        .bind(frozen_update_count as i64)
+        .bind(UPGRADE_PAGE)
+        .fetch_all(&mut *tx)
+        .await
+        .context("page legacy frozen updates")?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut page = Vec::with_capacity(rows.len());
+        for (position, encoded) in rows {
+            if position != frozen_update_count as i64 {
+                bail!(
+                    "legacy frozen update gap at position {frozen_update_count}: found {position}"
+                );
+            }
+            let update: FrozenUpdate =
+                serde_json::from_str(&encoded).context("decode legacy frozen update")?;
+            let expected_old =
+                parse_hex32(&frozen_root_hex).context("invalid reconstructed frozen root")?;
+            let actual_old =
+                parse_hex32(&update.old_root_hex).context("invalid legacy frozen old root")?;
+            if frozen_update_count > 0 && actual_old != expected_old {
+                bail!("legacy frozen update root chain is discontinuous");
+            }
+            let new_root =
+                parse_hex32(&update.new_root_hex).context("invalid legacy frozen new root")?;
+            frozen_root_hex = format!("0x{}", hex::encode(new_root));
+            page.push((frozen_update_count, update));
+            frozen_update_count += 1;
+        }
+        pg_apply_frozen_updates(&mut tx, pool_address, None, &page).await?;
+    }
+    let materialized_frozen_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM frozen_current WHERE pool_address=$1")
+            .bind(pool_address)
+            .fetch_one(&mut *tx)
+            .await
+            .context("verify materialized frozen set")?;
+    let frozen_count = u64::try_from(materialized_frozen_count)
+        .context("negative materialized frozen-set cardinality")?;
+
+    let tree_frontier_hex: Vec<String> = tree_frontier
+        .filled_be()
+        .into_iter()
+        .map(hex::encode)
+        .collect();
+    let confirmed_frontier_hex: Vec<String> = confirmed_frontier
+        .filled_be()
+        .into_iter()
+        .map(hex::encode)
+        .collect();
+    let updated = sqlx::query(
+        "UPDATE indexer_meta SET checkpoint_version=2, tree_size=$2, \
+                tree_root_hex=$3, tree_frontier_hex=$4, confirmed_frontier_hex=$5, \
+                frozen_root_hex=$6, frozen_count=$7, frozen_update_count=$8 \
+         WHERE pool_address=$1 AND checkpoint_version=1",
+    )
+    .bind(pool_address)
+    .bind(tree_size as i64)
+    .bind(hex::encode(tree_frontier.root_be()))
+    .bind(&tree_frontier_hex)
+    .bind(&confirmed_frontier_hex)
+    .bind(&frozen_root_hex)
+    .bind(frozen_count as i64)
+    .bind(frozen_update_count as i64)
+    .execute(&mut *tx)
+    .await
+    .context("seal compact checkpoint metadata")?
+    .rows_affected();
+    if updated != 1 {
+        bail!("legacy checkpoint version changed during compact upgrade");
+    }
+    tx.commit()
+        .await
+        .context("commit compact checkpoint upgrade")?;
+    println!(
+        "[indexer][{}] upgraded sealed checkpoint v1 -> v2: leaves={tree_size}, confirmed={confirmed_count}",
+        &pool_address[..10.min(pool_address.len())]
+    );
+    Ok(true)
+}
+
 /// Load a transactional PostgreSQL checkpoint and prove its relational shape is
 /// sufficient for warm-start.  Cryptographic/root and finalized-hash validation
 /// happen later against the rebuilt in-memory tree and live RPC.
@@ -5393,9 +7021,19 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
         Option<i64>,
         Option<i64>,
         i16,
+        Option<i64>,
+        Option<String>,
+        Option<Vec<String>>,
+        Option<Vec<String>>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
     );
     let label = &pool_address[..10.min(pool_address.len())];
     let mut warm_rejection: Option<String> = None;
+    let mut reject = |reason: String| {
+        warm_rejection.get_or_insert(reason);
+    };
     let mut tx = match pool.begin().await {
         Ok(tx) => tx,
         Err(error) => {
@@ -5413,7 +7051,8 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
     let meta = match sqlx::query_as::<_, MetaRow>(
         "SELECT next_block, active_root_hex, latest_seq, last_finalized_block, \
                 last_finalized_block_hash, confirmed_count, last_leaf_block, last_leaf_log_index, \
-                checkpoint_version \
+                checkpoint_version, tree_size, tree_root_hex, tree_frontier_hex, \
+                confirmed_frontier_hex, frozen_root_hex, frozen_count, frozen_update_count \
          FROM indexer_meta WHERE pool_address=$1",
     )
     .bind(pool_address)
@@ -5422,7 +7061,7 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
     {
         Ok(row) => row,
         Err(error) => {
-            warm_rejection = Some(format!("load indexer_meta: {error}"));
+            reject(format!("load indexer_meta: {error}"));
             None
         }
     };
@@ -5437,13 +7076,39 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
         raw_last_leaf_block,
         raw_last_leaf_log_index,
         checkpoint_version,
-    ) = meta.unwrap_or((start_block as i64, None, 0, None, None, None, None, None, 0));
-    if !matches!(checkpoint_version, 0 | 1) {
-        warm_rejection.get_or_insert_with(|| "unsupported checkpoint version".to_string());
+        raw_tree_size,
+        tree_root_hex,
+        tree_frontier_hex,
+        confirmed_frontier_hex,
+        raw_frozen_root_hex,
+        raw_frozen_count,
+        raw_frozen_update_count,
+    ) = meta.unwrap_or((
+        start_block as i64,
+        None,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ));
+    if !matches!(checkpoint_version, 0..=2) {
+        reject("unsupported checkpoint version".to_string());
     }
-
+    if checkpoint_version != 2 {
+        reject("legacy checkpoint requires compact-frontier upgrade".to_string());
+    }
     if raw_next_block < 0 || raw_latest_seq < 0 {
-        warm_rejection.get_or_insert_with(|| "negative checkpoint scalar".to_string());
+        reject("negative checkpoint scalar".to_string());
     }
     let next_block = u64::try_from(raw_next_block)
         .unwrap_or(start_block)
@@ -5457,27 +7122,34 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
         || raw_finalized_block.is_some() != last_finalized_block.is_some()
         || raw_finalized_hash.is_some() != last_finalized_block_hash.is_some()
     {
-        warm_rejection.get_or_insert_with(|| "invalid finalized cursor pair".to_string());
+        reject("invalid finalized cursor pair".to_string());
     }
-    let persisted_confirmed_count = raw_confirmed_count.and_then(|value| u64::try_from(value).ok());
-    if checkpoint_version == 1 && persisted_confirmed_count.is_none() {
-        warm_rejection.get_or_insert_with(|| "missing confirmed_count".to_string());
+    let confirmed_count = raw_confirmed_count
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_else(|| {
+            reject("missing or negative confirmed_count".to_string());
+            0
+        });
+    let tree_size = raw_tree_size
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_else(|| {
+            reject("missing or negative tree_size".to_string());
+            0
+        });
+    if confirmed_count > tree_size {
+        reject("confirmed_count exceeds tree_size".to_string());
     }
     let persisted_last_leaf_key = match (raw_last_leaf_block, raw_last_leaf_log_index) {
         (Some(block), Some(log_index)) => match (u64::try_from(block), u64::try_from(log_index)) {
             (Ok(block), Ok(log_index)) => Some((block, log_index)),
             _ => {
-                if checkpoint_version == 1 {
-                    warm_rejection.get_or_insert_with(|| "negative last-leaf cursor".to_string());
-                }
+                reject("negative last-leaf cursor".to_string());
                 None
             }
         },
         (None, None) => None,
         _ => {
-            if checkpoint_version == 1 {
-                warm_rejection.get_or_insert_with(|| "incomplete last-leaf cursor".to_string());
-            }
+            reject("incomplete last-leaf cursor".to_string());
             None
         }
     };
@@ -5485,124 +7157,186 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
         Some(value) => match parse_hex32(value) {
             Some(root) => Some(root),
             None => {
-                warm_rejection.get_or_insert_with(|| "invalid active_root_hex".to_string());
+                reject("invalid active_root_hex".to_string());
                 None
             }
         },
         None => None,
     };
 
-    let leaf_rows: Vec<(i64, String)> = match sqlx::query_as(
-        "SELECT position, cmx_hex FROM cmx_leaves WHERE pool_address=$1 ORDER BY position",
-    )
-    .bind(pool_address)
-    .fetch_all(&mut *tx)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            warm_rejection.get_or_insert_with(|| format!("load cmx leaves: {error}"));
-            Vec::new()
+    let mut tree_frontier = CompactFrontier::new();
+    let mut confirmed_frontier = CompactFrontier::new();
+    let compact = (|| -> Result<(CompactFrontier, CompactFrontier)> {
+        let tree_root = tree_root_hex
+            .as_deref()
+            .and_then(parse_hex32)
+            .context("invalid compact tree root")?;
+        let tree_filled = parse_hex32_vec(
+            tree_frontier_hex
+                .as_deref()
+                .context("missing tree frontier")?,
+        )?;
+        let confirmed_filled = parse_hex32_vec(
+            confirmed_frontier_hex
+                .as_deref()
+                .context("missing confirmed frontier")?,
+        )?;
+        let confirmed_root = match (confirmed_count, active_root) {
+            (0, None) => EVM_EMPTY_IMT_ROOT,
+            (0, Some(root)) if root == EVM_EMPTY_IMT_ROOT => root,
+            (0, Some(_)) => bail!("non-empty root at confirmed_count zero"),
+            (_, Some(root)) => root,
+            (_, None) => bail!("missing confirmed root"),
+        };
+        Ok((
+            CompactFrontier::from_parts_be(&tree_filled, tree_size, tree_root)?,
+            CompactFrontier::from_parts_be(&confirmed_filled, confirmed_count, confirmed_root)?,
+        ))
+    })();
+    match compact {
+        Ok((tree, confirmed)) => {
+            tree_frontier = tree;
+            confirmed_frontier = confirmed;
         }
-    };
-    let mut cmx_ordered = Vec::with_capacity(leaf_rows.len());
-    for (expected, (position, cmx_hex)) in leaf_rows.iter().enumerate() {
-        if *position != expected as i64 {
-            warm_rejection.get_or_insert_with(|| "non-contiguous cmx positions".to_string());
-        }
-        match parse_hex32(cmx_hex) {
-            Some(cmx) => cmx_ordered.push(cmx),
-            None => {
-                warm_rejection.get_or_insert_with(|| "invalid persisted cmx".to_string());
-            }
-        }
+        Err(error) => reject(format!("restore compact frontiers: {error:#}")),
     }
 
-    type NoteIntegrityRow = (String, Option<i64>, i64, i64, bool);
-    let note_rows: Vec<NoteIntegrityRow> = match sqlx::query_as(
-        "SELECT cmx_hex, position, block_number, log_index, is_confirmed \
-         FROM notes WHERE pool_address=$1 ORDER BY position NULLS LAST, cmx_hex",
+    let frozen_root_hex = match raw_frozen_root_hex.as_deref() {
+        Some(value) => match parse_hex32(value) {
+            Some(root) => format!("0x{}", hex::encode(root)),
+            None => {
+                reject("invalid frozen_root_hex".to_string());
+                format!("0x{}", "00".repeat(32))
+            }
+        },
+        None => {
+            reject("missing frozen_root_hex".to_string());
+            format!("0x{}", "00".repeat(32))
+        }
+    };
+    let frozen_count = raw_frozen_count
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_else(|| {
+            reject("missing or negative frozen_count".to_string());
+            0
+        });
+    let frozen_update_count = raw_frozen_update_count
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_else(|| {
+            reject("missing or negative frozen_update_count".to_string());
+            0
+        });
+
+    type CountSummary = (i64, Option<i64>, Option<i64>);
+    let leaf_summary: CountSummary = match sqlx::query_as(
+        "SELECT count(*), min(position), max(position) FROM cmx_leaves WHERE pool_address=$1",
     )
     .bind(pool_address)
-    .fetch_all(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
     {
-        Ok(rows) => rows,
+        Ok(summary) => summary,
         Err(error) => {
-            warm_rejection.get_or_insert_with(|| format!("load note integrity rows: {error}"));
-            Vec::new()
+            reject(format!("inspect cmx leaves: {error}"));
+            (0, None, None)
         }
     };
-    if note_rows.len() != cmx_ordered.len() {
-        warm_rejection.get_or_insert_with(|| "note/leaf cardinality mismatch".to_string());
+    let expected_min = (tree_size > 0).then_some(0);
+    let expected_max = tree_size.checked_sub(1).map(|value| value as i64);
+    if leaf_summary != (tree_size as i64, expected_min, expected_max) {
+        reject("cmx leaves are not a contiguous tree-sized prefix".to_string());
     }
-    let mut confirmed_cmx = HashSet::new();
-    let mut derived_confirmed_count = 0u64;
-    let mut saw_unconfirmed = false;
-    for (expected, (cmx_hex, position, block, log_index, is_confirmed)) in
-        note_rows.iter().enumerate()
+
+    let note_summary: (i64, i64, i64) = match sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE is_confirmed), \
+                count(*) FILTER (WHERE position IS NULL) \
+         FROM notes WHERE pool_address=$1",
+    )
+    .bind(pool_address)
+    .fetch_one(&mut *tx)
+    .await
     {
-        let parsed = parse_hex32(cmx_hex);
-        if *position != Some(expected as i64)
-            || parsed != cmx_ordered.get(expected).copied()
-            || *block < 0
-            || *log_index < 0
-        {
-            warm_rejection.get_or_insert_with(|| "note/leaf position mismatch".to_string());
+        Ok(summary) => summary,
+        Err(error) => {
+            reject(format!("inspect note archive: {error}"));
+            (0, 0, 0)
         }
-        if *is_confirmed {
-            if saw_unconfirmed {
-                warm_rejection.get_or_insert_with(|| "confirmed note prefix mismatch".to_string());
-            }
-            derived_confirmed_count = derived_confirmed_count.saturating_add(1);
-            if let Some(cmx) = parsed {
-                confirmed_cmx.insert(cmx);
-            }
-        } else {
-            saw_unconfirmed = true;
-        }
-    }
-    let confirmed_count = if checkpoint_version == 1 {
-        let persisted = persisted_confirmed_count.unwrap_or(0);
-        if persisted != derived_confirmed_count {
-            warm_rejection.get_or_insert_with(|| "persisted confirmed_count mismatch".to_string());
-        }
-        persisted
-    } else {
-        derived_confirmed_count
     };
-    if confirmed_count > cmx_ordered.len() as u64 {
-        warm_rejection.get_or_insert_with(|| "confirmed_count exceeds tree size".to_string());
+    if note_summary != (tree_size as i64, confirmed_count as i64, 0) {
+        reject("note/leaf/confirmation cardinality mismatch".to_string());
     }
-    let archive_last_leaf = note_rows
-        .last()
-        .and_then(|(_, position, block, log_index, _)| {
-            position.map(|_| (*block as u64, *log_index as u64))
-        });
-    let last_leaf_key = if checkpoint_version == 1 {
-        if archive_last_leaf != persisted_last_leaf_key
-            || cmx_ordered.is_empty() != persisted_last_leaf_key.is_none()
-        {
-            warm_rejection.get_or_insert_with(|| "last-leaf cursor mismatch".to_string());
-        }
-        persisted_last_leaf_key
-    } else {
-        archive_last_leaf
-    };
+    let note_leaf_mismatch: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+           SELECT 1 FROM cmx_leaves AS leaf \
+           FULL OUTER JOIN notes AS note \
+             ON note.pool_address=leaf.pool_address \
+            AND note.position=leaf.position AND lower(note.cmx_hex)=lower(leaf.cmx_hex) \
+           WHERE COALESCE(leaf.pool_address, note.pool_address)=$1 \
+             AND (leaf.position IS NULL OR note.position IS NULL \
+                  OR note.is_confirmed IS DISTINCT FROM (note.position < $2)) \
+         )",
+    )
+    .bind(pool_address)
+    .bind(confirmed_count as i64)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap_or(true);
+    if note_leaf_mismatch {
+        reject("note and cmx leaf archives diverge".to_string());
+    }
+
+    let archived_leaf_nodes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM merkle_nodes WHERE pool_address=$1 AND level=0")
+            .bind(pool_address)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or(-1);
+    if archived_leaf_nodes != confirmed_count as i64 {
+        reject("confirmed Merkle leaf archive cardinality mismatch".to_string());
+    }
+    let merkle_leaf_mismatch: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+           SELECT 1 FROM cmx_leaves AS leaf \
+           LEFT JOIN merkle_nodes AS node \
+             ON node.pool_address=leaf.pool_address AND node.level=0 \
+            AND node.node_index=leaf.position AND lower(node.hash_hex)=lower(leaf.cmx_hex) \
+           WHERE leaf.pool_address=$1 AND leaf.position < $2 AND node.node_index IS NULL \
+         )",
+    )
+    .bind(pool_address)
+    .bind(confirmed_count as i64)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap_or(true);
+    if merkle_leaf_mismatch {
+        reject("confirmed Merkle leaves diverge from cmx archive".to_string());
+    }
+
+    let archive_last_leaf: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT block_number, log_index FROM notes \
+         WHERE pool_address=$1 AND position=$2",
+    )
+    .bind(pool_address)
+    .bind(tree_size.saturating_sub(1) as i64)
+    .fetch_optional(&mut *tx)
+    .await
+    .unwrap_or(None);
+    let archive_last_leaf = archive_last_leaf.map(|(block, log)| (block as u64, log as u64));
+    if archive_last_leaf != persisted_last_leaf_key
+        || tree_size == 0 && persisted_last_leaf_key.is_some()
+    {
+        reject("last-leaf cursor mismatch".to_string());
+    }
+    let last_leaf_key = persisted_last_leaf_key;
     match (last_finalized_block, last_finalized_block_hash.as_ref()) {
         (Some(block), Some(_)) if next_block == block.saturating_add(1) => {}
-        _ => {
-            warm_rejection.get_or_insert_with(|| {
-                "checkpoint is not at a complete finalized boundary".to_string()
-            });
-        }
+        _ => reject("checkpoint is not at a complete finalized boundary".to_string()),
     }
     if last_leaf_key
         .zip(last_finalized_block)
         .is_some_and(|((leaf_block, _), finalized_block)| leaf_block > finalized_block)
     {
-        warm_rejection
-            .get_or_insert_with(|| "last leaf is beyond finalized checkpoint".to_string());
+        reject("last leaf is beyond finalized checkpoint".to_string());
     }
 
     let pending_tx_hashes: VecDeque<String> = match sqlx::query_as::<_, (String,)>(
@@ -5614,31 +7348,69 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
     {
         Ok(rows) => rows.into_iter().map(|(hash,)| hash).collect(),
         Err(error) => {
-            warm_rejection.get_or_insert_with(|| format!("load pending txs: {error}"));
+            reject(format!("load pending txs: {error}"));
             VecDeque::new()
         }
     };
 
-    let frozen_rows: Vec<(String,)> = match sqlx::query_as(
-        "SELECT update_json FROM frozen_updates WHERE pool_address=$1 ORDER BY position",
+    let frozen_shape: (i64, Option<i64>, Option<i64>) = match sqlx::query_as(
+        "SELECT count(*), min(position), max(position) \
+         FROM frozen_updates WHERE pool_address=$1",
     )
     .bind(pool_address)
-    .fetch_all(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
     {
-        Ok(rows) => rows,
+        Ok(shape) => shape,
         Err(error) => {
-            warm_rejection.get_or_insert_with(|| format!("load frozen updates: {error}"));
-            Vec::new()
+            reject(format!("inspect frozen updates: {error}"));
+            (0, None, None)
         }
     };
-    let mut frozen_updates = Vec::with_capacity(frozen_rows.len());
-    for (json,) in frozen_rows {
-        match serde_json::from_str(&json) {
-            Ok(update) => frozen_updates.push(update),
-            Err(error) => {
-                warm_rejection.get_or_insert_with(|| format!("decode frozen update: {error}"));
-            }
+    let expected_frozen_min = (frozen_update_count > 0).then_some(0i64);
+    let expected_frozen_max = frozen_update_count
+        .checked_sub(1)
+        .map(|position| position as i64);
+    if frozen_shape
+        != (
+            frozen_update_count as i64,
+            expected_frozen_min,
+            expected_frozen_max,
+        )
+    {
+        reject("frozen update archive is not a contiguous prefix".to_string());
+    }
+    let materialized_frozen_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM frozen_current WHERE pool_address=$1")
+            .bind(pool_address)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or(-1);
+    if materialized_frozen_count != frozen_count as i64 {
+        reject("frozen current-set cardinality mismatch".to_string());
+    }
+    if frozen_update_count == 0 {
+        if parse_hex32(&frozen_root_hex) != Some([0u8; 32]) || frozen_count != 0 {
+            reject("empty frozen archive has a non-empty summary".to_string());
+        }
+    } else {
+        let last_json: Option<String> = sqlx::query_scalar(
+            "SELECT update_json FROM frozen_updates \
+             WHERE pool_address=$1 AND position=$2",
+        )
+        .bind(pool_address)
+        .bind((frozen_update_count - 1) as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .unwrap_or(None);
+        match last_json
+            .as_deref()
+            .map(serde_json::from_str::<FrozenUpdate>)
+            .transpose()
+        {
+            Ok(Some(last)) if parse_hex32(&last.new_root_hex) == parse_hex32(&frozen_root_hex) => {}
+            Ok(_) => reject("frozen summary root does not match the final delta".to_string()),
+            Err(error) => reject(format!("decode final frozen update: {error}")),
         }
     }
 
@@ -5652,7 +7424,7 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
     {
         Ok(row) => row,
         Err(error) => {
-            warm_rejection.get_or_insert_with(|| format!("load shield stats: {error}"));
+            reject(format!("load shield stats: {error}"));
             None
         }
     };
@@ -5670,7 +7442,7 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
                 total_unshielded_wei: tuw,
             },
             _ => {
-                warm_rejection.get_or_insert_with(|| "invalid persisted shield stats".to_string());
+                reject("invalid persisted shield stats".to_string());
                 ShieldAccounting::default()
             }
         },
@@ -5678,31 +7450,33 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
     };
 
     if let Err(error) = tx.commit().await {
-        warm_rejection.get_or_insert_with(|| format!("close checkpoint snapshot: {error}"));
+        reject(format!("close checkpoint snapshot: {error}"));
     }
 
-    let warm_start_candidate = meta_present && warm_rejection.is_none();
+    let warm_start_candidate = meta_present && checkpoint_version == 2 && warm_rejection.is_none();
     if let Some(reason) = &warm_rejection {
         eprintln!("[indexer][{label}] checkpoint is not warm-start eligible: {reason}");
     }
     println!(
-        "[indexer] pg load: pool={label} next_block={next_block} leaves={} confirmed={} pending={} frozen_updates={} warm_candidate={warm_start_candidate}",
-        cmx_ordered.len(), confirmed_count, pending_tx_hashes.len(), frozen_updates.len()
+        "[indexer] pg load: pool={label} next_block={next_block} leaves={tree_size} confirmed={confirmed_count} pending={} frozen_updates={frozen_update_count} warm_candidate={warm_start_candidate}",
+        pending_tx_hashes.len()
     );
     CheckpointData {
         next_block,
         last_finalized_block,
         last_finalized_block_hash,
-        cmx_ordered,
+        tree_frontier,
         active_root,
         confirmed_count,
-        confirmed_cmx,
+        confirmed_frontier,
         last_leaf_key,
         warm_start_candidate,
         latest_seq,
         batches: VecDeque::new(),
         pending_tx_hashes,
-        frozen_updates,
+        frozen_root_hex,
+        frozen_count,
+        frozen_update_count,
         shield_accounting,
     }
 }
@@ -5710,28 +7484,39 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
 /// Load `out_ciphertext` + `cv_net_x` for one action from the tx `bundle()` calldata.
 async fn lookup_bundle_out_fields(
     rpc: &RpcClient,
-    cache: &mut HashMap<String, HashMap<[u8; 32], BundleActionCiphertexts>>,
+    state: &mut SharedState,
     tx_hash: &str,
     cmx: [u8; 32],
 ) -> (Vec<u8>, Option<[u8; 32]>) {
     let key = normalize_hex_0x(tx_hash);
-    if !cache.contains_key(&key) {
-        match rpc.get_transaction_input(&key).await {
+    if !state.bundle_out_cache.contains_key(&key) {
+        let decoded = match rpc.get_transaction_input(&key).await {
             Ok(Some(input)) => match bundle_actions_by_cmx(&input) {
-                Ok(map) => {
-                    cache.insert(key.clone(), map);
-                }
+                Ok(map) => map,
                 Err(e) => {
                     eprintln!("[indexer] bundle calldata decode failed for {key}: {e}");
+                    HashMap::new()
                 }
             },
-            Ok(None) => {}
+            Ok(None) => HashMap::new(),
             Err(e) => {
                 eprintln!("[indexer] eth_getTransactionByHash failed for {key}: {e}");
+                HashMap::new()
+            }
+        };
+        state.bundle_out_cache.insert(key.clone(), decoded);
+        state.bundle_out_order.push_back(key.clone());
+        while state.bundle_out_order.len() > MAX_BUNDLE_OUT_CACHE {
+            if let Some(expired) = state.bundle_out_order.pop_front() {
+                state.bundle_out_cache.remove(&expired);
             }
         }
     }
-    if let Some(entry) = cache.get(&key).and_then(|m| m.get(&cmx)) {
+    if let Some(entry) = state
+        .bundle_out_cache
+        .get(&key)
+        .and_then(|actions| actions.get(&cmx))
+    {
         (entry.out_ciphertext.clone(), Some(entry.cv_net_x))
     } else {
         (Vec::new(), None)
@@ -5784,6 +7569,8 @@ struct PollContext {
     broadcast_paused: Arc<AtomicBool>,
     /// Read-only warm-start probe used for blue/green shadow validation.
     shadow_mode: bool,
+    /// Ring-miss / recovery-source counters, shared with this pool's HTTP context.
+    ring_recovery: Arc<RingRecoveryMetrics>,
 }
 
 impl PollContext {
@@ -5825,6 +7612,97 @@ impl PollContext {
             .await
     }
 
+    /// Membership projection for the commitments referenced by the next frozen
+    /// delta. The durable table supplies the baseline; mutations buffered by the
+    /// current finalized replay are folded over it in order. Work is therefore
+    /// bounded by one event plus the already-bounded replay buffer, not history.
+    async fn frozen_membership_before_next_update(
+        &self,
+        cmx_values: &[String],
+    ) -> Result<HashSet<String>> {
+        let mut wanted = HashSet::with_capacity(cmx_values.len());
+        for raw_cmx in cmx_values {
+            let cmx = parse_hex32(raw_cmx)
+                .ok_or_else(|| anyhow!("invalid frozen cmx in disclosed delta"))?;
+            wanted.insert(format!("0x{}", hex::encode(cmx)));
+        }
+        let generation = self.rebuild_generation.read().await.clone();
+        let mut membership = self
+            .backend
+            .load_frozen_membership(&self.contract_address, generation.as_deref(), &wanted)
+            .await?;
+
+        let apply_buffered =
+            |mutations: &[NoteArchiveMutation], membership: &mut HashSet<String>| -> Result<()> {
+                for mutation in mutations {
+                    let NoteArchiveMutation::Frozen { update, .. } = mutation else {
+                        continue;
+                    };
+                    for (raw_cmx, is_add) in update.cmx_changed_hex.iter().zip(&update.is_add) {
+                        let cmx = parse_hex32(raw_cmx)
+                            .ok_or_else(|| anyhow!("invalid buffered frozen cmx"))?;
+                        let canonical = format!("0x{}", hex::encode(cmx));
+                        if !wanted.contains(&canonical) {
+                            continue;
+                        }
+                        if *is_add {
+                            membership.insert(canonical);
+                        } else {
+                            membership.remove(&canonical);
+                        }
+                    }
+                }
+                Ok(())
+            };
+
+        if generation.is_some() {
+            let buffered = self.rebuild_mutations.lock().await;
+            apply_buffered(&buffered, &mut membership)?;
+        } else {
+            let buffered = self.incremental_replay_mutations.lock().await;
+            if let Some(buffered) = buffered.as_deref() {
+                apply_buffered(buffered, &mut membership)?;
+            }
+        }
+        Ok(membership)
+    }
+
+    /// Recover a note's full payload after the ring has evicted it, so its
+    /// `NoteConfirmed` can still be republished with a fresh seq.
+    ///
+    /// Search order mirrors `archive_note_mutation`'s write order: mutations are
+    /// buffered in memory during a canonical rebuild or an incremental replay and
+    /// only reach the tables when that batch commits, so whichever sink is
+    /// currently being written to holds the newest rows and is searched first.
+    /// Skipping the buffer would miss a note whose `NoteAdded` is in the same
+    /// uncommitted batch as its `NoteConfirmed` — exactly the case a long
+    /// catch-up produces.
+    async fn recover_evicted_note(&self, cmx: [u8; 32]) -> Option<OrchardIndexedAbiNote> {
+        RingRecoveryMetrics::bump(&self.ring_recovery.ring_misses);
+        let generation = self.rebuild_generation.read().await.clone();
+        if generation.is_some() {
+            if let Some(note) = latest_upserted_note(&self.rebuild_mutations.lock().await, cmx) {
+                RingRecoveryMetrics::bump(&self.ring_recovery.recovered_from_buffer);
+                return Some(note);
+            }
+        } else if let Some(buffered) = self.incremental_replay_mutations.lock().await.as_ref() {
+            if let Some(note) = latest_upserted_note(buffered, cmx) {
+                RingRecoveryMetrics::bump(&self.ring_recovery.recovered_from_buffer);
+                return Some(note);
+            }
+        }
+        let recovered = self
+            .backend
+            .load_note_by_cmx(&self.contract_address, generation.as_deref(), cmx)
+            .await;
+        RingRecoveryMetrics::bump(if recovered.is_some() {
+            &self.ring_recovery.recovered_from_archive
+        } else {
+            &self.ring_recovery.unrecovered
+        });
+        recovered
+    }
+
     async fn begin_incremental_replay(&self) -> Result<()> {
         if self.rebuild_generation.read().await.is_some() {
             return Err(anyhow!(
@@ -5844,6 +7722,15 @@ impl PollContext {
     }
 
     async fn finish_incremental_replay(&self, snap: &CheckpointSnapshot) -> Result<usize> {
+        if !snap.is_complete_finalized_boundary() {
+            self.incremental_replay_mutations.lock().await.take();
+            self.persist.resume();
+            return Err(anyhow!(
+                "refusing to persist an incomplete finalized checkpoint: next_block={}, last_finalized={:?}",
+                snap.next_block,
+                snap.last_finalized_block
+            ));
+        }
         let mutations = self.incremental_replay_mutations.lock().await.take();
         let Some(mutations) = mutations else {
             self.persist.resume();
@@ -5885,11 +7772,7 @@ impl PollContext {
         }
         let _write_guard = self.backend_write_lock.lock().await;
         self.backend
-            .apply_note_mutations(
-                &self.contract_address,
-                Some(&generation),
-                &mutations,
-            )
+            .apply_note_mutations(&self.contract_address, Some(&generation), &mutations)
             .await
     }
 
@@ -5913,7 +7796,6 @@ impl PollContext {
     async fn mark_canonical_unready(&self) {
         let mut state = self.shared.write().await;
         state.tree_out_of_order = true;
-        state.confirmed_frontier = None;
     }
 
     async fn broadcast_batches_after(&self, after_seq: u64) {
@@ -5967,81 +7849,6 @@ async fn persisted_finalized_cursor_matches(
     }
 }
 
-fn fr_from_le_hex(value: &str) -> Result<Fr> {
-    let bytes = hex::decode(strip_0x(value)).context("invalid little-endian field hex")?;
-    let repr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow!("field element must be 32 bytes"))?;
-    Option::from(Fr::from_repr(repr.into()))
-        .ok_or_else(|| anyhow!("non-canonical BN254 field element"))
-}
-
-/// Reconstruct the exact O(1) on-chain frontier from the authentication path of
-/// the final leaf. This performs O(n) Poseidon work once, rather than replaying
-/// 32 hashes for every historical leaf (O(32n)).
-fn frontier_from_tree_prefix(
-    tree: &OrchardCommitmentTree,
-    leaves: &[[u8; 32]],
-    confirmed_count: u64,
-) -> Result<FrontierTree> {
-    if confirmed_count == 0 {
-        return Ok(FrontierTree::new());
-    }
-    let confirmed_count =
-        usize::try_from(confirmed_count).context("confirmed_count does not fit in usize")?;
-    if confirmed_count > leaves.len() {
-        return Err(anyhow!("confirmed_count exceeds checkpoint leaves"));
-    }
-    let final_position = (confirmed_count - 1) as u64;
-    let path = tree
-        .merkle_path_at(final_position, confirmed_count as u64)
-        .ok_or_else(|| anyhow!("cannot derive final-leaf Merkle path"))?;
-    if path.siblings.len() != MERKLE_DEPTH_EVM {
-        return Err(anyhow!(
-            "unexpected Merkle path depth: {}",
-            path.siblings.len()
-        ));
-    }
-    let mut filled = [Fr::ZERO; MERKLE_DEPTH_EVM];
-    let mut node = fr_from_be_bytes(&leaves[final_position as usize])
-        .ok_or_else(|| anyhow!("non-canonical confirmed cmx"))?;
-    for (level, sibling_hex) in path.siblings.iter().enumerate() {
-        let sibling = fr_from_le_hex(sibling_hex)?;
-        if (final_position >> level) & 1 == 0 {
-            filled[level] = node;
-            node = merkle_compress(level as u8, node, sibling);
-        } else {
-            filled[level] = sibling;
-            node = merkle_compress(level as u8, sibling, node);
-        }
-    }
-    Ok(FrontierTree::from_parts(
-        filled,
-        confirmed_count as u64,
-        node,
-    ))
-}
-
-fn checkpoint_tree_and_frontier(
-    leaves: &[[u8; 32]],
-    confirmed_count: u64,
-) -> Result<(OrchardCommitmentTree, FrontierTree)> {
-    let mut tree = OrchardCommitmentTree::new();
-    for leaf in leaves {
-        tree.append(*leaf);
-    }
-    let frontier = frontier_from_tree_prefix(&tree, leaves, confirmed_count)?;
-    // The prefix path above warms the confirmed subtree cache. Warm the small
-    // pending suffix too so /status, /root, and the first witness request do not
-    // pay another O(n) Poseidon pass after health turns green.
-    let _ = tree.latest_root();
-    Ok((tree, frontier))
-}
-
-fn frontier_from_ordered_leaves(leaves: &[[u8; 32]]) -> Result<FrontierTree> {
-    checkpoint_tree_and_frontier(leaves, leaves.len() as u64).map(|(_, frontier)| frontier)
-}
-
 /// Returns the finalized head that the initial incremental catch-up must cover
 /// before health may turn green.
 async fn try_warm_start(ctx: &PollContext) -> Result<Option<u64>> {
@@ -6059,10 +7866,6 @@ async fn try_warm_start(ctx: &PollContext) -> Result<Option<u64>> {
     if !candidate {
         return Ok(None);
     }
-    let Some(frontier) = frontier else {
-        ctx.shared.write().await.startup_source = "checkpoint_rejected".to_string();
-        return Ok(None);
-    };
     let (finalized_head, _) = ctx
         .rpc
         .finalized_block()
@@ -6075,7 +7878,7 @@ async fn try_warm_start(ctx: &PollContext) -> Result<Option<u64>> {
         ));
     }
 
-    let local_root = fr_to_be_bytes(frontier.root());
+    let local_root = frontier.root_be();
     let expected_root = match (confirmed_count, active_root) {
         (0, None) => EVM_EMPTY_IMT_ROOT,
         (0, Some(root)) if root == EVM_EMPTY_IMT_ROOT => root,
@@ -6138,7 +7941,7 @@ async fn try_warm_start(ctx: &PollContext) -> Result<Option<u64>> {
         state.startup_source = "checkpoint_rejected".to_string();
         return Ok(None);
     }
-    state.confirmed_frontier = Some(frontier);
+    state.confirmed_frontier = frontier;
     // Stay fail-closed until the incremental suffix reaches `finalized_head`.
     state.tree_out_of_order = true;
     state.startup_source = "checkpoint_validated".to_string();
@@ -6182,21 +7985,20 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
         // A legacy checkpoint may contain derived state but no finalized
         // marker. A finalized head below the configured deployment block
         // proves there are no canonical pool events to retain.
-        state.tree = OrchardCommitmentTree::new();
-        state.cmx_to_position.clear();
-        state.cmx_ordered.clear();
-        state.seen_event_ids.clear();
-        state.confirm_seen_ids.clear();
-        state.shield_seen_ids.clear();
-        state.accounting_seen_ids.clear();
+        state.tree_frontier = CompactFrontier::new();
+        state.recent_event_ids.clear();
         state.shield_accounting = ShieldAccounting::default();
         state.last_leaf_key = None;
         state.batches.clear();
         state.latest_seq = 0;
-        state.confirmed_cmx.clear();
         state.confirmed_count = 0;
-        state.confirmed_frontier = Some(FrontierTree::new());
+        state.confirmed_frontier = CompactFrontier::new();
         state.active_root = None;
+        state.bundle_out_cache.clear();
+        state.bundle_out_order.clear();
+        state.frozen_root_hex = format!("0x{}", "00".repeat(32));
+        state.frozen_count = 0;
+        state.frozen_update_count = 0;
         state.next_block = ctx.start_block;
         state.last_finalized_block = Some(head);
         state.last_finalized_block_hash = Some(finalized_hash);
@@ -6235,21 +8037,20 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
         // Public root endpoints fail closed until the complete finalized replay
         // and its terminal block-hash check have both succeeded.
         s.tree_out_of_order = true;
-        s.tree = OrchardCommitmentTree::new();
-        s.cmx_to_position.clear();
-        s.cmx_ordered.clear();
-        s.seen_event_ids.clear();
-        s.confirm_seen_ids.clear();
-        s.shield_seen_ids.clear();
-        s.accounting_seen_ids.clear();
+        s.tree_frontier = CompactFrontier::new();
+        s.recent_event_ids.clear();
         s.shield_accounting = ShieldAccounting::default();
         s.last_leaf_key = None;
         s.batches.clear();
         s.latest_seq = 0;
-        s.confirmed_cmx.clear();
         s.confirmed_count = 0;
-        s.confirmed_frontier = None;
+        s.confirmed_frontier = CompactFrontier::new();
         s.active_root = None;
+        s.bundle_out_cache.clear();
+        s.bundle_out_order.clear();
+        s.frozen_root_hex = format!("0x{}", "00".repeat(32));
+        s.frozen_count = 0;
+        s.frozen_update_count = 0;
     }
     println!(
         "[indexer][{label}] backfill: scanning logs [{}, {head}]…",
@@ -6319,7 +8120,7 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
     s.next_block = advance_cursor(ctx.start_block, head);
     s.last_finalized_block = Some(head);
     s.last_finalized_block_hash = Some(finalized_hash);
-    let tree_size = s.cmx_ordered.len();
+    let tree_size = s.tree_frontier.next_index();
     let snap = CheckpointSnapshot::from_state(&s);
     drop(s);
     ctx.finish_canonical_rebuild(&generation, &snap).await?;
@@ -6368,7 +8169,6 @@ async fn catchup_from_chain(ctx: &PollContext) {
         Ok(false) => {
             let mut state = ctx.shared.write().await;
             state.tree_out_of_order = true;
-            state.confirmed_frontier = None;
             ctx.persist.notify(&state);
             drop(state);
             eprintln!(
@@ -6457,16 +8257,10 @@ async fn catchup_from_chain(ctx: &PollContext) {
     }
 }
 
-/// Fetch every watched log in the inclusive block range `[from, to]` and replay
-/// them through `process_single_log` in strict (block, log_index) order.
-///
-/// The caller MUST hold `ctx.ingest_lock`. Returns the number of logs processed,
-/// or `Err(())` if a getLogs window failed (the cursor must not advance then).
-async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()> {
-    let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
+fn watched_topic0s(ctx: &PollContext) -> Vec<String> {
     let mut topic0s: Vec<String> = note_added_topic0_alternatives()
         .iter()
-        .map(|t| normalize_hex_0x(t))
+        .map(|topic| normalize_hex_0x(topic))
         .collect();
     topic0s.push(normalize_hex_0x(&shield_completed_topic0_hex()));
     topic0s.push(normalize_hex_0x(&ctx.note_confirmed_topic0));
@@ -6474,6 +8268,17 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
     topic0s.push(normalize_hex_0x(&frozen_root_updated_topic0()));
     topic0s.push(normalize_hex_0x(&shielded_topic0_hex()));
     topic0s.push(normalize_hex_0x(&unshielded_topic0_hex()));
+    topic0s
+}
+
+/// Fetch every watched log in the inclusive block range `[from, to]` and replay
+/// them through `process_single_log` in strict (block, log_index) order.
+///
+/// The caller MUST hold `ctx.ingest_lock`. Returns the number of logs processed,
+/// or `Err(())` if a getLogs window failed (the cursor must not advance then).
+async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()> {
+    let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
+    let topic0s = watched_topic0s(ctx);
 
     let mut total = 0usize;
     let mut lo = from;
@@ -6550,30 +8355,73 @@ fn is_watched_pool_log(ctx: &PollContext, log: &EthLog) -> bool {
             norm_topic(&shield_completed_topic0_hex()),
             norm_topic(&ctx.note_confirmed_topic0),
             norm_topic(&root_updated_topic0_hex()),
+            norm_topic(&frozen_root_updated_topic0()),
             norm_topic(&shielded_topic0_hex()),
             norm_topic(&unshielded_topic0_hex()),
         ]
         .contains(&topic0)
 }
 
-/// Ingest a live WS log while preserving strict on-chain ordering.
-///
-/// The pushed log is used ONLY as a wake-up signal + coverage marker — it is
-/// never processed directly. All appends flow through `replay_range`, which
-/// fetches `eth_getLogs` and processes strictly in (block, log_index) order.
-///
-/// Two provider behaviours make direct processing unsafe:
-/// - the WS can silently drop logs, so a pushed log for block B may have
-///   dropped predecessors in `[next_block, B]` that must be ingested first;
-/// - the provider's getLogs view can LAG its own WS push (observed on anvil
-///   under load): a replay right after the push may come back empty. If we
-///   then appended the pushed log directly, a later replay would insert the
-///   siblings BEHIND it — out of order — permanently corrupting the tree.
-///
-/// So: replay the window, check whether this log's event id got ingested, and
-/// if not, sleep briefly and retry until the getLogs view catches up. If it
-/// never does, leave the cursor untouched and let the periodic catchup replay
-/// the window in order later.
+fn state_has_event_id(state: &SharedState, event_id: &str) -> bool {
+    state.recent_event_ids.contains(event_id)
+}
+
+fn finalized_cursor_covers_block(
+    next_block: u64,
+    last_finalized_block: Option<u64>,
+    last_finalized_block_hash: Option<&str>,
+    tree_out_of_order: bool,
+    block_number: u64,
+) -> bool {
+    !tree_out_of_order
+        && checkpoint_is_complete_finalized_boundary(
+            next_block,
+            last_finalized_block,
+            last_finalized_block_hash,
+        )
+        && last_finalized_block.is_some_and(|finalized| finalized >= block_number)
+}
+
+fn state_covers_finalized_block(state: &SharedState, block_number: u64) -> bool {
+    finalized_cursor_covers_block(
+        state.next_block,
+        state.last_finalized_block,
+        state.last_finalized_block_hash.as_deref(),
+        state.tree_out_of_order,
+        block_number,
+    )
+}
+
+async fn canonical_ws_log_is_visible(
+    ctx: &PollContext,
+    block_number: u64,
+    transaction_hash: &str,
+    log_index: &str,
+) -> Result<bool> {
+    let logs = ctx
+        .rpc
+        .fetch_logs_topic0_or(
+            block_number,
+            block_number,
+            &ctx.contract_address,
+            &watched_topic0s(ctx),
+        )
+        .await?;
+    ctx.rpc.validate_canonical_logs(&logs).await?;
+    Ok(logs.iter().any(|candidate| {
+        candidate
+            .transaction_hash
+            .eq_ignore_ascii_case(transaction_hash)
+            && candidate.log_index.eq_ignore_ascii_case(log_index)
+    }))
+}
+
+/// Treat a live WS log only as a wake-up hint. Once the same finalized log is
+/// visible through canonical `eth_getLogs`, run the ordinary catch-up all the
+/// way to one finalized head and atomically publish that complete boundary.
+/// This prevents the old WS fast path from persisting `next_block=B` beside an
+/// older `last_finalized_block`, which made every restart in that window reject
+/// warm-start and fall back to a full replay.
 async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
     if log.removed {
         return Err(anyhow!(
@@ -6582,92 +8430,66 @@ async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             log.log_index
         ));
     }
-    let _ingest = ctx.ingest_lock.lock().await;
     let block_number = parse_hex_u64(&log.block_number)
         .with_context(|| format!("invalid blockNumber: {}", log.block_number))?;
-    let (finalized_head, finalized_hash) = ctx.rpc.finalized_block().await?;
-    if block_number > finalized_head {
-        // Monad publishes Voted logs before finalization. The push remains a
-        // wake-up hint only; periodic catch-up will ingest it once finalized.
+    let event_id = format!("{}:{}", log.transaction_hash, log.log_index);
+    let already_seen = {
+        let state = ctx.shared.read().await;
+        state_has_event_id(&state, &event_id)
+    };
+    if already_seen {
         return Ok(());
     }
-    let event_id = format!("{}:{}", log.transaction_hash, log.log_index);
 
-    let covered = |s: &SharedState| {
-        s.seen_event_ids.contains(&event_id)
-            || s.confirm_seen_ids.contains(&event_id)
-            || s.shield_seen_ids.contains(&event_id)
-            || s.accounting_seen_ids.contains(&event_id)
-    };
-
+    let mut visible = false;
     for attempt in 0u64..6 {
-        {
-            let s = ctx.shared.read().await;
-            if covered(&s) {
-                return Ok(());
-            }
-        }
-        let cursor = { ctx.shared.read().await.next_block };
-        let from = cursor.min(block_number);
-        let starting_seq = ctx.shared.read().await.latest_seq;
-        ctx.begin_incremental_replay()
-            .await
-            .context("begin canonical WS replay")?;
-        ctx.broadcast_paused.store(true, AtomicOrdering::Release);
-        if replay_range(ctx, from, block_number).await.is_err() {
-            ctx.abort_incremental_replay().await;
-            ctx.mark_canonical_unready().await;
-            ctx.broadcast_paused.store(false, AtomicOrdering::Release);
-            return Err(anyhow!(
-                "canonical replay failed while ingesting WS hint {event_id}"
-            ));
-        }
-        match ctx.rpc.block_hash(finalized_head).await {
-            Ok(hash) if hash == finalized_hash => {}
-            Ok(hash) => {
-                ctx.abort_incremental_replay().await;
-                ctx.mark_canonical_unready().await;
-                ctx.broadcast_paused.store(false, AtomicOrdering::Release);
-                return Err(anyhow!(
-                    "finalized boundary changed during WS replay: head={finalized_head}, \
-                     before={finalized_hash}, after={hash}"
-                ));
-            }
-            Err(error) => {
-                ctx.abort_incremental_replay().await;
-                ctx.mark_canonical_unready().await;
-                ctx.broadcast_paused.store(false, AtomicOrdering::Release);
-                return Err(error).context("recheck finalized boundary during WS replay");
-            }
-        }
-        let mut s = ctx.shared.write().await;
-        let is_covered = covered(&s);
-        if is_covered {
-            // Cursor moves to B (not past it): later same-block pushes trigger
-            // a cheap dedup-only replay of B, never a skip.
-            s.next_block = s.next_block.max(block_number);
-        }
-        let snap = CheckpointSnapshot::from_state(&s);
-        drop(s);
-        if let Err(e) = ctx.finish_incremental_replay(&snap).await {
-            ctx.mark_canonical_unready().await;
-            ctx.broadcast_paused.store(false, AtomicOrdering::Release);
-            return Err(e).context("commit canonical WS replay");
-        }
-        ctx.broadcast_paused.store(false, AtomicOrdering::Release);
-        ctx.broadcast_batches_after(starting_seq).await;
-        if is_covered {
+        let (finalized_head, _) = ctx.rpc.finalized_block().await?;
+        if block_number > finalized_head {
+            // Monad publishes Voted logs before finalization. The periodic
+            // catch-up will ingest this block after it becomes finalized.
             return Ok(());
         }
-        // getLogs has not caught up with the WS push yet.
+        if canonical_ws_log_is_visible(ctx, block_number, &log.transaction_hash, &log.log_index)
+            .await?
+        {
+            visible = true;
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
     }
-    eprintln!(
-        "[indexer] WS log {event_id} (block {block_number}) still not visible via eth_getLogs; \
-         deferring to the periodic catchup"
-    );
+    if !visible {
+        return Err(anyhow!(
+            "WS hint {event_id} is finalized but not visible through canonical eth_getLogs"
+        ));
+    }
+
+    // Dedup sets are intentionally not persisted. After a restart, a delayed WS
+    // delivery or pending-receipt recovery can therefore refer to a block that a
+    // valid finalized checkpoint already covers. The sealed cursor is the durable
+    // proof of coverage; do not turn that benign replay into a full rebuild.
+    let already_covered = {
+        let state = ctx.shared.read().await;
+        state_has_event_id(&state, &event_id) || state_covers_finalized_block(&state, block_number)
+    };
+    if already_covered {
+        return Ok(());
+    }
+
+    catchup_from_chain(ctx).await;
+    let covered_after_catchup = {
+        let state = ctx.shared.read().await;
+        state_has_event_id(&state, &event_id) || state_covers_finalized_block(&state, block_number)
+    };
+    if covered_after_catchup {
+        return Ok(());
+    }
+
+    // A transient canonical RPC failure leaves the cursor at/before this block.
+    // Preserve the last valid checkpoint and let periodic catch-up retry. If the
+    // catch-up detected an actual cursor/hash mismatch it already marked the
+    // state unready itself.
     Err(anyhow!(
-        "WS hint {event_id} was not visible through canonical eth_getLogs"
+        "canonical catch-up did not yet cover finalized WS hint {event_id}; retry deferred"
     ))
 }
 
@@ -6839,9 +8661,7 @@ async fn recover_pending_txs(ctx: &PollContext) {
                 let canonical = match ctx.rpc.block_hash(receipt.block_number).await {
                     Ok(hash) => hash,
                     Err(e) => {
-                        eprintln!(
-                            "[indexer] cannot verify receipt block for {tx_hash}: {e:#}"
-                        );
+                        eprintln!("[indexer] cannot verify receipt block for {tx_hash}: {e:#}");
                         continue;
                     }
                 };
@@ -6937,7 +8757,7 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
             "topics": [topics]
         }]
     });
-    ws.send(Message::Text(sub_req.to_string().into()))
+    ws.send(Message::Text(sub_req.to_string()))
         .await
         .context("failed to send eth_subscribe")?;
 
@@ -7076,7 +8896,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         .any(|na| t0.as_deref() == Some(na.as_str()))
     {
         // ── NoteAdded ────────────────────────────────────────────────────────
-        if state.seen_event_ids.contains(&event_id) {
+        if state.recent_event_ids.contains(&event_id) {
             return Ok(());
         }
         let d = match decode_note_added_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
@@ -7092,42 +8912,31 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         // chain. Reject the append and flag a full rebuild instead; do NOT mark
         // the event seen, so the rebuild replays it at the right position.
         let key = (block_number, log_index);
-        if !state.cmx_to_position.contains_key(&d.cmx) {
-            if let Some(last) = state.last_leaf_key {
-                if key <= last {
-                    eprintln!(
-                        "[indexer] OUT-OF-ORDER leaf rejected: event {event_id} key={key:?} <= last appended {last:?}; scheduling tree rebuild"
-                    );
-                    state.tree_out_of_order = true;
-                    state.confirmed_frontier = None;
-                    return Ok(());
-                }
+        if let Some(last) = state.last_leaf_key {
+            if key <= last {
+                eprintln!(
+                    "[indexer] OUT-OF-ORDER leaf rejected: event {event_id} key={key:?} <= last appended {last:?}; scheduling tree rebuild"
+                );
+                state.tree_out_of_order = true;
+                return Ok(());
             }
         }
-        let cmx_position = if let Some(&existing_pos) = state.cmx_to_position.get(&d.cmx) {
-            Some(existing_pos)
-        } else {
-            state.tree.append(d.cmx).map(|pos| {
-                state.cmx_to_position.insert(d.cmx, pos);
-                state.cmx_ordered.push(d.cmx);
-                state.last_leaf_key = Some(key);
-                pos
-            })
-        };
-        state.seen_event_ids.insert(event_id);
-        let is_confirmed = state.confirmed_cmx.contains(&d.cmx);
+        let cmx_position = state.tree_frontier.next_index();
+        // Pending leaves update only the compact all-leaf frontier. Immutable
+        // witness nodes are archived when the corresponding NoteConfirmed event
+        // advances the confirmed prefix.
+        state
+            .tree_frontier
+            .append_be(d.cmx)
+            .context("append compact commitment frontier")?;
+        state.last_leaf_key = Some(key);
+        state.recent_event_ids.insert(event_id);
         const OUT_LEN: usize = 80;
         let (out_ciphertext, cv_net_x) =
             if d.out_ciphertext.len() == OUT_LEN && d.cv_net_x.is_some() {
                 (d.out_ciphertext, d.cv_net_x)
             } else {
-                lookup_bundle_out_fields(
-                    &ctx.rpc,
-                    &mut state.bundle_out_cache,
-                    &log.transaction_hash,
-                    d.cmx,
-                )
-                .await
+                lookup_bundle_out_fields(&ctx.rpc, &mut state, &log.transaction_hash, d.cmx).await
             };
         let note = OrchardIndexedAbiNote {
             block_number,
@@ -7140,9 +8949,9 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             cv_net_x,
             nf_old: d.nf_old,
             ack_hash: [0u8; 32],
-            cmx_position,
+            cmx_position: Some(cmx_position),
             shield_amount_sats: None,
-            is_confirmed,
+            is_confirmed: false,
         };
         let seq = state.latest_seq.saturating_add(1);
         state.latest_seq = seq;
@@ -7151,7 +8960,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             to_block: block_number,
             abi_notes: vec![note],
             bundles: vec![],
-            latest_root: state.tree.latest_root(),
+            latest_root: Some(state.tree_frontier.root_le()),
         };
         let envelope = BatchEnvelope {
             seq,
@@ -7181,28 +8990,85 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         }
     } else if t0.as_deref() == Some(nc.as_str()) {
         // ── NoteConfirmed ────────────────────────────────────────────────────
-        if !state.confirm_seen_ids.insert(event_id) {
+        if state.recent_event_ids.contains(&event_id) {
             return Ok(());
         }
         let (cmx, new_root, position) =
             decode_note_confirmed_log(log.topics.as_deref().unwrap_or(&[]), &log.data)
                 .map_err(|e| anyhow!("NoteConfirmed decode failed: {e}"))?;
-        state.confirmed_cmx.insert(cmx);
+        let expected_position = state.confirmed_frontier.next_index();
+        if position != expected_position || position >= state.tree_frontier.next_index() {
+            state.tree_out_of_order = true;
+            bail!(
+                "NoteConfirmed position is not the next ingested leaf: event={position}, expected={expected_position}, tree_size={}",
+                state.tree_frontier.next_index()
+            );
+        }
+        let mut next_confirmed = state.confirmed_frontier.clone();
+        let nodes = next_confirmed
+            .append_be(cmx)
+            .context("advance compact confirmed frontier")?;
+        if next_confirmed.root_be() != new_root {
+            state.tree_out_of_order = true;
+            bail!(
+                "NoteConfirmed root mismatch at position {position}: local={}, event={}",
+                hex::encode(next_confirmed.root_be()),
+                hex::encode(new_root)
+            );
+        }
+        state.confirmed_frontier = next_confirmed;
         state.active_root = Some(new_root);
-        state.confirmed_count = state.confirmed_count.max(position.saturating_add(1));
+        state.confirmed_count = position.saturating_add(1);
+        state.recent_event_ids.insert(event_id);
 
-        let maybe_note = state
+        // The confirmation event carries only (cmx, root, position) — republishing
+        // it to subscribers needs the note's full payload, which only the original
+        // NoteAdded had. The ring is a bounded cache, so under load the NoteAdded
+        // can be evicted before its NoteConfirmed arrives.
+        //
+        // Without a fallback the confirmation is applied to state and to the
+        // archive but never republished with a fresh seq. Consumers track this
+        // feed by a monotonic `/batches/page` cursor, so a note whose
+        // confirmation never reaches the head of the feed is skipped forever:
+        // wallets never see it become spendable, and the official prover's
+        // successor scan walks its cursor past it.
+        //
+        // Lazy fallback: the ring stays the fast path (steady-state cost is zero,
+        // hit rate is ~100%), and only a miss pays for an archive read. The read
+        // must happen with the state lock released — every log-ingestion path
+        // holds `ingest_lock` for its whole duration, so no other ingestion can
+        // interleave here, but `/root` and `/merkle_path` readers must not be
+        // blocked on a database round-trip.
+        let ring_hit = state
             .batches
             .iter()
             .rev()
             .flat_map(|env| env.batch.abi_notes.iter())
             .find(|note| note.cmx == cmx)
-            .cloned()
-            .map(|mut note| {
-                note.is_confirmed = true;
-                note.cmx_position = Some(position);
-                note
-            });
+            .cloned();
+        let (mut state, base_note) = match ring_hit {
+            Some(note) => (state, Some(note)),
+            None => {
+                drop(state);
+                let recovered = ctx.recover_evicted_note(cmx).await;
+                if recovered.is_none() && !ctx.shadow_mode {
+                    // Every NoteAdded is archived before its NoteConfirmed can be
+                    // processed, so this means the archive is incomplete.
+                    eprintln!(
+                        "[indexer][{}] NoteConfirmed for cmx {} is absent from the ring AND the \
+                         archive; it will not be republished with a new seq",
+                        &ctx.contract_address[..10.min(ctx.contract_address.len())],
+                        hex::encode(cmx)
+                    );
+                }
+                (ctx.shared.write().await, recovered)
+            }
+        };
+        let maybe_note = base_note.map(|mut note| {
+            note.is_confirmed = true;
+            note.cmx_position = Some(position);
+            note
+        });
         let envelope = maybe_note.map(|note| {
             let seq = state.latest_seq.saturating_add(1);
             state.latest_seq = seq;
@@ -7214,7 +9080,8 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                     to_block: block_number,
                     abi_notes: vec![note],
                     bundles: vec![],
-                    latest_root: state.tree.latest_root(),
+                    latest_root: (state.tree_frontier.next_index() > 0)
+                        .then(|| state.tree_frontier.root_le()),
                 },
             }
         });
@@ -7233,8 +9100,12 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             ctx.archive_note_mutation(NoteArchiveMutation::Upsert(envelope.clone()))
                 .await?;
         }
-        ctx.archive_note_mutation(NoteArchiveMutation::Confirm { cmx, position })
-            .await?;
+        ctx.archive_note_mutation(NoteArchiveMutation::Confirm {
+            cmx,
+            position,
+            nodes,
+        })
+        .await?;
         if canonical_ready && !ctx.broadcast_paused.load(AtomicOrdering::Acquire) {
             if let Some(envelope) = envelope {
                 ctx.batch_tx.send(envelope).ok();
@@ -7246,16 +9117,31 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         return Ok(());
     } else if t0.as_deref() == Some(ru.as_str()) {
         // ── RootUpdated (batch confirm) ──────────────────────────────────────
-        // One verified `updateRoot` batch: authoritative watermark advance. The
-        // per-note NoteConfirmed events of the same tx also advance it; this
-        // branch makes the watermark robust if any of them fails to decode.
-        if !state.confirm_seen_ids.insert(event_id) {
+        // NoteConfirmed events carry the leaves required to advance the compact
+        // frontier. RootUpdated is therefore a consistency seal, not a shortcut
+        // that may skip missing leaves.
+        if state.recent_event_ids.contains(&event_id) {
             return Ok(());
         }
         match decode_root_updated_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
             Ok(d) => {
-                state.confirmed_count = state.confirmed_count.max(d.to_count);
+                if d.to_count != state.confirmed_count
+                    || d.to_count != state.confirmed_frontier.next_index()
+                    || d.new_root != state.confirmed_frontier.root_be()
+                    || d.from_count > d.to_count
+                {
+                    state.tree_out_of_order = true;
+                    bail!(
+                        "RootUpdated does not seal the compact confirmed frontier: from={}, to={}, local_count={}, event_root={}, local_root={}",
+                        d.from_count,
+                        d.to_count,
+                        state.confirmed_count,
+                        hex::encode(d.new_root),
+                        hex::encode(state.confirmed_frontier.root_be())
+                    );
+                }
                 state.active_root = Some(d.new_root);
+                state.recent_event_ids.insert(event_id);
                 println!(
                     "[indexer] root updated: confirmed [{}, {}) root={} batch={}",
                     d.from_count,
@@ -7271,11 +9157,21 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         // ── FrozenRootUpdated (compliance leaf delta) ────────────────────────
         // Append the disclosed delta to the per-pool feed (frozen-tree-execution-plan PR2).
         // Dedup on (tx_hash, log_index) via the existing event_id set so a re-scan is idempotent.
-        if !state.seen_event_ids.insert(event_id.clone()) {
+        if state.recent_event_ids.contains(&event_id) {
             return Ok(());
         }
         match decode_frozen_root_updated_log(&log.data) {
             Ok(d) => {
+                let current_root =
+                    parse_hex32(&state.frozen_root_hex).context("invalid in-memory frozen root")?;
+                if state.frozen_update_count > 0 && d.old_root != current_root {
+                    state.tree_out_of_order = true;
+                    bail!(
+                        "FrozenRootUpdated old root mismatch: local={}, event={}",
+                        hex::encode(current_root),
+                        hex::encode(d.old_root)
+                    );
+                }
                 let upd = FrozenUpdate {
                     block_number,
                     log_index,
@@ -7294,8 +9190,39 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                     upd.new_root_hex,
                     upd.cmx_changed_hex.len()
                 );
-                state.frozen_updates.push(upd);
-                ctx.persist.notify(&state);
+                let position = state.frozen_update_count;
+                let current_count = state.frozen_count;
+                drop(state);
+                let membership = ctx
+                    .frozen_membership_before_next_update(&upd.cmx_changed_hex)
+                    .await?;
+                let next_count = frozen_count_after_delta(current_count, membership, &upd)?;
+                // Archive/buffer first. A storage failure leaves in-memory state
+                // untouched, so canonical replay can retry this event.
+                ctx.archive_note_mutation(NoteArchiveMutation::Frozen {
+                    position,
+                    update: upd.clone(),
+                })
+                .await?;
+
+                let mut state = ctx.shared.write().await;
+                let still_current_root = parse_hex32(&state.frozen_root_hex)
+                    .context("invalid in-memory frozen root after archive")?;
+                if state.frozen_update_count != position || still_current_root != current_root {
+                    state.tree_out_of_order = true;
+                    bail!("frozen state changed while archiving a serialized event");
+                }
+                state.frozen_root_hex = upd.new_root_hex.clone();
+                state.frozen_count = next_count;
+                state.frozen_update_count = position.saturating_add(1);
+                state.recent_event_ids.insert(event_id.clone());
+                let persist_snap =
+                    (!ctx.persist.is_paused()).then(|| CheckpointSnapshot::from_state(&state));
+                drop(state);
+                if let Some(snap) = persist_snap {
+                    ctx.persist.notify_owned(snap);
+                }
+                return Ok(());
             }
             Err(e) => eprintln!("[indexer] FrozenRootUpdated decode FAILED: {e}"),
         }
@@ -7303,25 +9230,44 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         // ── ShieldCompleted ──────────────────────────────────────────────────
         // NoteAdded was already processed; update shield_amount_sats on the
         // existing batch entry and re-emit.
-        if !state.shield_seen_ids.insert(event_id) {
+        if state.recent_event_ids.contains(&event_id) {
             return Ok(());
         }
         let (cmx, raw_amount) =
             decode_shield_completed_log(log.topics.as_deref().unwrap_or(&[]), &log.data)
                 .map_err(|e| anyhow!("ShieldCompleted decode failed: {e}"))?;
-        let amount =
-            u64::try_from(raw_amount).context("ShieldCompleted amount exceeds u64")?;
-        let maybe_note = state
+        let amount = u64::try_from(raw_amount).context("ShieldCompleted amount exceeds u64")?;
+        state.recent_event_ids.insert(event_id);
+        // Same eviction hazard as NoteConfirmed: `ShieldCompleted` carries only
+        // (cmx, amount), so re-emitting needs the NoteAdded payload, and the ring
+        // may already have dropped it. Recovering keeps `shield_amount_sats`
+        // reaching subscribers, which is what the pool's public shield accounting
+        // is rendered from.
+        let ring_hit = state
             .batches
             .iter()
             .rev()
             .flat_map(|env| env.batch.abi_notes.iter())
             .find(|note| note.cmx == cmx && note.tx_hash == log.transaction_hash)
-            .cloned()
-            .map(|mut note| {
-                note.shield_amount_sats = Some(amount);
-                note
-            });
+            .cloned();
+        let (mut state, base_note) = match ring_hit {
+            Some(note) => (state, Some(note)),
+            None => {
+                drop(state);
+                // The archive is keyed by cmx alone, so the tx_hash match the ring
+                // scan applies is re-checked here: a recovered note from a
+                // different transaction is not this event's note.
+                let recovered = ctx.recover_evicted_note(cmx).await.filter(|note| {
+                    normalize_hex_0x(&note.tx_hash).to_lowercase()
+                        == normalize_hex_0x(&log.transaction_hash).to_lowercase()
+                });
+                (ctx.shared.write().await, recovered)
+            }
+        };
+        let maybe_note = base_note.map(|mut note| {
+            note.shield_amount_sats = Some(amount);
+            note
+        });
         let envelope = maybe_note.map(|note| {
             let seq = state.latest_seq.saturating_add(1);
             state.latest_seq = seq;
@@ -7333,7 +9279,8 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                     to_block: block_number,
                     abi_notes: vec![note],
                     bundles: vec![],
-                    latest_root: state.tree.latest_root(),
+                    latest_root: (state.tree_frontier.next_index() > 0)
+                        .then(|| state.tree_frontier.root_le()),
                 },
             }
         });
@@ -7364,12 +9311,12 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         return Ok(());
     } else if t0.as_deref() == Some(shielded_topic.as_str()) {
         // ── Shielded accounting ───────────────────────────────────────────────
-        if state.accounting_seen_ids.contains(&event_id) {
+        if state.recent_event_ids.contains(&event_id) {
             return Ok(());
         }
         match decode_shielded_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
             Ok(d) => {
-                state.accounting_seen_ids.insert(event_id);
+                state.recent_event_ids.insert(event_id);
                 state.shield_accounting.total_shielded_units = state
                     .shield_accounting
                     .total_shielded_units
@@ -7385,12 +9332,12 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         }
     } else if t0.as_deref() == Some(unshielded_topic.as_str()) {
         // ── Unshielded accounting ─────────────────────────────────────────────
-        if state.accounting_seen_ids.contains(&event_id) {
+        if state.recent_event_ids.contains(&event_id) {
             return Ok(());
         }
         match decode_unshielded_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
             Ok(d) => {
-                state.accounting_seen_ids.insert(event_id);
+                state.recent_event_ids.insert(event_id);
                 state.shield_accounting.total_unshielded_units = state
                     .shield_accounting
                     .total_unshielded_units
@@ -7549,8 +9496,7 @@ impl RpcClient {
             .await
             .context("eth_getBlockByNumber(finalized)")?;
         let header = header.ok_or_else(|| anyhow!("RPC returned no finalized block"))?;
-        let number =
-            parse_hex_u64(&header.number).context("invalid finalized block number")?;
+        let number = parse_hex_u64(&header.number).context("invalid finalized block number")?;
         let hash = normalize_block_hash(&header.hash).context("invalid finalized block hash")?;
         Ok((number, hash))
     }
@@ -7715,10 +9661,7 @@ impl RpcClient {
         }))
     }
 
-    async fn get_transaction_receipt_logs(
-        &self,
-        tx_hash: &str,
-    ) -> Result<Option<ReceiptWithLogs>> {
+    async fn get_transaction_receipt_logs(&self, tx_hash: &str) -> Result<Option<ReceiptWithLogs>> {
         #[derive(Deserialize)]
         struct ReceiptLog {
             #[serde(default)]
@@ -7755,8 +9698,7 @@ impl RpcClient {
             return Ok(None);
         };
         let success = r.status.as_deref().unwrap_or("0x1") == "0x1";
-        let block_number =
-            parse_hex_u64(&r.block_number).context("invalid receipt blockNumber")?;
+        let block_number = parse_hex_u64(&r.block_number).context("invalid receipt blockNumber")?;
         let block_hash =
             normalize_block_hash(&r.block_hash).context("invalid receipt blockHash")?;
         let logs = r
@@ -8054,6 +9996,7 @@ impl RpcClient {
 // ─── Ethereum raw transaction ─────────────────────────────────────────────────
 
 /// Builds and signs an EIP-155 legacy raw transaction.
+#[allow(clippy::too_many_arguments)]
 fn build_and_sign_raw_tx(
     nonce: u64,
     gas_price: u64,
@@ -8309,21 +10252,24 @@ fn strip_0x(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_cursor, batch_page_end, beacon_words_match, canonical_guard, classify_selector,
-        compact_note_mutations, crank_gas_limit, crank_next_delay_secs,
-        decode_frozen_root_updated_log, decode_json_note_archive, eip1967_beacon_slot,
-        encode_crank_root_calldata, factory_log_matches, frontier_from_ordered_leaves,
-        frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error, nonempty_trimmed,
-        normalize_hex_0x, parse_address_set, parse_bytes32_strict, parse_tx_meta,
-        perc20_deployed_topic0,
-        persist_request_is_current, pg_apply_note_mutations, pg_begin_canonical_rebuild,
-        pg_archive_seq_bound, pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
-        push_incremental_replay_mutation, replay_frozen_set, require_admin, require_relayer,
-        rlp_bytes, rlp_list, rlp_uint, validate_log_against_canonical, BatchEnvelope,
-        CheckpointSnapshot, Cli, EthLog, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
-        JsonNoteArchiveUpdate, NoteArchiveMutation, RpcClient, StateBackend,
-        DEFAULT_MAX_BATCHES_IN_MEMORY,
-        MAX_CRANK_GAS_MARGIN_BPS,
+        advance_cursor, batch_page_end, beacon_words_match, canonical_guard,
+        checkpoint_is_complete_finalized_boundary, classify_selector, compact_note_mutations,
+        crank_gas_limit, crank_next_delay_secs, decode_frozen_root_updated_log,
+        decode_json_note_archive, eip1967_beacon_slot, encode_crank_root_calldata,
+        factory_log_matches, finalized_cursor_covers_block, frontier_from_leaves,
+        frozen_count_after_delta, frozen_root_updated_topic0, getlogs_window_end,
+        is_getlogs_range_error, latest_upserted_note, nonempty_trimmed, normalize_hex_0x,
+        parse_address_set, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
+        persist_request_is_current, pg_append_cmx_leaves, pg_append_merkle_nodes,
+        pg_apply_note_mutations, pg_archive_seq_bound, pg_begin_canonical_rebuild,
+        pg_bulk_upsert_notes, pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
+        pg_upgrade_legacy_compact_checkpoint, push_incremental_replay_mutation, replay_frozen_set,
+        require_admin, require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint,
+        strip_0x, validate_log_against_canonical, witness_from_nodes, witness_root_be,
+        ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, EthLog,
+        FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
+        NoteArchiveMutation, RecentEventIds, RpcClient, StateBackend, StreamingFrontierBuilder,
+        DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS,
     };
 
     #[test]
@@ -8336,6 +10282,85 @@ mod tests {
     #[test]
     fn batch_page_limit_is_a_soft_envelope_limit() {
         assert_eq!(batch_page_end(&[7, 7, 7], 1), 3);
+    }
+
+    #[test]
+    fn postgres_archive_unbounded_sequence_sentinel_does_not_wrap_negative() {
+        assert_eq!(pg_archive_seq_bound(0), 0);
+        assert_eq!(pg_archive_seq_bound(i64::MAX as u64), i64::MAX);
+        assert_eq!(pg_archive_seq_bound(u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn only_complete_finalized_boundaries_are_checkpoint_eligible() {
+        assert!(checkpoint_is_complete_finalized_boundary(
+            102,
+            Some(101),
+            Some("0xabc")
+        ));
+        assert!(!checkpoint_is_complete_finalized_boundary(
+            101,
+            Some(101),
+            Some("0xabc")
+        ));
+        assert!(!checkpoint_is_complete_finalized_boundary(
+            102,
+            Some(100),
+            Some("0xabc")
+        ));
+        assert!(!checkpoint_is_complete_finalized_boundary(
+            102,
+            Some(101),
+            None
+        ));
+    }
+
+    #[test]
+    fn sealed_finalized_cursor_deduplicates_delayed_ws_logs_after_restart() {
+        let hash = format!("0x{}", "ab".repeat(32));
+        assert!(finalized_cursor_covers_block(
+            102,
+            Some(101),
+            Some(&hash),
+            false,
+            100,
+        ));
+        assert!(!finalized_cursor_covers_block(
+            102,
+            Some(101),
+            Some(&hash),
+            false,
+            102,
+        ));
+        assert!(!finalized_cursor_covers_block(
+            102,
+            Some(101),
+            Some(&hash),
+            true,
+            100,
+        ));
+        assert!(!finalized_cursor_covers_block(
+            101,
+            Some(101),
+            Some(&hash),
+            false,
+            100,
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_archive_database_errors_fail_closed() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres@127.0.0.1:1/unreachable")
+            .unwrap();
+        pool.close().await;
+        let result = StateBackend::Pgsql(pool)
+            .load_archived_batch_page(&format!("0x{}", "11".repeat(20)), 0, 100, u64::MAX, 10)
+            .await;
+        assert!(
+            result.is_err(),
+            "archive errors must never look like an empty page"
+        );
     }
 
     fn frozen_update(cmx: &[&str], is_add: &[bool]) -> FrozenUpdate {
@@ -8358,7 +10383,10 @@ mod tests {
             frozen_update(&["0xaa"], &[false]),
             frozen_update(&["0xaa", "0xbb"], &[true, true]), // re-add A; B already present (idempotent)
         ];
-        assert_eq!(replay_frozen_set(&feed), vec!["0xbb".to_string(), "0xaa".to_string()]);
+        assert_eq!(
+            replay_frozen_set(&feed),
+            vec!["0xbb".to_string(), "0xaa".to_string()]
+        );
 
         // remove-all → empty
         let feed2 = vec![
@@ -8366,6 +10394,34 @@ mod tests {
             frozen_update(&["0xaa"], &[false]),
         ];
         assert!(replay_frozen_set(&feed2).is_empty());
+    }
+
+    #[test]
+    fn frozen_count_projection_preserves_idempotent_delta_semantics() {
+        let a = format!("0x{}", hex::encode(canonical_test_leaf(1)));
+        let b = format!("0x{}", hex::encode(canonical_test_leaf(2)));
+        let absent = format!("0x{}", hex::encode(canonical_test_leaf(3)));
+        let membership = HashSet::from([a.clone(), b.clone()]);
+        let update = frozen_update(&[&a, &absent], &[true, false]);
+        assert_eq!(
+            frozen_count_after_delta(2, membership.clone(), &update).unwrap(),
+            2,
+            "re-adding an existing cmx and removing an absent cmx are no-ops"
+        );
+        let remove = frozen_update(&[&b], &[false]);
+        assert_eq!(frozen_count_after_delta(2, membership, &remove).unwrap(), 1);
+    }
+
+    #[test]
+    fn recent_event_dedup_is_strictly_bounded() {
+        let mut recent = RecentEventIds::default();
+        for value in 0..=MAX_RECENT_EVENT_IDS {
+            assert!(recent.insert(format!("event-{value}")));
+        }
+        assert_eq!(recent.order.len(), MAX_RECENT_EVENT_IDS);
+        assert_eq!(recent.set.len(), MAX_RECENT_EVENT_IDS);
+        assert!(!recent.contains("event-0"));
+        assert!(recent.contains(&format!("event-{MAX_RECENT_EVENT_IDS}")));
     }
 
     #[test]
@@ -8422,14 +10478,15 @@ mod tests {
     use clap::CommandFactory;
     use ff::PrimeField;
     use halo2curves::bn256::Fr;
-    use privacy_core::commitment_tree::frontier::{
-        FrontierTree, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX,
-    };
     use privacy_core::commitment_tree::frozen::fr_to_be_bytes;
+    use privacy_core::commitment_tree::{
+        frontier::{FrontierTree, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX},
+        OrchardCommitmentTree,
+    };
     use privacy_core::ethereum::{update_root_selector, update_roots_selector};
     use privacy_core::types::{OrchardIndexBatch, OrchardIndexedAbiNote};
     use sha3::{Digest, Keccak256};
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
     #[test]
     fn incremental_replay_uses_a_larger_bounded_history_window() {
@@ -8451,6 +10508,7 @@ mod tests {
             NoteArchiveMutation::Confirm {
                 cmx: [0x11; 32],
                 position: 0,
+                nodes: Vec::new(),
             },
             1,
         )
@@ -8460,6 +10518,7 @@ mod tests {
             NoteArchiveMutation::Confirm {
                 cmx: [0x22; 32],
                 position: 1,
+                nodes: Vec::new(),
             },
             1,
         )
@@ -8517,33 +10576,41 @@ mod tests {
     }
 
     #[test]
-    fn final_leaf_path_reconstructs_exact_crank_frontier() {
+    fn compact_frontier_reconstructs_exact_crank_frontier() {
         let leaves: Vec<[u8; 32]> = (1..=65).map(canonical_test_leaf).collect();
         for size in [0usize, 1, 2, 3, 4, 7, 8, 31, 32, 33, 64, 65] {
-            let restored = frontier_from_ordered_leaves(&leaves[..size])
+            let restored = frontier_from_leaves(&leaves[..size])
                 .expect("reconstruct frontier from checkpoint leaves");
             let mut replayed = FrontierTree::new();
             for leaf in &leaves[..size] {
                 replayed.insert_be(*leaf);
             }
             assert_eq!(restored.next_index(), replayed.next_index(), "size={size}");
-            assert_eq!(restored.filled(), replayed.filled(), "size={size}");
             assert_eq!(
-                fr_to_be_bytes(restored.root()),
+                restored.root_be(),
                 fr_to_be_bytes(replayed.root()),
                 "size={size}"
             );
+            assert_eq!(restored.frontier_commit(), replayed.frontier_commit());
         }
     }
 
     #[test]
     #[ignore = "capacity benchmark; run explicitly in release mode"]
     fn production_sized_checkpoint_frontier_rebuild() {
-        const LEAVES: u64 = 61_504;
-        let leaves: Vec<[u8; 32]> = (1..=LEAVES).map(canonical_test_leaf).collect();
+        const LEAVES: u64 = 350_000;
         let started = std::time::Instant::now();
-        let restored = frontier_from_ordered_leaves(&leaves)
-            .expect("reconstruct production-sized checkpoint frontier");
+        let mut builder = StreamingFrontierBuilder::new();
+        for value in 1..LEAVES {
+            let complete = builder
+                .push_nonfinal_be(canonical_test_leaf(value))
+                .expect("stream production-sized checkpoint leaf");
+            assert!(complete.len() <= 32);
+        }
+        let (restored, complete) = builder
+            .finish_with_last_be(canonical_test_leaf(LEAVES))
+            .expect("finish production-sized checkpoint frontier");
+        assert!(complete.len() <= 32);
         eprintln!(
             "reconstructed {LEAVES}-leaf frontier in {:?}",
             started.elapsed()
@@ -8921,6 +10988,7 @@ mod tests {
             NoteArchiveMutation::Confirm {
                 cmx: [0x11; 32],
                 position: 7,
+                nodes: Vec::new(),
             },
             NoteArchiveMutation::ShieldAmount {
                 cmx: [0x11; 32],
@@ -8968,16 +11036,271 @@ mod tests {
         assert_eq!(decoded[0].pool_address.as_deref(), Some(pool.as_str()));
     }
 
+    /// `NoteConfirmed`'s ring-miss fallback searches the uncommitted mutation
+    /// buffer before the tables, so it must pick the newest `Upsert` for the cmx
+    /// and ignore the other mutation kinds.
     #[test]
-    fn postgres_archive_unbounded_sequence_sentinel_does_not_wrap_negative() {
-        assert_eq!(pg_archive_seq_bound(0), 0);
-        assert_eq!(pg_archive_seq_bound(i64::MAX as u64), i64::MAX);
-        assert_eq!(pg_archive_seq_bound(u64::MAX), i64::MAX);
+    fn latest_upserted_note_prefers_the_newest_write_for_that_cmx() {
+        let mut stale = sample_note_envelope(0x33, 4);
+        stale.batch.abi_notes[0].block_number = 111;
+        let mut fresh = sample_note_envelope(0x33, 9);
+        fresh.batch.abi_notes[0].block_number = 222;
+        let mutations = vec![
+            NoteArchiveMutation::Upsert(sample_note_envelope(0x44, 3)),
+            NoteArchiveMutation::Upsert(stale),
+            NoteArchiveMutation::Confirm {
+                cmx: [0x33; 32],
+                position: 7,
+                nodes: Vec::new(),
+            },
+            NoteArchiveMutation::Upsert(fresh),
+            NoteArchiveMutation::ShieldAmount {
+                cmx: [0x33; 32],
+                amount: 5,
+            },
+        ];
+        let found = latest_upserted_note(&mutations, [0x33; 32]).expect("buffered upsert");
+        assert_eq!(found.block_number, 222, "expected the newest Upsert");
+        assert_eq!(
+            latest_upserted_note(&mutations, [0x44; 32]).map(|n| n.cmx),
+            Some([0x44; 32])
+        );
+        // A cmx that only ever appears in non-Upsert mutations has no payload to
+        // recover — the caller must fall through to the tables, not synthesise one.
+        assert!(latest_upserted_note(
+            &[NoteArchiveMutation::Confirm {
+                cmx: [0x55; 32],
+                position: 1,
+                nodes: Vec::new(),
+            }],
+            [0x55; 32]
+        )
+        .is_none());
+    }
+
+    /// A canonical rebuild stages its notes in an isolated generation. The
+    /// ring-miss fallback must read inside that generation while it is active,
+    /// and must not see it once it has been abandoned.
+    #[tokio::test]
+    async fn pg_evicted_note_recovery_reads_inside_the_active_rebuild_generation() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pg = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pg).await.unwrap();
+        let pool_address = format!("0x{}", "c4".repeat(20));
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
+        let backend = StateBackend::Pgsql(pg.clone());
+        let generation = "gen-under-test";
+
+        // Live table carries an older copy; the rebuild stages a newer one.
+        let mut live = sample_note_envelope(0x33, 1);
+        live.batch.abi_notes[0].block_number = 111;
+        backend
+            .apply_note_mutations(&pool_address, None, &[NoteArchiveMutation::Upsert(live)])
+            .await
+            .unwrap();
+        pg_begin_canonical_rebuild(&pg, &pool_address, generation)
+            .await
+            .unwrap();
+        let mut staged = sample_note_envelope(0x33, 2);
+        staged.batch.abi_notes[0].block_number = 222;
+        backend
+            .apply_note_mutations(
+                &pool_address,
+                Some(generation),
+                &[NoteArchiveMutation::Upsert(staged)],
+            )
+            .await
+            .unwrap();
+
+        let in_generation = backend
+            .load_note_by_cmx(&pool_address, Some(generation), [0x33; 32])
+            .await
+            .expect("staged note");
+        assert_eq!(in_generation.block_number, 222);
+        let live_row = backend
+            .load_note_by_cmx(&pool_address, None, [0x33; 32])
+            .await
+            .expect("live note");
+        assert_eq!(
+            live_row.block_number, 111,
+            "an active rebuild must not leak into the live table"
+        );
+        assert!(
+            backend
+                .load_note_by_cmx(&pool_address, Some("other-generation"), [0x33; 32])
+                .await
+                .is_none(),
+            "generations must be isolated from each other"
+        );
+
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
+    }
+
+    /// `/note` and `/tx` fall back to the archive once the ring evicts a note, so
+    /// both point lookups must resolve notes the in-memory ring no longer holds.
+    #[tokio::test]
+    async fn json_archive_point_lookups_find_notes_evicted_from_the_ring() {
+        let dir = std::env::temp_dir().join(format!("indexer-pointlookup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json");
+        let state_path = state_path.to_str().unwrap().to_owned();
+        let archive_path = StateBackend::json_archive_path(&state_path);
+        let _ = std::fs::remove_file(&archive_path);
+
+        let pool = format!("0x{}", "11".repeat(20));
+        // Two notes in one tx (recipient + change), plus an unrelated third.
+        let mut first = sample_note_envelope(0x33, 9);
+        let mut second = sample_note_envelope(0x44, 10);
+        let shared_tx = format!("0x{}", "ab".repeat(32));
+        first.batch.abi_notes[0].tx_hash = shared_tx.clone();
+        second.batch.abi_notes[0].tx_hash = shared_tx.to_uppercase();
+        let other = sample_note_envelope(0x55, 11);
+        for env in [&first, &second, &other] {
+            StateBackend::append_json_line(&archive_path, env).unwrap();
+        }
+        let backend = StateBackend::Json(Some(state_path));
+
+        let found = backend.load_note_by_cmx(&pool, None, [0x33; 32]).await;
+        assert_eq!(found.map(|n| n.cmx), Some([0x33; 32]));
+        assert!(backend
+            .load_note_by_cmx(&pool, None, [0x99; 32])
+            .await
+            .is_none());
+
+        // Casing and `0x` prefix are normalised on both sides, and the unrelated
+        // note must not leak into the result.
+        for needle in [
+            shared_tx.as_str(),
+            &shared_tx.to_uppercase(),
+            strip_0x(&shared_tx),
+        ] {
+            let mut notes = backend.load_notes_by_tx_hash(&pool, needle).await;
+            notes.sort_by_key(|n| n.cmx);
+            assert_eq!(
+                notes.iter().map(|n| n.cmx).collect::<Vec<_>>(),
+                vec![[0x33; 32], [0x44; 32]],
+                "tx lookup failed for needle {needle}"
+            );
+        }
+        assert!(backend
+            .load_notes_by_tx_hash(&pool, &format!("0x{}", "cd".repeat(32)))
+            .await
+            .is_empty());
+
+        let _ = std::fs::remove_file(&archive_path);
+    }
+
+    /// The PostgreSQL `/tx` predicate must match `notes_tx_hash_idx` (migration
+    /// 0007). `enable_seqscan=off` asserts the index is *usable* by the query —
+    /// asserting the planner *chose* it would fail spuriously on a small table,
+    /// where a sequential scan is genuinely cheaper.
+    #[tokio::test]
+    async fn pg_note_and_tx_point_lookups_use_the_archive_when_database_is_configured() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pg = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pg).await.unwrap();
+        let pool_address = format!("0x{}", "b7".repeat(20));
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
+
+        let shared_tx = format!("0x{}", "ab".repeat(32));
+        let mut first = sample_note_envelope(0x33, 9);
+        let mut second = sample_note_envelope(0x44, 10);
+        first.batch.abi_notes[0].tx_hash = shared_tx.clone();
+        // Stored verbatim from the log, so the archive must tolerate mixed casing.
+        second.batch.abi_notes[0].tx_hash = shared_tx.to_uppercase();
+        let backend = StateBackend::Pgsql(pg.clone());
+        backend
+            .apply_note_mutations(
+                &pool_address,
+                None,
+                &[
+                    NoteArchiveMutation::Upsert(first),
+                    NoteArchiveMutation::Upsert(second),
+                    NoteArchiveMutation::Upsert(sample_note_envelope(0x55, 11)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let found = backend
+            .load_note_by_cmx(&pool_address, None, [0x44; 32])
+            .await;
+        assert_eq!(found.map(|n| n.cmx), Some([0x44; 32]));
+        assert!(backend
+            .load_note_by_cmx(&pool_address, None, [0x99; 32])
+            .await
+            .is_none());
+
+        let mut notes = backend
+            .load_notes_by_tx_hash(&pool_address, &shared_tx)
+            .await;
+        notes.sort_by_key(|n| n.cmx);
+        assert_eq!(
+            notes.iter().map(|n| n.cmx).collect::<Vec<_>>(),
+            vec![[0x33; 32], [0x44; 32]]
+        );
+
+        // Only the forced plan is asserted. On a table this small Postgres will
+        // reasonably prefer a sequential scan (or another index), so asserting the
+        // *chosen* plan would be flaky in both directions — it would fail on a
+        // legitimate small-table plan, and it would pass on a bare `Seq Scan`,
+        // which is precisely the outcome the index exists to prevent.
+        //
+        // `SET LOCAL` inside a transaction, not a bare `SET`: `enable_seqscan` is
+        // session state, and sqlx hands out pooled connections, so a bare `SET`
+        // may not apply to the connection the EXPLAIN lands on — and would leak to
+        // whichever test borrows that connection next.
+        let mut tx = pg.begin().await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // Other indexes also lead with `pool_address`, so on a tiny fixture the
+        // planner may legitimately scan one of them and filter `tx_hash`. Disable
+        // an explicit sort and request the expression-index order to turn this
+        // EXPLAIN into a deterministic *index usability* probe. The production
+        // query above is still exercised separately for result correctness.
+        sqlx::query("SET LOCAL enable_sort = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let forced: Vec<(String,)> = sqlx::query_as(
+            "EXPLAIN SELECT cmx_hex FROM notes \
+             WHERE pool_address=$1 AND lower(tx_hash) = ANY($2::text[]) \
+             ORDER BY pool_address, lower(tx_hash)",
+        )
+        .bind(&pool_address)
+        .bind(vec![shared_tx.to_lowercase()])
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        let forced = forced
+            .into_iter()
+            .map(|(line,)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            forced.contains("notes_tx_hash_idx"),
+            "the /tx predicate cannot use notes_tx_hash_idx; it would seq-scan `notes` \
+             at production size. Plan:\n{forced}"
+        );
+
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
     }
 
     async fn clear_pg_rebuild_test_pool(pool: &sqlx::PgPool, pool_address: &str) {
         for statement in [
+            "DELETE FROM frozen_current_rebuild WHERE pool_address=$1",
+            "DELETE FROM frozen_updates_rebuild WHERE pool_address=$1",
+            "DELETE FROM merkle_nodes_rebuild WHERE pool_address=$1",
             "DELETE FROM notes_rebuild WHERE pool_address=$1",
+            "DELETE FROM frozen_current WHERE pool_address=$1",
+            "DELETE FROM merkle_nodes WHERE pool_address=$1",
             "DELETE FROM notes WHERE pool_address=$1",
             "DELETE FROM cmx_leaves WHERE pool_address=$1",
             "DELETE FROM pending_tx WHERE pool_address=$1",
@@ -8994,6 +11317,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pg_batch_history_is_keyset_paged_and_keeps_boundary_sequence_whole() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let pool_address = format!("0x{}", "e9".repeat(20));
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
+
+        let mut mutations: Vec<NoteArchiveMutation> = (1..=2_505u64)
+            .map(|seq| {
+                NoteArchiveMutation::Upsert(sample_note_envelope_for_cmx(unique_cmx(seq), seq))
+            })
+            .collect();
+        for suffix in 1..=3u64 {
+            mutations.push(NoteArchiveMutation::Upsert(sample_note_envelope_for_cmx(
+                unique_cmx(10_000 + suffix),
+                1_000,
+            )));
+        }
+        pg_apply_note_mutations(&pool, &pool_address, None, &mutations)
+            .await
+            .unwrap();
+
+        let backend = StateBackend::Pgsql(pool.clone());
+        let first = backend
+            .load_archived_batch_page(&pool_address, 0, 2_505, u64::MAX, 1_000)
+            .await
+            .unwrap();
+        assert!(first.has_more);
+        assert_eq!(first.envelopes.len(), 1_003);
+        assert!(first.envelopes.iter().all(|envelope| envelope.seq <= 1_000));
+        assert_eq!(
+            first
+                .envelopes
+                .iter()
+                .filter(|envelope| envelope.seq == 1_000)
+                .count(),
+            4
+        );
+
+        let second = backend
+            .load_archived_batch_page(&pool_address, 1_000, 2_505, u64::MAX, 1_000)
+            .await
+            .unwrap();
+        assert!(second.has_more);
+        assert_eq!(second.envelopes.len(), 1_000);
+        assert_eq!(second.envelopes.first().unwrap().seq, 1_001);
+        assert_eq!(second.envelopes.last().unwrap().seq, 2_000);
+
+        let final_page = backend
+            .load_archived_batch_page(&pool_address, 2_000, 2_505, u64::MAX, 1_000)
+            .await
+            .unwrap();
+        assert!(!final_page.has_more);
+        assert_eq!(final_page.envelopes.len(), 505);
+        assert_eq!(final_page.envelopes.last().unwrap().seq, 2_505);
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let plan: Vec<(String,)> = sqlx::query_as(
+            "EXPLAIN SELECT cmx_hex FROM notes \
+             WHERE pool_address=$1 AND seq > $2 AND seq <= $3 AND seq < $4 \
+             ORDER BY seq, cmx_hex LIMIT $5",
+        )
+        .bind(&pool_address)
+        .bind(0i64)
+        .bind(2_505i64)
+        .bind(i64::MAX)
+        .bind(1_000i64)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        assert!(
+            plan.into_iter()
+                .map(|(line,)| line)
+                .any(|line| line.contains("notes_history_seq_idx")),
+            "bounded history query must use the composite keyset index"
+        );
+
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
+    }
+
+    #[tokio::test]
     async fn pg_checkpoint_integrity_enables_warm_start_when_database_is_configured() {
         let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
             return;
@@ -9004,15 +11415,19 @@ mod tests {
         clear_pg_rebuild_test_pool(&pool, &pool_address).await;
 
         let cmx = canonical_test_leaf(77);
-        let note = sample_note_envelope_for_cmx(cmx, 1);
-        let frontier = frontier_from_ordered_leaves(&[cmx]).unwrap();
+        let mut note = sample_note_envelope_for_cmx(cmx, 1);
+        note.batch.abi_notes[0].cmx_position = Some(0);
+        note.batch.abi_notes[0].is_confirmed = true;
+        let mut frontier = CompactFrontier::new();
+        let nodes = frontier.append_be(cmx).unwrap();
         let snap = CheckpointSnapshot {
             next_block: 102,
             last_finalized_block: Some(101),
             last_finalized_block_hash: Some(format!("0x{}", "cd".repeat(32))),
-            cmx_ordered: vec![cmx],
-            active_root: Some(fr_to_be_bytes(frontier.root())),
+            tree_frontier: frontier.clone(),
+            active_root: Some(frontier.root_be()),
             confirmed_count: 1,
+            confirmed_frontier: frontier.clone(),
             last_leaf_key: Some((101, 1)),
             latest_seq: 1,
             ..CheckpointSnapshot::default()
@@ -9022,7 +11437,11 @@ mod tests {
             &pool_address,
             &[
                 NoteArchiveMutation::Upsert(note),
-                NoteArchiveMutation::Confirm { cmx, position: 0 },
+                NoteArchiveMutation::Confirm {
+                    cmx,
+                    position: 0,
+                    nodes,
+                },
             ],
             &snap,
         )
@@ -9033,37 +11452,77 @@ mod tests {
         assert!(loaded.warm_start_candidate);
         assert_eq!(loaded.confirmed_count, 1);
         assert_eq!(loaded.last_leaf_key, Some((101, 1)));
-        assert!(loaded.confirmed_cmx.contains(&cmx));
-        let archived = StateBackend::Pgsql(pool.clone())
-            .load_archived_batches(&pool_address, 0, u64::MAX)
-            .await;
-        assert_eq!(archived.len(), 1);
-        assert_eq!(archived[0].seq, 1);
+        assert_eq!(loaded.tree_frontier.next_index(), 1);
+        assert_eq!(loaded.confirmed_frontier.root_be(), frontier.root_be());
+        let backend = StateBackend::Pgsql(pool.clone());
+        let mut incomplete = snap.clone();
+        incomplete.next_block = 101;
+        assert!(backend.save(&pool_address, &incomplete).await.is_err());
+        assert!(pg_load(&pool, &pool_address, 1).await.warm_start_candidate);
 
-        // Version 0 models an old writer that cannot maintain the new scalar
-        // columns. The read-only snapshot derives them from the atomic note
-        // archive, then the Poseidon/RPC warm-start checks still apply.
+        let archived = backend
+            .load_archived_batch_page(&pool_address, 0, u64::MAX, u64::MAX, 10)
+            .await
+            .unwrap();
+        assert!(!archived.has_more);
+        assert_eq!(archived.envelopes.len(), 1);
+        assert_eq!(archived.envelopes[0].seq, 1);
+
+        // A sealed v1 row is not directly warm-startable. The bounded legacy
+        // upgrade rebuilds only the depth-32 frontiers/node archive from PG and
+        // atomically seals v2 metadata, without consulting RPC history.
         sqlx::query(
-            "UPDATE indexer_meta SET checkpoint_version=0, confirmed_count=0, \
-             last_leaf_block=NULL, last_leaf_log_index=NULL WHERE pool_address=$1",
+            "UPDATE indexer_meta SET checkpoint_version=1, tree_size=NULL, \
+             tree_root_hex=NULL, tree_frontier_hex=NULL, confirmed_frontier_hex=NULL, \
+             frozen_root_hex=NULL, frozen_count=NULL, frozen_update_count=NULL \
+             WHERE pool_address=$1",
         )
         .bind(&pool_address)
         .execute(&pool)
         .await
         .unwrap();
-        let legacy_writer = pg_load(&pool, &pool_address, 1).await;
-        assert!(legacy_writer.warm_start_candidate);
-        assert_eq!(legacy_writer.confirmed_count, 1);
-        assert_eq!(legacy_writer.last_leaf_key, Some((101, 1)));
+        assert!(!pg_load(&pool, &pool_address, 1).await.warm_start_candidate);
+        assert!(
+            pg_upgrade_legacy_compact_checkpoint(&pool, &pool_address, 1)
+                .await
+                .unwrap()
+        );
+        let upgraded = pg_load(&pool, &pool_address, 1).await;
+        assert!(upgraded.warm_start_candidate);
+        assert_eq!(upgraded.confirmed_frontier.root_be(), frontier.root_be());
+
+        // Version 0 was never transactionally sealed, so it is deliberately
+        // ineligible for automatic promotion and must fail closed.
+        sqlx::query("UPDATE indexer_meta SET checkpoint_version=0 WHERE pool_address=$1")
+            .bind(&pool_address)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !pg_upgrade_legacy_compact_checkpoint(&pool, &pool_address, 1)
+                .await
+                .unwrap()
+        );
+        assert!(!pg_load(&pool, &pool_address, 1).await.warm_start_candidate);
 
         sqlx::query(
             "UPDATE indexer_meta SET checkpoint_version=1, confirmed_count=1, \
-             last_leaf_block=101, last_leaf_log_index=2 WHERE pool_address=$1",
+             last_leaf_block=101, last_leaf_log_index=2, tree_size=NULL, \
+             tree_root_hex=NULL, tree_frontier_hex=NULL, confirmed_frontier_hex=NULL, \
+             frozen_root_hex=NULL, frozen_count=NULL, frozen_update_count=NULL \
+             WHERE pool_address=$1",
         )
         .bind(&pool_address)
         .execute(&pool)
         .await
         .unwrap();
+        assert!(
+            pg_upgrade_legacy_compact_checkpoint(&pool, &pool_address, 1)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("last-leaf cursor")
+        );
         let rejected = pg_load(&pool, &pool_address, 1).await;
         assert!(!rejected.warm_start_candidate);
 
@@ -9094,20 +11553,24 @@ mod tests {
         pg_begin_canonical_rebuild(&pool, &pool_address, generation)
             .await
             .unwrap();
+        let cmx = canonical_test_leaf(0xbb);
+        let mut rebuilt = sample_note_envelope_for_cmx(cmx, 1);
+        rebuilt.batch.abi_notes[0].cmx_position = Some(0);
+        rebuilt.batch.abi_notes[0].is_confirmed = true;
+        let mut frontier = CompactFrontier::new();
+        let nodes = frontier.append_be(cmx).unwrap();
         pg_apply_note_mutations(
             &pool,
             &pool_address,
             Some(generation),
             &[
-                NoteArchiveMutation::Upsert(sample_note_envelope(0xbb, 2)),
+                NoteArchiveMutation::Upsert(rebuilt),
                 NoteArchiveMutation::Confirm {
-                    cmx: [0xbb; 32],
+                    cmx,
                     position: 0,
+                    nodes,
                 },
-                NoteArchiveMutation::ShieldAmount {
-                    cmx: [0xbb; 32],
-                    amount: 77,
-                },
+                NoteArchiveMutation::ShieldAmount { cmx, amount: 77 },
             ],
         )
         .await
@@ -9119,8 +11582,12 @@ mod tests {
             next_block: 102,
             last_finalized_block: Some(101),
             last_finalized_block_hash: Some(format!("0x{}", "cc".repeat(32))),
-            cmx_ordered: vec![[0xbb; 32]],
-            latest_seq: 2,
+            tree_frontier: frontier.clone(),
+            active_root: Some(frontier.root_be()),
+            confirmed_count: 1,
+            confirmed_frontier: frontier,
+            last_leaf_key: Some((101, 1)),
+            latest_seq: 1,
             ..CheckpointSnapshot::default()
         };
         pg_finish_canonical_rebuild(&pool, &pool_address, generation, &snap)
@@ -9135,17 +11602,13 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(
-            rows,
-            vec![(hex::encode([0xbb; 32]), Some(0), true, Some(77))]
-        );
-        let staged: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM notes_rebuild WHERE pool_address=$1",
-        )
-        .bind(&pool_address)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        assert_eq!(rows, vec![(hex::encode(cmx), Some(0), true, Some(77))]);
+        let staged: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM notes_rebuild WHERE pool_address=$1")
+                .bind(&pool_address)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(staged, 0);
         let cursor: (i64, Option<i64>, Option<String>) = sqlx::query_as(
             "SELECT next_block, last_finalized_block, last_finalized_block_hash \
@@ -9158,6 +11621,230 @@ mod tests {
         assert_eq!(cursor.0, 102);
         assert_eq!(cursor.1, Some(101));
         assert_eq!(cursor.2, snap.last_finalized_block_hash);
+
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
+    }
+
+    async fn seed_pg_confirmed_prefix(
+        pool: &sqlx::PgPool,
+        pool_address: &str,
+        leaf_count: u64,
+    ) -> CompactFrontier {
+        assert!(leaf_count > 0);
+        let mut tx = pool.begin().await.unwrap();
+        let mut builder = StreamingFrontierBuilder::new();
+        let mut completed = None;
+        let mut rows = Vec::with_capacity(500);
+        let mut nodes = Vec::with_capacity(1_000);
+        for position in 0..leaf_count {
+            let cmx = canonical_test_leaf(position + 1);
+            let generated = if position + 1 == leaf_count {
+                let (frontier, generated) = builder.finish_with_last_be(cmx).unwrap();
+                completed = Some(frontier);
+                generated
+            } else {
+                builder.push_nonfinal_be(cmx).unwrap()
+            };
+            nodes.extend(generated);
+            let seq = position + 1;
+            let mut envelope = sample_note_envelope_for_cmx(cmx, seq);
+            let note = &mut envelope.batch.abi_notes[0];
+            note.cmx_position = Some(position);
+            note.is_confirmed = true;
+            rows.push(ArchivedNoteRow {
+                seq,
+                note: note.clone(),
+            });
+            if rows.len() == 500 || position + 1 == leaf_count {
+                pg_bulk_upsert_notes(&mut tx, pool_address, None, &rows)
+                    .await
+                    .unwrap();
+                pg_append_cmx_leaves(&mut tx, pool_address, &rows)
+                    .await
+                    .unwrap();
+                pg_append_merkle_nodes(&mut tx, pool_address, None, &nodes)
+                    .await
+                    .unwrap();
+                rows.clear();
+                nodes.clear();
+            }
+        }
+        tx.commit().await.unwrap();
+        completed.unwrap()
+    }
+
+    #[tokio::test]
+    async fn pg_merkle_path_compatibility_reads_only_required_archived_nodes() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let pool_address = format!("0x{}", "e7".repeat(20));
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
+
+        const LEAVES: u64 = 129;
+        let frontier = seed_pg_confirmed_prefix(&pool, &pool_address, LEAVES).await;
+        let backend = StateBackend::Pgsql(pool.clone());
+        let mut reference = OrchardCommitmentTree::new();
+        for position in 0..LEAVES {
+            reference.append(canonical_test_leaf(position + 1));
+        }
+
+        for position in [0, 1, 63, 64, 127, 128] {
+            let cmx = canonical_test_leaf(position + 1);
+            assert_eq!(
+                backend.load_cmx_position(&pool_address, cmx).await.unwrap(),
+                Some(position)
+            );
+            let keys = required_witness_nodes(position, LEAVES).unwrap();
+            let nodes = backend
+                .load_merkle_nodes(&pool_address, &keys)
+                .await
+                .unwrap();
+            let siblings = witness_from_nodes(position, LEAVES, &nodes).unwrap();
+            assert_eq!(
+                siblings,
+                reference.merkle_path_at(position, LEAVES).unwrap().siblings
+            );
+            assert_eq!(
+                witness_root_be(cmx, position, &siblings).unwrap(),
+                frontier.root_be()
+            );
+        }
+
+        // A missing archived node must fail closed instead of returning an
+        // unchecked compatibility witness.
+        let keys = required_witness_nodes(64, LEAVES).unwrap();
+        let missing = keys[0];
+        sqlx::query(
+            "DELETE FROM merkle_nodes \
+             WHERE pool_address=$1 AND level=$2 AND node_index=$3",
+        )
+        .bind(&pool_address)
+        .bind(i16::from(missing.level))
+        .bind(missing.index as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let incomplete = backend
+            .load_merkle_nodes(&pool_address, &keys)
+            .await
+            .unwrap();
+        assert!(witness_from_nodes(64, LEAVES, &incomplete).is_err());
+
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
+    }
+
+    #[tokio::test]
+    async fn pg_frozen_history_is_paged_and_current_set_is_idempotent() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let pool_address = format!("0x{}", "e6".repeat(20));
+        clear_pg_rebuild_test_pool(&pool, &pool_address).await;
+
+        let root = |value| format!("0x{}", hex::encode(canonical_test_leaf(value)));
+        let a = root(101);
+        let b = root(102);
+        let absent = root(103);
+        let updates = [
+            FrozenUpdate {
+                block_number: 10,
+                log_index: 0,
+                tx_hash: format!("0x{}", "10".repeat(32)),
+                old_root_hex: root(1),
+                new_root_hex: root(2),
+                cmx_changed_hex: vec![a.clone(), b.clone()],
+                is_add: vec![true, true],
+            },
+            FrozenUpdate {
+                block_number: 11,
+                log_index: 0,
+                tx_hash: format!("0x{}", "11".repeat(32)),
+                old_root_hex: root(2),
+                new_root_hex: root(3),
+                cmx_changed_hex: vec![a.clone(), absent],
+                is_add: vec![true, false],
+            },
+            FrozenUpdate {
+                block_number: 12,
+                log_index: 0,
+                tx_hash: format!("0x{}", "12".repeat(32)),
+                old_root_hex: root(3),
+                new_root_hex: root(4),
+                cmx_changed_hex: vec![b],
+                is_add: vec![false],
+            },
+        ];
+        for (position, update) in updates.iter().cloned().enumerate() {
+            pg_apply_note_mutations(
+                &pool,
+                &pool_address,
+                None,
+                &[NoteArchiveMutation::Frozen {
+                    position: position as u64,
+                    update,
+                }],
+            )
+            .await
+            .unwrap();
+        }
+
+        let backend = StateBackend::Pgsql(pool.clone());
+        assert_eq!(
+            backend.load_frozen_leaves(&pool_address, 10).await.unwrap(),
+            vec![a]
+        );
+        let first_page = backend
+            .load_frozen_updates_after(&pool_address, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first_page.len(), 2);
+        assert_eq!(first_page[0].block_number, 10);
+        let second_page = backend
+            .load_frozen_updates_after(&pool_address, Some((11, 0)), 2)
+            .await
+            .unwrap();
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].block_number, 12);
+
+        let snap = CheckpointSnapshot {
+            next_block: 21,
+            last_finalized_block: Some(20),
+            last_finalized_block_hash: Some(format!("0x{}", "20".repeat(32))),
+            frozen_root_hex: root(4),
+            frozen_count: 1,
+            frozen_update_count: 3,
+            ..CheckpointSnapshot::default()
+        };
+        backend.save(&pool_address, &snap).await.unwrap();
+        let loaded = pg_load(&pool, &pool_address, 1).await;
+        assert!(loaded.warm_start_candidate);
+        assert_eq!(loaded.frozen_count, 1);
+        assert_eq!(loaded.frozen_update_count, 3);
+
+        sqlx::query(
+            "UPDATE indexer_meta SET checkpoint_version=1, tree_size=NULL, \
+             tree_root_hex=NULL, tree_frontier_hex=NULL, confirmed_frontier_hex=NULL, \
+             frozen_root_hex=NULL, frozen_count=NULL, frozen_update_count=NULL \
+             WHERE pool_address=$1",
+        )
+        .bind(&pool_address)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            pg_upgrade_legacy_compact_checkpoint(&pool, &pool_address, 1)
+                .await
+                .unwrap()
+        );
+        let upgraded = pg_load(&pool, &pool_address, 1).await;
+        assert!(upgraded.warm_start_candidate);
+        assert_eq!(upgraded.frozen_count, 1);
+        assert_eq!(upgraded.frozen_update_count, 3);
 
         clear_pg_rebuild_test_pool(&pool, &pool_address).await;
     }
@@ -9175,11 +11862,18 @@ mod tests {
         const EXISTING_LEAVES: u64 = 58_000;
         const REPLAY_NOTES: u64 = 340;
 
+        let prefix_frontier = seed_pg_confirmed_prefix(&pool, &pool_address, EXISTING_LEAVES).await;
+        let prefix_finalized = 100 + EXISTING_LEAVES;
         let prefix_snap = CheckpointSnapshot {
-            next_block: 1_001,
-            last_finalized_block: Some(1_000),
+            next_block: prefix_finalized + 1,
+            last_finalized_block: Some(prefix_finalized),
             last_finalized_block_hash: Some(format!("0x{}", "cd".repeat(32))),
-            cmx_ordered: (0..EXISTING_LEAVES).map(unique_cmx).collect(),
+            tree_frontier: prefix_frontier.clone(),
+            active_root: Some(prefix_frontier.root_be()),
+            confirmed_count: EXISTING_LEAVES,
+            confirmed_frontier: prefix_frontier.clone(),
+            last_leaf_key: Some((prefix_finalized, EXISTING_LEAVES)),
+            latest_seq: EXISTING_LEAVES,
             ..CheckpointSnapshot::default()
         };
         pg_commit_incremental_replay(&pool, &pool_address, &[], &prefix_snap)
@@ -9193,28 +11887,34 @@ mod tests {
         .await
         .expect("read prefix xmin");
 
-        let mut mutations = Vec::with_capacity(REPLAY_NOTES as usize * 3);
-        let mut cmx_ordered = prefix_snap.cmx_ordered.clone();
+        let mut mutations = Vec::with_capacity(REPLAY_NOTES as usize * 2);
+        let mut frontier = prefix_frontier;
         for offset in 0..REPLAY_NOTES {
             let position = EXISTING_LEAVES + offset;
-            let cmx = unique_cmx(position);
-            let seq = position * 2 + 1;
-            let initial = sample_note_envelope_for_cmx(cmx, seq);
-            let mut confirmed = initial.clone();
-            confirmed.seq = seq + 1;
+            let cmx = canonical_test_leaf(position + 1);
+            let seq = position + 1;
+            let mut confirmed = sample_note_envelope_for_cmx(cmx, seq);
             confirmed.batch.abi_notes[0].is_confirmed = true;
             confirmed.batch.abi_notes[0].cmx_position = Some(position);
-            mutations.push(NoteArchiveMutation::Upsert(initial));
+            let nodes = frontier.append_be(cmx).unwrap();
             mutations.push(NoteArchiveMutation::Upsert(confirmed));
-            mutations.push(NoteArchiveMutation::Confirm { cmx, position });
-            cmx_ordered.push(cmx);
+            mutations.push(NoteArchiveMutation::Confirm {
+                cmx,
+                position,
+                nodes,
+            });
         }
+        let replay_finalized = 100 + EXISTING_LEAVES + REPLAY_NOTES;
         let snap = CheckpointSnapshot {
-            next_block: 2_001,
-            last_finalized_block: Some(2_000),
+            next_block: replay_finalized + 1,
+            last_finalized_block: Some(replay_finalized),
             last_finalized_block_hash: Some(format!("0x{}", "ab".repeat(32))),
-            cmx_ordered,
-            latest_seq: (EXISTING_LEAVES + REPLAY_NOTES) * 2,
+            tree_frontier: frontier.clone(),
+            active_root: Some(frontier.root_be()),
+            confirmed_count: EXISTING_LEAVES + REPLAY_NOTES,
+            confirmed_frontier: frontier,
+            last_leaf_key: Some((replay_finalized, EXISTING_LEAVES + REPLAY_NOTES)),
+            latest_seq: EXISTING_LEAVES + REPLAY_NOTES,
             ..CheckpointSnapshot::default()
         };
         let started = std::time::Instant::now();
@@ -9239,8 +11939,8 @@ mod tests {
         assert_eq!(
             counts,
             (
-                REPLAY_NOTES as i64,
-                REPLAY_NOTES as i64,
+                (EXISTING_LEAVES + REPLAY_NOTES) as i64,
+                (EXISTING_LEAVES + REPLAY_NOTES) as i64,
                 (EXISTING_LEAVES + REPLAY_NOTES) as i64,
             )
         );
@@ -9262,30 +11962,30 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let bad_cmx = unique_cmx(EXISTING_LEAVES + REPLAY_NOTES);
+        let bad_cmx = canonical_test_leaf(999_999);
         let bad_seq = snap.latest_seq + 1;
         let mut bad_snap = snap.clone();
-        let persisted_boundary = bad_snap.cmx_ordered.len() - 1;
-        bad_snap.cmx_ordered[persisted_boundary] = unique_cmx(9_999);
-        bad_snap.cmx_ordered.push(bad_cmx);
         bad_snap.next_block = 9_999;
+        let conflicting_position = EXISTING_LEAVES + REPLAY_NOTES - 1;
+        let mut conflicting = sample_note_envelope_for_cmx(bad_cmx, bad_seq);
+        conflicting.batch.abi_notes[0].cmx_position = Some(conflicting_position);
+        conflicting.batch.abi_notes[0].is_confirmed = true;
         let error = pg_commit_incremental_replay(
             &pool,
             &pool_address,
             &[
-                NoteArchiveMutation::Upsert(sample_note_envelope_for_cmx(bad_cmx, bad_seq)),
+                NoteArchiveMutation::Upsert(conflicting),
                 NoteArchiveMutation::Confirm {
                     cmx: bad_cmx,
-                    position: EXISTING_LEAVES + REPLAY_NOTES,
+                    position: conflicting_position,
+                    nodes: Vec::new(),
                 },
             ],
             &bad_snap,
         )
         .await
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("append-only cmx checkpoint prefix mismatch"));
+        assert!(error.to_string().contains("cmx leaf append conflicted"));
 
         let state_after_failure: (i64, i64, i64) = sqlx::query_as(
             "SELECT \
@@ -9300,7 +12000,7 @@ mod tests {
         assert_eq!(
             state_after_failure,
             (
-                REPLAY_NOTES as i64,
+                (EXISTING_LEAVES + REPLAY_NOTES) as i64,
                 (EXISTING_LEAVES + REPLAY_NOTES) as i64,
                 cursor_before_failure,
             )

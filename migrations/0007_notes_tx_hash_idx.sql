@@ -1,0 +1,13 @@
+-- Index for `/tx?hash=` archive lookups.
+--
+-- `notes` previously had no index on `tx_hash` (only the `(pool_address, cmx_hex)`
+-- primary key plus `seq` / `nf_old_hex` / `block_number`), so serving `/tx` from the
+-- archive instead of the in-memory ring would have been a sequential scan of the
+-- whole table.
+--
+-- The index is on `lower(tx_hash)` rather than the bare column: `tx_hash` is stored
+-- verbatim as it came off the JSON-RPC log (`push_bind(&note.tx_hash)`), so its
+-- casing/`0x` prefix is not normalised on write. `/tx` normalises the needle the same
+-- way the in-memory scan does, and the query must match that expression exactly for
+-- the index to be used.
+CREATE INDEX IF NOT EXISTS notes_tx_hash_idx ON notes (pool_address, lower(tx_hash));

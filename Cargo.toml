@@ -29,4 +29,5 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 ethabi = "18"
 ff = "0.13"
 halo2curves = { version = "0.10.0", default-features = false }
+halo2_poseidon = "0.1.0"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "migrate"] }
