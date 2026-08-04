@@ -4693,13 +4693,19 @@ impl StateBackend {
                 .collect(),
             StateBackend::Json(None) => Vec::new(),
             StateBackend::Pgsql(pool) => {
+                // `u64::MAX` is the in-process sentinel for an unbounded archive
+                // scan when the warm-started in-memory ring is empty. A direct
+                // `as i64` cast turns that sentinel into -1 and makes the SQL
+                // predicate reject every persisted envelope.
+                let after_seq = pg_archive_seq_bound(after_seq);
+                let before_seq = pg_archive_seq_bound(before_seq);
                 let rows: Vec<NoteRow> = sqlx::query_as(&format!(
                     "SELECT {NOTE_SELECT_COLUMNS} FROM notes \
                      WHERE pool_address=$1 AND seq > $2 AND seq < $3 ORDER BY seq"
                 ))
                 .bind(pool_address)
-                .bind(after_seq as i64)
-                .bind(before_seq as i64)
+                .bind(after_seq)
+                .bind(before_seq)
                 .fetch_all(pool)
                 .await
                 .unwrap_or_default();
@@ -4824,6 +4830,10 @@ impl StateBackend {
             StateBackend::Pgsql(pool) => pg_save(pool, pool_address, snap).await,
         }
     }
+}
+
+fn pg_archive_seq_bound(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn decode_json_note_archive(raw: &str, pool_address: &str) -> Vec<BatchEnvelope> {
@@ -8611,8 +8621,9 @@ mod tests {
         frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error, nonempty_trimmed,
         normalize_hex_0x, parse_address_set, parse_bytes32_strict, parse_tx_meta,
         perc20_deployed_topic0,
-        persist_request_is_current, pg_apply_note_mutations, pg_begin_canonical_rebuild,
-        pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
+        persist_request_is_current, pg_apply_note_mutations, pg_archive_seq_bound,
+        pg_begin_canonical_rebuild, pg_commit_incremental_replay, pg_finish_canonical_rebuild,
+        pg_load,
         push_incremental_replay_mutation, replay_frozen_set, require_admin, require_relayer,
         latest_upserted_note, rlp_bytes, rlp_list, rlp_uint, strip_0x,
         validate_log_against_canonical, BatchEnvelope,
@@ -8631,6 +8642,13 @@ mod tests {
     #[test]
     fn batch_page_limit_is_a_soft_envelope_limit() {
         assert_eq!(batch_page_end(&[7, 7, 7], 1), 3);
+    }
+
+    #[test]
+    fn postgres_archive_unbounded_sequence_sentinel_does_not_wrap_negative() {
+        assert_eq!(pg_archive_seq_bound(0), 0);
+        assert_eq!(pg_archive_seq_bound(i64::MAX as u64), i64::MAX);
+        assert_eq!(pg_archive_seq_bound(u64::MAX), i64::MAX);
     }
 
     fn frozen_update(cmx: &[&str], is_add: &[bool]) -> FrozenUpdate {
@@ -9567,6 +9585,11 @@ mod tests {
         assert_eq!(loaded.confirmed_count, 1);
         assert_eq!(loaded.last_leaf_key, Some((101, 1)));
         assert!(loaded.confirmed_cmx.contains(&cmx));
+        let archived = StateBackend::Pgsql(pool.clone())
+            .load_archived_batches(&pool_address, 0, u64::MAX)
+            .await;
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].seq, 1);
 
         // Version 0 models an old writer that cannot maintain the new scalar
         // columns. The read-only snapshot derives them from the atomic note
