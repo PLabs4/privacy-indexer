@@ -454,6 +454,132 @@ impl RecentEventIds {
     }
 }
 
+/// One on-chain `RootUpdated` event waiting for the immediately-following
+/// `NoteConfirmed` events from the same updateRoot/updateRoots transaction.
+///
+/// OrchardVerifier emits the batch seal first and the confirmed leaves second.
+/// Keep the working frontier isolated until the whole segment validates so
+/// `/root`, the crank, and durable checkpoints continue to expose the previous
+/// complete on-chain boundary while the event stream is between those logs.
+#[derive(Clone)]
+struct PendingRootUpdate {
+    transaction_hash: String,
+    target_root: [u8; 32],
+    from_count: u64,
+    to_count: u64,
+    batch_size: u32,
+    frontier: CompactFrontier,
+}
+
+impl PendingRootUpdate {
+    fn begin(
+        confirmed_frontier: &CompactFrontier,
+        confirmed_count: u64,
+        tree_size: u64,
+        transaction_hash: &str,
+        target_root: [u8; 32],
+        from_count: u64,
+        to_count: u64,
+        batch_size: u32,
+    ) -> Result<Self> {
+        let declared = to_count
+            .checked_sub(from_count)
+            .ok_or_else(|| anyhow!("RootUpdated count range is reversed"))?;
+        if batch_size == 0
+            || batch_size as usize > CMX_CONFIRM_MAX_BATCH
+            || declared != u64::from(batch_size)
+        {
+            bail!(
+                "RootUpdated batch/count mismatch: from={from_count}, to={to_count}, batch={batch_size}, max={CMX_CONFIRM_MAX_BATCH}"
+            );
+        }
+        if confirmed_frontier.next_index() != confirmed_count || from_count != confirmed_count {
+            bail!(
+                "RootUpdated does not start at the compact confirmed frontier: from={from_count}, local_count={confirmed_count}, frontier_count={}",
+                confirmed_frontier.next_index()
+            );
+        }
+        if to_count > tree_size {
+            bail!(
+                "RootUpdated confirms leaves not yet ingested: to={to_count}, tree_size={tree_size}"
+            );
+        }
+        Ok(Self {
+            transaction_hash: normalize_hex_0x(transaction_hash),
+            target_root,
+            from_count,
+            to_count,
+            batch_size,
+            frontier: confirmed_frontier.clone(),
+        })
+    }
+
+    /// Append one NoteConfirmed leaf. The event repeats the segment's final
+    /// root for every leaf, so only the last append may compare the computed
+    /// frontier root with `target_root`.
+    fn append_confirmation(
+        &mut self,
+        transaction_hash: &str,
+        cmx: [u8; 32],
+        event_root: [u8; 32],
+        position: u64,
+        tree_size: u64,
+    ) -> Result<(Vec<MerkleNode>, bool)> {
+        if !self
+            .transaction_hash
+            .eq_ignore_ascii_case(&normalize_hex_0x(transaction_hash))
+        {
+            bail!("NoteConfirmed transaction does not match the pending RootUpdated segment");
+        }
+        if event_root != self.target_root {
+            bail!(
+                "NoteConfirmed target root differs from RootUpdated: event={}, target={}",
+                hex::encode(event_root),
+                hex::encode(self.target_root)
+            );
+        }
+        let expected_position = self.frontier.next_index();
+        if position != expected_position || position >= self.to_count || position >= tree_size {
+            bail!(
+                "NoteConfirmed position is outside the pending RootUpdated segment: event={position}, expected={expected_position}, segment=[{}, {}), tree_size={tree_size}",
+                self.from_count,
+                self.to_count
+            );
+        }
+
+        // Mutate the staged copy only after every precondition has passed. A
+        // final-root mismatch leaves the committed frontier untouched.
+        let mut next = self.frontier.clone();
+        let nodes = next
+            .append_be(cmx)
+            .context("advance staged compact confirmed frontier")?;
+        let complete = next.next_index() == self.to_count;
+        if complete && next.root_be() != self.target_root {
+            bail!(
+                "RootUpdated final root mismatch after {} confirmations: local={}, event={}",
+                self.batch_size,
+                hex::encode(next.root_be()),
+                hex::encode(self.target_root)
+            );
+        }
+        self.frontier = next;
+        Ok((nodes, complete))
+    }
+}
+
+fn ensure_root_update_boundary_sealed(state: &SharedState) -> Result<()> {
+    if let Some(pending) = state.pending_root_update.as_ref() {
+        bail!(
+            "incomplete RootUpdated segment at replay boundary: confirmed=[{}, {}), staged_count={}, batch={}",
+            pending.from_count,
+            pending.to_count,
+            pending.frontier.next_index(),
+            pending.batch_size
+        );
+    }
+    Ok(())
+}
+
 struct SharedState {
     next_block: u64,
     /// Last fully scanned Monad-finalized block and its canonical hash.
@@ -492,9 +618,11 @@ struct SharedState {
     /// O(depth) frontier over the confirmed prefix. This is both the `/root`
     /// source and the crank's exact starting state.
     confirmed_frontier: CompactFrontier,
-    /// Latest confirmed Orchard commitment tree root.
-    /// Updated only when a NoteConfirmed event is processed (Phase 2).
+    /// Latest fully-sealed Orchard commitment tree root.
+    /// Updated only after every NoteConfirmed in a RootUpdated segment validates.
     active_root: Option<[u8; 32]>,
+    /// Transient, bounded (at most 8 leaves) RootUpdated segment. Never persisted.
+    pending_root_update: Option<PendingRootUpdate>,
     /// Tx hashes submitted by the relayer but whose events haven't been received
     /// via WebSocket yet. On WS reconnect, these are recovered via receipt lookup.
     pending_tx_hashes: VecDeque<String>,
@@ -685,6 +813,7 @@ impl PoolBuilder {
             confirmed_count: ck.confirmed_count,
             confirmed_frontier: ck.confirmed_frontier,
             active_root: ck.active_root,
+            pending_root_update: None,
             pending_tx_hashes: ck.pending_tx_hashes,
             bundle_out_cache: HashMap::new(),
             bundle_out_order: VecDeque::new(),
@@ -5683,6 +5812,7 @@ impl Persist {
     fn notify(&self, s: &SharedState) {
         if self.read_only
             || self.is_paused()
+            || s.pending_root_update.is_some()
             || !checkpoint_is_complete_finalized_boundary(
                 s.next_block,
                 s.last_finalized_block,
@@ -7994,6 +8124,7 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
         state.confirmed_count = 0;
         state.confirmed_frontier = CompactFrontier::new();
         state.active_root = None;
+        state.pending_root_update = None;
         state.bundle_out_cache.clear();
         state.bundle_out_order.clear();
         state.frozen_root_hex = format!("0x{}", "00".repeat(32));
@@ -8046,6 +8177,7 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
         s.confirmed_count = 0;
         s.confirmed_frontier = CompactFrontier::new();
         s.active_root = None;
+        s.pending_root_update = None;
         s.bundle_out_cache.clear();
         s.bundle_out_order.clear();
         s.frozen_root_hex = format!("0x{}", "00".repeat(32));
@@ -8087,6 +8219,11 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
                     process_single_log(ctx, log)
                         .await
                         .with_context(|| format!("backfill log processing [{from},{to}]"))?;
+                }
+                {
+                    let state = ctx.shared.read().await;
+                    ensure_root_update_boundary_sealed(&state)
+                        .with_context(|| format!("backfill RootUpdated boundary [{from},{to}]"))?;
                 }
                 ctx.flush_rebuild_note_mutations()
                     .await
@@ -8313,6 +8450,15 @@ async fn replay_range(ctx: &PollContext, from: u64, to: u64) -> Result<usize, ()
                         return Err(());
                     }
                     total += 1;
+                }
+                {
+                    let state = ctx.shared.read().await;
+                    if let Err(e) = ensure_root_update_boundary_sealed(&state) {
+                        eprintln!(
+                            "[indexer][{label}] replay RootUpdated boundary [{lo},{hi}] failed: {e:#}"
+                        );
+                        return Err(());
+                    }
                 }
                 if hi == u64::MAX {
                     break;
@@ -8996,29 +9142,33 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         let (cmx, new_root, position) =
             decode_note_confirmed_log(log.topics.as_deref().unwrap_or(&[]), &log.data)
                 .map_err(|e| anyhow!("NoteConfirmed decode failed: {e}"))?;
-        let expected_position = state.confirmed_frontier.next_index();
-        if position != expected_position || position >= state.tree_frontier.next_index() {
+        let tree_size = state.tree_frontier.next_index();
+        let Some(pending) = state.pending_root_update.as_mut() else {
             state.tree_out_of_order = true;
-            bail!(
-                "NoteConfirmed position is not the next ingested leaf: event={position}, expected={expected_position}, tree_size={}",
-                state.tree_frontier.next_index()
-            );
+            bail!("NoteConfirmed at position {position} has no preceding RootUpdated segment");
+        };
+        let (nodes, complete) = match pending.append_confirmation(
+            &log.transaction_hash,
+            cmx,
+            new_root,
+            position,
+            tree_size,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                state.tree_out_of_order = true;
+                return Err(error.context("validate NoteConfirmed against RootUpdated segment"));
+            }
+        };
+        if complete {
+            let sealed = state
+                .pending_root_update
+                .take()
+                .expect("completed RootUpdated segment remains staged");
+            state.confirmed_frontier = sealed.frontier;
+            state.active_root = Some(sealed.target_root);
+            state.confirmed_count = sealed.to_count;
         }
-        let mut next_confirmed = state.confirmed_frontier.clone();
-        let nodes = next_confirmed
-            .append_be(cmx)
-            .context("advance compact confirmed frontier")?;
-        if next_confirmed.root_be() != new_root {
-            state.tree_out_of_order = true;
-            bail!(
-                "NoteConfirmed root mismatch at position {position}: local={}, event={}",
-                hex::encode(next_confirmed.root_be()),
-                hex::encode(new_root)
-            );
-        }
-        state.confirmed_frontier = next_confirmed;
-        state.active_root = Some(new_root);
-        state.confirmed_count = position.saturating_add(1);
         state.recent_event_ids.insert(event_id);
 
         // The confirmation event carries only (cmx, root, position) — republishing
@@ -9091,9 +9241,9 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 state.batches.pop_front();
             }
         }
-        let canonical_ready = !state.tree_out_of_order;
-        let persist_snap =
-            (!ctx.persist.is_paused()).then(|| CheckpointSnapshot::from_state(&state));
+        let canonical_ready = !state.tree_out_of_order && state.pending_root_update.is_none();
+        let persist_snap = (!ctx.persist.is_paused() && state.pending_root_update.is_none())
+            .then(|| CheckpointSnapshot::from_state(&state));
         drop(state);
 
         if let Some(envelope) = &envelope {
@@ -9117,33 +9267,37 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
         return Ok(());
     } else if t0.as_deref() == Some(ru.as_str()) {
         // ── RootUpdated (batch confirm) ──────────────────────────────────────
-        // NoteConfirmed events carry the leaves required to advance the compact
-        // frontier. RootUpdated is therefore a consistency seal, not a shortcut
-        // that may skip missing leaves.
+        // OrchardVerifier emits RootUpdated BEFORE this segment's NoteConfirmed
+        // events. Stage its target and commit only after every leaf validates.
         if state.recent_event_ids.contains(&event_id) {
             return Ok(());
         }
         match decode_root_updated_log(log.topics.as_deref().unwrap_or(&[]), &log.data) {
             Ok(d) => {
-                if d.to_count != state.confirmed_count
-                    || d.to_count != state.confirmed_frontier.next_index()
-                    || d.new_root != state.confirmed_frontier.root_be()
-                    || d.from_count > d.to_count
-                {
+                if state.pending_root_update.is_some() {
                     state.tree_out_of_order = true;
-                    bail!(
-                        "RootUpdated does not seal the compact confirmed frontier: from={}, to={}, local_count={}, event_root={}, local_root={}",
-                        d.from_count,
-                        d.to_count,
-                        state.confirmed_count,
-                        hex::encode(d.new_root),
-                        hex::encode(state.confirmed_frontier.root_be())
-                    );
+                    bail!("RootUpdated arrived before the previous segment was sealed");
                 }
-                state.active_root = Some(d.new_root);
+                let pending = match PendingRootUpdate::begin(
+                    &state.confirmed_frontier,
+                    state.confirmed_count,
+                    state.tree_frontier.next_index(),
+                    &log.transaction_hash,
+                    d.new_root,
+                    d.from_count,
+                    d.to_count,
+                    d.batch_size,
+                ) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        state.tree_out_of_order = true;
+                        return Err(error.context("validate RootUpdated segment"));
+                    }
+                };
+                state.pending_root_update = Some(pending);
                 state.recent_event_ids.insert(event_id);
                 println!(
-                    "[indexer] root updated: confirmed [{}, {}) root={} batch={}",
+                    "[indexer] root update staged: confirmed [{}, {}) root={} batch={}",
                     d.from_count,
                     d.to_count,
                     hex::encode(d.new_root),
@@ -10268,8 +10422,9 @@ mod tests {
         strip_0x, validate_log_against_canonical, witness_from_nodes, witness_root_be,
         ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, EthLog,
         FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
-        NoteArchiveMutation, RecentEventIds, RpcClient, StateBackend, StreamingFrontierBuilder,
-        DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS,
+        NoteArchiveMutation, PendingRootUpdate, RecentEventIds, RpcClient, StateBackend,
+        StreamingFrontierBuilder, DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS,
+        MAX_RECENT_EVENT_IDS,
     };
 
     #[test]
@@ -10573,6 +10728,116 @@ mod tests {
         let mut be: [u8; 32] = Fr::from(value).to_repr().into();
         be.reverse();
         be
+    }
+
+    fn append_test_leaves(mut frontier: CompactFrontier, leaves: &[[u8; 32]]) -> CompactFrontier {
+        for leaf in leaves {
+            frontier.append_be(*leaf).unwrap();
+        }
+        frontier
+    }
+
+    #[test]
+    fn root_updated_before_note_confirmed_seals_one_eight_leaf_segment() {
+        let committed = CompactFrontier::new();
+        let leaves: Vec<_> = (1..=8).map(canonical_test_leaf).collect();
+        let expected = append_test_leaves(committed.clone(), &leaves);
+        let target_root = expected.root_be();
+        let tx_hash = format!("0x{}", "11".repeat(32));
+        let mut pending = PendingRootUpdate::begin(
+            &committed,
+            0,
+            leaves.len() as u64,
+            &tx_hash,
+            target_root,
+            0,
+            8,
+            8,
+        )
+        .unwrap();
+
+        // The committed frontier is unchanged while the first seven events
+        // repeat the final batch root.
+        assert_eq!(committed.next_index(), 0);
+        for (position, cmx) in leaves.into_iter().enumerate() {
+            let (_, complete) = pending
+                .append_confirmation(&tx_hash, cmx, target_root, position as u64, 8)
+                .unwrap();
+            assert_eq!(complete, position == 7);
+        }
+        assert_eq!(pending.frontier.next_index(), 8);
+        assert_eq!(pending.frontier.root_be(), target_root);
+    }
+
+    #[test]
+    fn update_roots_event_order_seals_four_segments_and_thirty_two_leaves() {
+        let leaves: Vec<_> = (1..=32).map(canonical_test_leaf).collect();
+        let tx_hash = format!("0x{}", "22".repeat(32));
+        let mut committed = CompactFrontier::new();
+
+        for segment in 0..4usize {
+            let from = (segment * 8) as u64;
+            let to = from + 8;
+            let segment_leaves = &leaves[segment * 8..segment * 8 + 8];
+            let expected = append_test_leaves(committed.clone(), segment_leaves);
+            let target_root = expected.root_be();
+            let mut pending =
+                PendingRootUpdate::begin(&committed, from, 32, &tx_hash, target_root, from, to, 8)
+                    .unwrap();
+            for (offset, cmx) in segment_leaves.iter().copied().enumerate() {
+                let (_, complete) = pending
+                    .append_confirmation(&tx_hash, cmx, target_root, from + offset as u64, 32)
+                    .unwrap();
+                assert_eq!(complete, offset == 7);
+            }
+            committed = pending.frontier;
+            assert_eq!(committed.root_be(), expected.root_be());
+        }
+        assert_eq!(committed.next_index(), 32);
+    }
+
+    #[test]
+    fn malformed_root_update_segments_fail_closed_without_partial_commit() {
+        let committed = CompactFrontier::new();
+        let leaves: Vec<_> = (1..=8).map(canonical_test_leaf).collect();
+        let expected = append_test_leaves(committed.clone(), &leaves);
+        let target_root = expected.root_be();
+        let tx_hash = format!("0x{}", "33".repeat(32));
+
+        assert!(
+            PendingRootUpdate::begin(&committed, 0, 8, &tx_hash, target_root, 1, 9, 8,).is_err()
+        );
+        assert!(
+            PendingRootUpdate::begin(&committed, 0, 8, &tx_hash, target_root, 0, 8, 7,).is_err()
+        );
+
+        let mut pending =
+            PendingRootUpdate::begin(&committed, 0, 8, &tx_hash, target_root, 0, 8, 8).unwrap();
+        assert!(pending
+            .append_confirmation(&tx_hash, leaves[0], target_root, 1, 8)
+            .is_err());
+        assert_eq!(pending.frontier.next_index(), 0);
+        assert!(pending
+            .append_confirmation(
+                &format!("0x{}", "44".repeat(32)),
+                leaves[0],
+                target_root,
+                0,
+                8,
+            )
+            .is_err());
+        assert_eq!(pending.frontier.next_index(), 0);
+
+        for (position, cmx) in leaves.iter().copied().take(7).enumerate() {
+            pending
+                .append_confirmation(&tx_hash, cmx, target_root, position as u64, 8)
+                .unwrap();
+        }
+        assert!(pending
+            .append_confirmation(&tx_hash, canonical_test_leaf(999), target_root, 7, 8,)
+            .is_err());
+        assert_eq!(pending.frontier.next_index(), 7);
+        assert_eq!(committed.next_index(), 0);
     }
 
     #[test]
