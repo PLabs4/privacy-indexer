@@ -2883,6 +2883,9 @@ async fn get_batches_page(
         }));
     }
 
+    // TODO(indexer-oom): push `target_seq` and `limit` through the backend so
+    // PostgreSQL applies bounded keyset pagination. The current compatibility
+    // path materializes the remaining archive before truncating the response.
     let mut candidates = collect_batches_since(&ctx, after_seq).await?;
     candidates.retain(|envelope| envelope.seq <= target_seq);
     candidates.sort_by_key(|envelope| envelope.seq);
