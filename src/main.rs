@@ -6,7 +6,7 @@ use std::{
     net::SocketAddr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -68,7 +68,7 @@ use privacy_core::types::{OrchardIndexBatch, OrchardIndexedAbiNote};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
-use tokio::sync::{broadcast, RwLock, Semaphore};
+use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_tungstenite::tungstenite::Message;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -915,6 +915,9 @@ struct PoolRegistry {
     /// used to be unbounded, so a handful of concurrent clients could each
     /// materialize the complete `notes` table and exhaust the process heap.
     history_read_semaphore: Arc<Semaphore>,
+    /// Single-flight cache so Browser polling cannot cause repeated aggregate
+    /// reads. PostgreSQL refreshes it from the compact one-row-per-tx index.
+    system_stats_cache: Arc<Mutex<Option<(Instant, u64)>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1572,6 +1575,7 @@ const DEFAULT_BATCH_PAGE_LIMIT: usize = 1_000;
 const MAX_BATCH_PAGE_LIMIT: usize = 2_000;
 const HISTORY_READ_CONCURRENCY: usize = 4;
 const MAX_TX_HISTORY_NOTE_ROWS: usize = 2_000;
+const SYSTEM_STATS_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 struct BatchesPageQuery {
@@ -1691,6 +1695,11 @@ fn decode_fee_charged_log(data: &str) -> Result<DecodedFeeCharged> {
         fee_units: be_u128(&raw[0..32]),
         fee_wei: be_u128(&raw[32..64]),
     })
+}
+
+#[derive(Debug, Serialize)]
+struct SystemStatsResponse {
+    total_transactions: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1903,6 +1912,7 @@ async fn main() -> Result<()> {
             .map(Arc::<str>::from),
         write_semaphore: Arc::new(Semaphore::new(2)),
         history_read_semaphore: Arc::new(Semaphore::new(HISTORY_READ_CONCURRENCY)),
+        system_stats_cache: Arc::new(Mutex::new(None)),
     };
     registry.validate_trust_roots().await?;
 
@@ -2004,6 +2014,7 @@ async fn main() -> Result<()> {
         .route("/notify_tx", post(post_notify_tx))
         .route("/pools", get(list_pools).post(register_pool))
         .route("/pool_meta", get(get_pool_meta))
+        .route("/stats", get(get_system_stats))
         .route("/shield/stats", get(get_shield_stats))
         .route("/frozen_root", get(get_frozen_root))
         .route("/frozen_updates", get(get_frozen_updates))
@@ -2834,6 +2845,61 @@ async fn get_pool_meta(
             format!("no metadata for pool {}", q.pool),
         )
     })
+}
+
+/// `GET /stats` — exact system-wide transaction aggregates for the explorer.
+async fn get_system_stats(
+    State(reg): State<PoolRegistry>,
+) -> Result<Json<SystemStatsResponse>, (StatusCode, String)> {
+    let mut cache = reg.system_stats_cache.lock().await;
+    if let Some((refreshed_at, total_transactions)) = *cache {
+        if refreshed_at.elapsed() < SYSTEM_STATS_CACHE_TTL {
+            return Ok(Json(SystemStatsResponse { total_transactions }));
+        }
+    }
+
+    let total_transactions = if let Some(pool) = reg.builder.pg_pool.as_ref() {
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM indexed_transactions")
+            .fetch_one(pool)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("load transaction stats: {error}"),
+                )
+            })?;
+        u64::try_from(total).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stored transaction count is negative".to_owned(),
+            )
+        })?
+    } else {
+        // JSON is development-only and has no aggregate tables. Preserve API
+        // parity by folding its complete archives at most once per cache TTL.
+        let _history_permit = acquire_history_read(&reg).await?;
+        let contexts: Vec<AppContext> = reg.pools.read().await.values().cloned().collect();
+        let mut hashes = HashSet::new();
+        for ctx in &contexts {
+            if let StateBackend::Json(Some(path)) = &ctx.backend {
+                for envelope in StateBackend::read_json_archive(path, &ctx.contract_address) {
+                    for note in envelope.batch.abi_notes {
+                        hashes.insert(normalize_hex_0x(&note.tx_hash).to_lowercase());
+                    }
+                }
+            }
+            let state = ctx.state.read().await;
+            canonical_guard(state.tree_out_of_order)?;
+            for envelope in &state.batches {
+                for note in &envelope.batch.abi_notes {
+                    hashes.insert(normalize_hex_0x(&note.tx_hash).to_lowercase());
+                }
+            }
+        }
+        hashes.len() as u64
+    };
+    *cache = Some((Instant::now(), total_transactions));
+    Ok(Json(SystemStatsResponse { total_transactions }))
 }
 
 /// `GET /shield/stats[?pool=0x...]` — event-derived ERC20Shield accounting.
@@ -11666,6 +11732,62 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn pg_transaction_stats_deduplicate_notes_and_pools_and_follow_deletes() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pg = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pg).await.unwrap();
+        let pool_a = format!("0x{}", "d1".repeat(20));
+        let pool_b = format!("0x{}", "d2".repeat(20));
+        clear_pg_rebuild_test_pool(&pg, &pool_a).await;
+        clear_pg_rebuild_test_pool(&pg, &pool_b).await;
+
+        let shared_hash = format!("0x{}", "ef".repeat(32));
+        let mut first = sample_note_envelope(0xa1, 1);
+        let mut second = sample_note_envelope(0xa2, 2);
+        first.batch.abi_notes[0].tx_hash = shared_hash.clone();
+        // Legacy rows may differ in case and omit 0x; they are one transaction.
+        second.batch.abi_notes[0].tx_hash = strip_0x(&shared_hash).to_uppercase();
+        let backend = StateBackend::Pgsql(pg.clone());
+        backend
+            .apply_note_mutations(&pool_a, None, &[NoteArchiveMutation::Upsert(first)])
+            .await
+            .unwrap();
+        backend
+            .apply_note_mutations(&pool_b, None, &[NoteArchiveMutation::Upsert(second)])
+            .await
+            .unwrap();
+
+        let note_count: i64 =
+            sqlx::query_scalar("SELECT note_count FROM indexed_transactions WHERE tx_hash=$1")
+                .bind(&shared_hash)
+                .fetch_one(&pg)
+                .await
+                .unwrap();
+        assert_eq!(note_count, 2);
+
+        clear_pg_rebuild_test_pool(&pg, &pool_a).await;
+        let note_count: i64 =
+            sqlx::query_scalar("SELECT note_count FROM indexed_transactions WHERE tx_hash=$1")
+                .bind(&shared_hash)
+                .fetch_one(&pg)
+                .await
+                .unwrap();
+        assert_eq!(note_count, 1, "the other swap pool still references the tx");
+
+        clear_pg_rebuild_test_pool(&pg, &pool_b).await;
+        let remains: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM indexed_transactions WHERE tx_hash=$1)",
+        )
+        .bind(&shared_hash)
+        .fetch_one(&pg)
+        .await
+        .unwrap();
+        assert!(!remains);
     }
 
     #[tokio::test]
