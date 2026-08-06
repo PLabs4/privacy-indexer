@@ -395,6 +395,12 @@ struct ShieldAccounting {
     total_shielded_wei: u128,
     total_unshielded_units: u128,
     total_unshielded_wei: u128,
+    /// Protocol fees collected by this pool (shield + unshield), in note units / wei.
+    /// Independent of the shielded-supply figures above — fees never enter custody accounting.
+    #[serde(default)]
+    total_fee_units: u128,
+    #[serde(default)]
+    total_fee_wei: u128,
 }
 
 impl ShieldAccounting {
@@ -1641,6 +1647,52 @@ struct ShieldStatsResponse {
     pools: Vec<ShieldPoolStats>,
 }
 
+/// `ERC20Shield.FeeCharged(address indexed payer, uint256 feeUnits, uint256 feeAmount, address collector)`
+///
+/// Emitted by `shield` and `unshield` when a protocol fee is deducted. Declared locally rather
+/// than pulled from `privacy-core`: the event ships with the fee release and the core crate is
+/// pinned to an earlier rev.
+///
+/// NOTE on the surrounding accounting: `Shielded` carries the NET units credited to the note and
+/// `Unshielded` the GROSS units that left the shielded supply, so `current_shielded_*` continues
+/// to track `shieldedSupply` exactly. The fee is a separate flow — never add it back in.
+fn fee_charged_topic0_hex() -> String {
+    format!(
+        "0x{}",
+        hex::encode(Keccak256::digest(
+            b"FeeCharged(address,uint256,uint256,address)"
+        ))
+    )
+}
+
+struct DecodedFeeCharged {
+    fee_units: u128,
+    fee_wei: u128,
+}
+
+/// data = feeUnits(32) || feeAmount(32) || collector(32); `payer` is indexed (topic1).
+fn decode_fee_charged_log(data: &str) -> Result<DecodedFeeCharged> {
+    let raw = hex::decode(strip_0x(data)).context("FeeCharged data is not hex")?;
+    if raw.len() < 96 {
+        return Err(anyhow!(
+            "FeeCharged data too short: {} bytes (expected >= 96)",
+            raw.len()
+        ));
+    }
+    // u128 is enough: note units are circuit-bounded to 64 bits and wei fits comfortably.
+    let be_u128 = |w: &[u8]| -> u128 {
+        let mut out = 0u128;
+        for b in &w[16..32] {
+            out = (out << 8) | u128::from(*b);
+        }
+        out
+    };
+    Ok(DecodedFeeCharged {
+        fee_units: be_u128(&raw[0..32]),
+        fee_wei: be_u128(&raw[32..64]),
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct ShieldPoolStats {
     pool_address: String,
@@ -1652,6 +1704,8 @@ struct ShieldPoolStats {
     total_unshielded_wei: String,
     current_shielded_units: String,
     current_shielded_wei: String,
+    total_fee_units: String,
+    total_fee_wei: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2814,6 +2868,8 @@ async fn get_shield_stats(
             total_unshielded_wei: stats.total_unshielded_wei.to_string(),
             current_shielded_units: stats.current_shielded_units().to_string(),
             current_shielded_wei: stats.current_shielded_wei().to_string(),
+            total_fee_units: stats.total_fee_units.to_string(),
+            total_fee_wei: stats.total_fee_wei.to_string(),
         });
     }
 
@@ -6559,16 +6615,20 @@ async fn pg_save_snapshot_tx(
 
     sqlx::query(
         "INSERT INTO shield_pool_stats \
-          (pool_address, total_shielded_units, total_shielded_wei, total_unshielded_units, total_unshielded_wei, updated_at) \
-         VALUES ($1,$2,$3,$4,$5, now()) \
+          (pool_address, total_shielded_units, total_shielded_wei, total_unshielded_units, total_unshielded_wei, \
+           total_fee_units, total_fee_wei, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7, now()) \
          ON CONFLICT (pool_address) DO UPDATE SET \
-          total_shielded_units=$2, total_shielded_wei=$3, total_unshielded_units=$4, total_unshielded_wei=$5, updated_at=now()",
+          total_shielded_units=$2, total_shielded_wei=$3, total_unshielded_units=$4, total_unshielded_wei=$5, \
+          total_fee_units=$6, total_fee_wei=$7, updated_at=now()",
     )
     .bind(pool_address)
     .bind(snap.shield_accounting.total_shielded_units.to_string())
     .bind(snap.shield_accounting.total_shielded_wei.to_string())
     .bind(snap.shield_accounting.total_unshielded_units.to_string())
     .bind(snap.shield_accounting.total_unshielded_wei.to_string())
+    .bind(snap.shield_accounting.total_fee_units.to_string())
+    .bind(snap.shield_accounting.total_fee_wei.to_string())
     .execute(&mut **tx)
     .await
     .context("upsert shield_pool_stats")?;
@@ -7544,8 +7604,9 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
         }
     }
 
-    let stats_row: Option<(String, String, String, String)> = match sqlx::query_as(
-        "SELECT total_shielded_units, total_shielded_wei, total_unshielded_units, total_unshielded_wei \
+    let stats_row: Option<(String, String, String, String, String, String)> = match sqlx::query_as(
+        "SELECT total_shielded_units, total_shielded_wei, total_unshielded_units, total_unshielded_wei, \
+                total_fee_units, total_fee_wei \
          FROM shield_pool_stats WHERE pool_address=$1",
     )
     .bind(pool_address)
@@ -7559,17 +7620,21 @@ async fn pg_load(pool: &sqlx::PgPool, pool_address: &str, start_block: u64) -> C
         }
     };
     let shield_accounting = match stats_row {
-        Some((tsu, tsw, tuu, tuw)) => match (
+        Some((tsu, tsw, tuu, tuw, tfu, tfw)) => match (
             tsu.parse::<u128>(),
             tsw.parse::<u128>(),
             tuu.parse::<u128>(),
             tuw.parse::<u128>(),
+            tfu.parse::<u128>(),
+            tfw.parse::<u128>(),
         ) {
-            (Ok(tsu), Ok(tsw), Ok(tuu), Ok(tuw)) => ShieldAccounting {
+            (Ok(tsu), Ok(tsw), Ok(tuu), Ok(tuw), Ok(tfu), Ok(tfw)) => ShieldAccounting {
                 total_shielded_units: tsu,
                 total_shielded_wei: tsw,
                 total_unshielded_units: tuu,
                 total_unshielded_wei: tuw,
+                total_fee_units: tfu,
+                total_fee_wei: tfw,
             },
             _ => {
                 reject("invalid persisted shield stats".to_string());
@@ -8160,6 +8225,7 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
     topic0s.push(normalize_hex_0x(&frozen_root_updated_topic0()));
     topic0s.push(normalize_hex_0x(&shielded_topic0_hex()));
     topic0s.push(normalize_hex_0x(&unshielded_topic0_hex()));
+    topic0s.push(normalize_hex_0x(&fee_charged_topic0_hex()));
 
     // Reset tree state for a clean rebuild so positions match on-chain order even
     // if the restored checkpoint was partial/corrupt. (pending_tx_hashes kept.)
@@ -8405,6 +8471,7 @@ fn watched_topic0s(ctx: &PollContext) -> Vec<String> {
     topic0s.push(normalize_hex_0x(&frozen_root_updated_topic0()));
     topic0s.push(normalize_hex_0x(&shielded_topic0_hex()));
     topic0s.push(normalize_hex_0x(&unshielded_topic0_hex()));
+    topic0s.push(normalize_hex_0x(&fee_charged_topic0_hex()));
     topic0s
 }
 
@@ -8504,6 +8571,7 @@ fn is_watched_pool_log(ctx: &PollContext, log: &EthLog) -> bool {
             norm_topic(&frozen_root_updated_topic0()),
             norm_topic(&shielded_topic0_hex()),
             norm_topic(&unshielded_topic0_hex()),
+            norm_topic(&fee_charged_topic0_hex()),
         ]
         .contains(&topic0)
 }
@@ -8893,6 +8961,7 @@ async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
     topics.push(norm_topic(&frozen_root_updated_topic0()));
     topics.push(norm_topic(&shielded_topic0_hex()));
     topics.push(norm_topic(&unshielded_topic0_hex()));
+    topics.push(norm_topic(&fee_charged_topic0_hex()));
 
     let sub_req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -9017,6 +9086,7 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
     let fru = norm_topic(&frozen_root_updated_topic0());
     let shielded_topic = norm_topic(&shielded_topic0_hex());
     let unshielded_topic = norm_topic(&unshielded_topic0_hex());
+    let fee_charged_topic = norm_topic(&fee_charged_topic0_hex());
 
     let event_id = format!("{}:{}", log.transaction_hash, log.log_index);
     let block_number = parse_hex_u64(&log.block_number)
@@ -9504,6 +9574,23 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 ctx.persist.notify(&state);
             }
             Err(e) => return Err(anyhow!("Unshielded decode failed: {e}")),
+        }
+    } else if t0.as_deref() == Some(fee_charged_topic.as_str()) {
+        // ── Protocol fee accounting (shield + unshield) ────────────────────────
+        if state.recent_event_ids.contains(&event_id) {
+            return Ok(());
+        }
+        match decode_fee_charged_log(&log.data) {
+            Ok(d) => {
+                state.recent_event_ids.insert(event_id);
+                state.shield_accounting.total_fee_units =
+                    state.shield_accounting.total_fee_units.saturating_add(d.fee_units);
+                state.shield_accounting.total_fee_wei =
+                    state.shield_accounting.total_fee_wei.saturating_add(d.fee_wei);
+                state.next_block = block_number.saturating_add(1).max(state.next_block);
+                ctx.persist.notify(&state);
+            }
+            Err(e) => return Err(anyhow!("FeeCharged decode failed: {e}")),
         }
     }
 
