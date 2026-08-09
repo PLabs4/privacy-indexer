@@ -190,6 +190,19 @@ struct Cli {
         value_parser = parse_bool_flag
     )]
     migrate_only: bool,
+    /// One-shot tip-snapshot bootstrap for `frozen_paths` (mainnet upgrade path).
+    /// After warm-start / full rebuild succeeds, any confirmed cmx that still
+    /// lacks a frozen record is assigned a witness pinned to the pool's current
+    /// local confirmed root (must match on-chain `confirmedRoot` when counts
+    /// agree). Already-frozen cmxs are left untouched. Opt-in: turn off after
+    /// the archive is full (`count(frozen_paths) == confirmed_count`).
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_FREEZE_TIP_PATHS",
+        default_value_t = false,
+        value_parser = parse_bool_flag
+    )]
+    freeze_tip_paths: bool,
     /// First block to scan when no checkpoint exists; resume never goes below this.
     #[arg(long, env = "PRIVACYBTC_START_BLOCK", default_value_t = 0)]
     start_block: u64,
@@ -752,6 +765,8 @@ struct PoolBuilder {
     max_batches: usize,
     note_confirmed_topic0: String,
     shadow_mode: bool,
+    /// See [`Cli::freeze_tip_paths`].
+    freeze_tip_paths: bool,
 }
 
 impl PoolBuilder {
@@ -902,6 +917,7 @@ impl PoolBuilder {
             incremental_replay_mutations: Arc::new(tokio::sync::Mutex::new(None)),
             broadcast_paused: Arc::new(AtomicBool::new(false)),
             shadow_mode: self.shadow_mode,
+            freeze_tip_paths: self.freeze_tip_paths,
             ring_recovery: Arc::clone(&ring_recovery),
         };
         let addr_label = contract_address.to_string();
@@ -1890,6 +1906,7 @@ async fn main() -> Result<()> {
         max_batches: cli.max_batches_in_memory,
         note_confirmed_topic0: note_confirmed.clone(),
         shadow_mode: cli.shadow_mode,
+        freeze_tip_paths: cli.freeze_tip_paths,
     });
 
     let admission = Arc::new(PoolAdmissionPolicy::from_cli(&cli)?);
@@ -5888,6 +5905,38 @@ impl StateBackend {
         }
     }
 
+    /// Number of durable frozen-path rows for a pool (live table / JSON archive).
+    async fn count_frozen_paths(&self, pool_address: &str) -> Result<u64> {
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let archive_path = Self::json_archive_path(path);
+                let Ok(raw) = std::fs::read_to_string(archive_path) else {
+                    return Ok(0);
+                };
+                let mut by_cmx = HashSet::new();
+                for line in raw.lines() {
+                    if let Ok(JsonNoteArchiveUpdate::FrozenPath(record)) =
+                        serde_json::from_str::<JsonNoteArchiveUpdate>(line)
+                    {
+                        by_cmx.insert(record.cmx);
+                    }
+                }
+                Ok(by_cmx.len() as u64)
+            }
+            StateBackend::Json(None) => Ok(0),
+            StateBackend::Pgsql(pool) => {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM frozen_paths WHERE pool_address=$1",
+                )
+                .bind(pool_address)
+                .fetch_one(pool)
+                .await
+                .context("count frozen Merkle paths")?;
+                Ok(u64::try_from(count).unwrap_or(0))
+            }
+        }
+    }
+
     /// Point lookup of one segment-end frozen path record. Serving reads never
     /// mutate the store, so repeated GETs stay byte-identical (idempotency
     /// contract of `/merkle_path` in docs/note-sync-indexer-frozen-merkle-path.md).
@@ -8175,6 +8224,8 @@ struct PollContext {
     broadcast_paused: Arc<AtomicBool>,
     /// Read-only warm-start probe used for blue/green shadow validation.
     shadow_mode: bool,
+    /// Opt-in tip-snapshot bootstrap for missing `frozen_paths` rows.
+    freeze_tip_paths: bool,
     /// Ring-miss / recovery-source counters, shared with this pool's HTTP context.
     ring_recovery: Arc<RingRecoveryMetrics>,
 }
@@ -9122,6 +9173,239 @@ async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
 ///
 /// 1. Subscribe: `eth_subscribe logs` on the contract address.
 /// 2. Treat each incoming log as a hint; ingest only via finalized canonical replay.
+/// Page size for tip-snapshot path materialization. Each page unions witness
+/// node keys into one `load_merkle_nodes` round-trip.
+const TIP_FREEZE_PAGE_SIZE: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TipFreezeReport {
+    confirmed_count: u64,
+    already_frozen: u64,
+    written: u64,
+    skipped_existing: u64,
+}
+
+/// Build tip-anchored frozen records for a contiguous confirmed-leaf page.
+/// `leaves[i]` is the cmx at global position `start_position + i`. Every witness
+/// must reopen to `tip_root` (the pool's current confirmed frontier root).
+fn build_tip_frozen_paths(
+    leaves: &[[u8; 32]],
+    start_position: u64,
+    confirmed_count: u64,
+    tip_root: [u8; 32],
+    nodes: &HashMap<MerkleNodeKey, [u8; 32]>,
+) -> Result<Vec<FrozenPathRecord>> {
+    let mut records = Vec::with_capacity(leaves.len());
+    for (offset, cmx) in leaves.iter().enumerate() {
+        let position = start_position
+            .checked_add(offset as u64)
+            .ok_or_else(|| anyhow!("tip-freeze position overflow"))?;
+        if position >= confirmed_count {
+            bail!("tip-freeze leaf position {position} is outside confirmed prefix {confirmed_count}");
+        }
+        let siblings = witness_from_nodes(position, confirmed_count, nodes)
+            .with_context(|| format!("tip-freeze witness for position {position}"))?;
+        let recomputed = witness_root_be(*cmx, position, &siblings)
+            .with_context(|| format!("tip-freeze root check for position {position}"))?;
+        if recomputed != tip_root {
+            bail!(
+                "tip-freeze witness for position {position} opens to {} != tip {}",
+                hex::encode(recomputed),
+                hex::encode(tip_root)
+            );
+        }
+        records.push(FrozenPathRecord {
+            cmx: *cmx,
+            position,
+            siblings,
+            anchor_root: tip_root,
+        });
+    }
+    Ok(records)
+}
+
+/// Controllable init: assign every confirmed cmx that still lacks a frozen path
+/// a witness pinned to the pool's **current** confirmed root (a valid historical
+/// anchor). Already-frozen cmxs (segment-seal or prior tip snapshot) are skipped
+/// — divergent reseal is rejected by persistence. Opt-in via `--freeze-tip-paths`.
+async fn freeze_confirmed_paths_at_tip(ctx: &PollContext) -> Result<TipFreezeReport> {
+    if ctx.shadow_mode {
+        bail!("tip-path freeze is disabled in shadow mode");
+    }
+    let _ingest = ctx.ingest_lock.lock().await;
+    let label = &ctx.contract_address[..10.min(ctx.contract_address.len())];
+
+    let (confirmed_count, tip_root, tree_out_of_order) = {
+        let state = ctx.shared.read().await;
+        (
+            state.confirmed_count,
+            state.confirmed_frontier.root_be(),
+            state.tree_out_of_order,
+        )
+    };
+    if tree_out_of_order {
+        bail!("refusing tip-path freeze while the commitment tree is unready");
+    }
+    if confirmed_count == 0 {
+        return Ok(TipFreezeReport {
+            confirmed_count: 0,
+            already_frozen: 0,
+            written: 0,
+            skipped_existing: 0,
+        });
+    }
+
+    // Fail closed against a divergent local tip. Local may lag the chain (then
+    // the local tip is still a historical confirmed root); local may not lead.
+    let chain_count = word_to_u64(
+        &ctx.rpc
+            .eth_call_word(&ctx.contract_address, eth_selector(b"confirmedCount()"))
+            .await
+            .context("read confirmedCount for tip-path freeze")?,
+    );
+    let chain_root = ctx
+        .rpc
+        .eth_call_word(&ctx.contract_address, eth_selector(b"confirmedRoot()"))
+        .await
+        .context("read confirmedRoot for tip-path freeze")?;
+    if chain_count < confirmed_count {
+        bail!(
+            "local confirmed_count {confirmed_count} is ahead of on-chain {chain_count}; refusing tip-path freeze"
+        );
+    }
+    if chain_count == confirmed_count && chain_root != tip_root {
+        bail!(
+            "local tip {} disagrees with on-chain confirmedRoot {}; refusing tip-path freeze",
+            hex::encode(tip_root),
+            hex::encode(chain_root)
+        );
+    }
+
+    let already_frozen = ctx
+        .backend
+        .count_frozen_paths(&ctx.contract_address)
+        .await
+        .context("count existing frozen paths")?;
+    if already_frozen >= confirmed_count {
+        println!(
+            "[indexer][{label}] tip-path freeze skipped: frozen_paths={already_frozen} already covers confirmed={confirmed_count}"
+        );
+        return Ok(TipFreezeReport {
+            confirmed_count,
+            already_frozen,
+            written: 0,
+            skipped_existing: already_frozen,
+        });
+    }
+
+    println!(
+        "[indexer][{label}] tip-path freeze starting: confirmed={confirmed_count} \
+         already_frozen={already_frozen} tip={}",
+        hex::encode(tip_root)
+    );
+
+    let mut written = 0u64;
+    let mut skipped_existing = 0u64;
+    let mut position = 0u64;
+    while position < confirmed_count {
+        let remaining = (confirmed_count - position) as usize;
+        let limit = remaining.min(TIP_FREEZE_PAGE_SIZE);
+        let leaves = ctx
+            .backend
+            .load_cmx_range(&ctx.contract_address, position, limit)
+            .await
+            .with_context(|| format!("load confirmed cmx page at position {position}"))?;
+        if leaves.is_empty() {
+            bail!(
+                "confirmed cmx archive has a gap at position {position} (confirmed_count={confirmed_count})"
+            );
+        }
+        if leaves.len() as u64 + position > confirmed_count {
+            bail!("confirmed cmx page overruns confirmed_count");
+        }
+
+        let mut keys = HashSet::new();
+        for offset in 0..leaves.len() {
+            let leaf_pos = position + offset as u64;
+            for key in required_witness_nodes(leaf_pos, confirmed_count)? {
+                keys.insert(key);
+            }
+        }
+        let mut key_list: Vec<_> = keys.into_iter().collect();
+        key_list.sort_unstable();
+        let nodes = ctx
+            .backend
+            .load_merkle_nodes(&ctx.contract_address, &key_list)
+            .await
+            .with_context(|| format!("load merkle nodes for tip-freeze page at {position}"))?;
+
+        let mut page_records = Vec::new();
+        for (offset, cmx) in leaves.iter().enumerate() {
+            if ctx
+                .backend
+                .load_frozen_path(&ctx.contract_address, *cmx)
+                .await?
+                .is_some()
+            {
+                skipped_existing += 1;
+                continue;
+            }
+            let leaf_pos = position + offset as u64;
+            let mut one = build_tip_frozen_paths(
+                &[*cmx],
+                leaf_pos,
+                confirmed_count,
+                tip_root,
+                &nodes,
+            )?;
+            page_records.append(&mut one);
+        }
+
+        if !page_records.is_empty() {
+            let n = page_records.len() as u64;
+            let _write = ctx.backend_write_lock.lock().await;
+            ctx.backend
+                .apply_note_mutations(
+                    &ctx.contract_address,
+                    None,
+                    &[NoteArchiveMutation::FrozenPaths(page_records)],
+                )
+                .await
+                .with_context(|| format!("persist tip-frozen paths for page at {position}"))?;
+            written += n;
+        }
+
+        position += leaves.len() as u64;
+        if position % 2_048 == 0 || position == confirmed_count {
+            println!(
+                "[indexer][{label}] tip-path freeze progress: {position}/{confirmed_count} \
+                 written={written} skipped_existing={skipped_existing}"
+            );
+        }
+    }
+
+    let final_count = ctx
+        .backend
+        .count_frozen_paths(&ctx.contract_address)
+        .await?;
+    if final_count < confirmed_count {
+        bail!(
+            "tip-path freeze incomplete: frozen_paths={final_count} < confirmed={confirmed_count}"
+        );
+    }
+    println!(
+        "[indexer][{label}] tip-path freeze complete: written={written} \
+         skipped_existing={skipped_existing} frozen_paths={final_count} tip={}",
+        hex::encode(tip_root)
+    );
+    Ok(TipFreezeReport {
+        confirmed_count,
+        already_frozen,
+        written,
+        skipped_existing,
+    })
+}
+
 /// 3. On disconnect: recover any pending tx hashes via receipt lookup, then resubscribe.
 /// 4. Also listens for recover_trigger signals from post_notify_tx for immediate recovery.
 /// 5. A concurrent `catchup_from_chain` task reconciles anything the WS silently dropped.
@@ -9183,6 +9467,31 @@ async fn run_event_loop(ctx: PollContext) -> Result<()> {
                 Err(e) => {
                     eprintln!(
                         "[indexer][{label}] finalized startup backfill failed closed: {e:#}; retrying in 5s"
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+    // Controllable tip-snapshot init (mainnet upgrade): pin every still-missing
+    // confirmed cmx to the current confirmed root. Segment-seal freezes that
+    // already cover the archive make this a no-op.
+    if ctx.freeze_tip_paths {
+        loop {
+            match freeze_confirmed_paths_at_tip(&ctx).await {
+                Ok(report) => {
+                    println!(
+                        "[indexer][{label}] tip-path freeze report: confirmed={} already={} written={} skipped={}",
+                        report.confirmed_count,
+                        report.already_frozen,
+                        report.written,
+                        report.skipped_existing
+                    );
+                    break;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[indexer][{label}] tip-path freeze failed closed: {e:#}; retrying in 5s"
                     );
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
@@ -10919,6 +11228,8 @@ fn strip_0x(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         advance_cursor, batch_page_end, beacon_words_match, canonical_guard,
         checkpoint_is_complete_finalized_boundary, classify_selector, compact_note_mutations,
@@ -10928,15 +11239,15 @@ mod tests {
         frontier_from_leaves, frozen_count_after_delta, frozen_root_updated_topic0,
         getlogs_window_end, is_getlogs_range_error, latest_upserted_note, nonempty_trimmed,
         normalize_hex_0x, parse_address_set, parse_bytes32_strict, parse_tx_meta,
-        perc20_deployed_topic0, persist_request_is_current, pg_append_cmx_leaves,
-        pg_append_merkle_nodes, pg_apply_note_mutations, pg_archive_seq_bound,
-        pg_begin_canonical_rebuild, pg_bulk_upsert_notes, pg_commit_incremental_replay,
-        pg_finish_canonical_rebuild, pg_load, pg_upgrade_legacy_compact_checkpoint,
-        push_incremental_replay_mutation, replay_frozen_set, require_admin, require_relayer,
-        required_witness_nodes, rlp_bytes, rlp_list, rlp_uint, strip_0x,
-        validate_log_against_canonical, witness_from_nodes, witness_root_be, ArchivedNoteRow,
-        BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, EthLog, FrozenPathRecord,
-        FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
+        build_tip_frozen_paths, perc20_deployed_topic0, persist_request_is_current,
+        pg_append_cmx_leaves, pg_append_merkle_nodes, pg_apply_note_mutations,
+        pg_archive_seq_bound, pg_begin_canonical_rebuild, pg_bulk_upsert_notes,
+        pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
+        pg_upgrade_legacy_compact_checkpoint, push_incremental_replay_mutation, replay_frozen_set,
+        require_admin, require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint,
+        strip_0x, validate_log_against_canonical, witness_from_nodes, witness_root_be,
+        ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, EthLog,
+        FrozenPathRecord, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
         NoteArchiveMutation, PendingRootUpdate, RecentEventIds, RpcClient, StateBackend,
         StreamingFrontierBuilder, DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS,
         MAX_RECENT_EVENT_IDS,
@@ -12161,6 +12472,186 @@ mod tests {
             .is_none());
 
         let _ = std::fs::remove_file(&archive_path);
+    }
+
+    #[test]
+    fn freeze_tip_paths_cli_flag_defaults_off_and_parses_env_style() {
+        use clap::Parser;
+        // Required release-bound fields so clap can construct a Cli; we only
+        // assert the tip-freeze switch's default / opt-in behaviour.
+        let base = [
+            "privacy-indexer",
+            "--rpc-url",
+            "http://127.0.0.1:8545",
+            "--expected-verifier-set-id",
+            &format!("0x{}", "11".repeat(32)),
+        ];
+        let defaulted = Cli::try_parse_from(base).expect("default cli");
+        assert!(!defaulted.freeze_tip_paths);
+        let enabled = Cli::try_parse_from([base.as_slice(), &["--freeze-tip-paths"]].concat())
+            .expect("enabled cli");
+        assert!(enabled.freeze_tip_paths);
+    }
+
+    /// Tip-snapshot builder: every confirmed leaf's witness must open to the
+    /// current tip root (the bootstrap anchor for mainnet upgrades).
+    #[test]
+    fn tip_frozen_paths_all_open_to_current_confirmed_root() {
+        const N: u64 = 17;
+        let mut builder = StreamingFrontierBuilder::new();
+        let mut leaves = Vec::with_capacity(N as usize);
+        let mut nodes = HashMap::new();
+        let mut frontier = None;
+        for position in 0..N {
+            let cmx = canonical_test_leaf(position + 1);
+            leaves.push(cmx);
+            let generated = if position + 1 == N {
+                let (done, generated) = builder.finish_with_last_be(cmx).unwrap();
+                frontier = Some(done);
+                generated
+            } else {
+                builder.push_nonfinal_be(cmx).unwrap()
+            };
+            for node in generated {
+                nodes.insert(node.key, node.hash_be);
+            }
+        }
+        let tip = frontier.unwrap().root_be();
+        let records = build_tip_frozen_paths(&leaves, 0, N, tip, &nodes).unwrap();
+        assert_eq!(records.len(), N as usize);
+        for (position, record) in records.iter().enumerate() {
+            assert_eq!(record.position, position as u64);
+            assert_eq!(record.cmx, leaves[position]);
+            assert_eq!(record.anchor_root, tip);
+            assert_eq!(
+                witness_root_be(record.cmx, record.position, &record.siblings).unwrap(),
+                tip
+            );
+        }
+        // A wrong tip must fail closed.
+        let mut wrong = tip;
+        wrong[0] ^= 1;
+        assert!(build_tip_frozen_paths(&leaves, 0, N, wrong, &nodes).is_err());
+    }
+
+    /// PostgreSQL tip-snapshot init: materialize missing frozen_paths against the
+    /// seeded tip, leave already-frozen cmxs untouched, and serve frozen:true.
+    #[tokio::test]
+    async fn pg_tip_freeze_fills_missing_paths_against_current_root() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pg = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pg).await.unwrap();
+        let pool_address = format!("0x{}", "d4".repeat(20));
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
+
+        const LEAVES: u64 = 33;
+        let frontier = seed_pg_confirmed_prefix(&pg, &pool_address, LEAVES).await;
+        let tip = frontier.root_be();
+        let backend = StateBackend::Pgsql(pg.clone());
+        assert_eq!(backend.count_frozen_paths(&pool_address).await.unwrap(), 0);
+
+        // Pre-freeze one leaf under the tip (simulates a prior partial run).
+        let pre_cmx = canonical_test_leaf(1);
+        let pre_keys = required_witness_nodes(0, LEAVES).unwrap();
+        let pre_nodes = backend
+            .load_merkle_nodes(&pool_address, &pre_keys)
+            .await
+            .unwrap();
+        let pre = build_tip_frozen_paths(&[pre_cmx], 0, LEAVES, tip, &pre_nodes).unwrap();
+        backend
+            .apply_note_mutations(
+                &pool_address,
+                None,
+                &[NoteArchiveMutation::FrozenPaths(pre.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend.count_frozen_paths(&pool_address).await.unwrap(), 1);
+
+        // Tip-freeze every still-missing leaf (same algorithm as the startup hook).
+        let mut written = 0u64;
+        let mut position = 0u64;
+        while position < LEAVES {
+            let page = backend
+                .load_cmx_range(&pool_address, position, 8)
+                .await
+                .unwrap();
+            let mut keys = HashSet::new();
+            for offset in 0..page.len() {
+                for key in required_witness_nodes(position + offset as u64, LEAVES).unwrap() {
+                    keys.insert(key);
+                }
+            }
+            let key_list: Vec<_> = keys.into_iter().collect();
+            let nodes = backend
+                .load_merkle_nodes(&pool_address, &key_list)
+                .await
+                .unwrap();
+            let mut records = Vec::new();
+            for (offset, cmx) in page.iter().enumerate() {
+                if backend
+                    .load_frozen_path(&pool_address, *cmx)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    continue;
+                }
+                records.extend(
+                    build_tip_frozen_paths(
+                        &[*cmx],
+                        position + offset as u64,
+                        LEAVES,
+                        tip,
+                        &nodes,
+                    )
+                    .unwrap(),
+                );
+            }
+            if !records.is_empty() {
+                written += records.len() as u64;
+                backend
+                    .apply_note_mutations(
+                        &pool_address,
+                        None,
+                        &[NoteArchiveMutation::FrozenPaths(records)],
+                    )
+                    .await
+                    .unwrap();
+            }
+            position += page.len() as u64;
+        }
+        assert_eq!(written, LEAVES - 1);
+        assert_eq!(
+            backend.count_frozen_paths(&pool_address).await.unwrap(),
+            LEAVES
+        );
+
+        // Spot-check: every path is tip-anchored and reopens to tip; the
+        // pre-frozen leaf is unchanged (idempotent exact record).
+        for position in [0u64, 1, 16, 32] {
+            let cmx = canonical_test_leaf(position + 1);
+            let record = backend
+                .load_frozen_path(&pool_address, cmx)
+                .await
+                .unwrap()
+                .expect("frozen");
+            assert_eq!(record.anchor_root, tip);
+            assert_eq!(
+                witness_root_be(record.cmx, record.position, &record.siblings).unwrap(),
+                tip
+            );
+        }
+        let pre_stored = backend
+            .load_frozen_path(&pool_address, pre_cmx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pre_stored.siblings, pre[0].siblings);
+
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
     }
 
     /// PostgreSQL frozen paths: write-once per cmx. An exact replay is a no-op;
