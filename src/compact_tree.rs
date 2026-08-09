@@ -458,6 +458,94 @@ pub fn witness_root_be(
     Ok(fr_to_be(node))
 }
 
+/// One leaf's segment-end frozen authentication path
+/// (PERC20 `docs/note-sync-indexer-frozen-merkle-path.md` §4.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrozenSegmentPath {
+    /// EVM/on-chain byte order, as decoded from `NoteConfirmed`.
+    pub cmx_be: [u8; 32],
+    pub position: u64,
+    /// 32 little-endian 0x-hex siblings — the `/merkle_path` wire encoding.
+    pub siblings: Vec<String>,
+}
+
+/// Export the frozen witness for every leaf of one sealed `RootUpdated`
+/// segment, pinned to the segment's `newRoot`, **without reading the node
+/// archive**. That independence matters: during catch-up replay and canonical
+/// rebuild, archive mutations are buffered in memory and the database lags the
+/// staged tree, so a seal-time export must be derivable from segment-local
+/// state alone.
+///
+/// Correctness rests on a structural property of append-only Merkle trees. For
+/// a leaf at position `p ∈ [from, to)` witnessed against the `to`-leaf prefix,
+/// every *complete* sibling cover either
+///   * contains at least one segment leaf — then `append_be` emitted its root
+///     as a complete node while the segment was staged, or
+///   * lies entirely inside the pre-segment prefix — then it is exactly the
+///     pre-segment frontier's filled ommer at that level.
+/// Partial right-edge covers are rebuilt from those nodes plus empty roots by
+/// `witness_from_nodes`. Every path is verified to recompute
+/// `expected_root_be` before anything is returned.
+pub fn export_segment_frozen_paths(
+    begin_filled_be: &[[u8; 32]],
+    from_count: u64,
+    to_count: u64,
+    segment_cmxs: &[[u8; 32]],
+    segment_nodes: &HashMap<MerkleNodeKey, [u8; 32]>,
+    expected_root_be: [u8; 32],
+) -> Result<Vec<FrozenSegmentPath>> {
+    if begin_filled_be.len() != TREE_DEPTH {
+        bail!(
+            "pre-segment frontier has {} slots, expected {TREE_DEPTH}",
+            begin_filled_be.len()
+        );
+    }
+    if from_count.checked_add(segment_cmxs.len() as u64) != Some(to_count) {
+        bail!(
+            "segment leaf count mismatch: [{from_count}, {to_count}) with {} staged leaves",
+            segment_cmxs.len()
+        );
+    }
+    let mut paths = Vec::with_capacity(segment_cmxs.len());
+    for (offset, cmx_be) in segment_cmxs.iter().enumerate() {
+        let position = from_count + offset as u64;
+        let keys = required_witness_nodes(position, to_count)?;
+        let mut nodes = HashMap::with_capacity(keys.len());
+        for key in keys {
+            let value = segment_nodes.get(&key).copied().or_else(|| {
+                // A complete cover the segment did not emit must sit entirely
+                // left of the segment, where it is the frontier's filled ommer.
+                let level = key.level as usize;
+                let is_begin_ommer = level < TREE_DEPTH
+                    && ((from_count >> level) & 1) == 1
+                    && key.index == (from_count >> level) - 1;
+                is_begin_ommer.then(|| begin_filled_be[level])
+            });
+            let Some(value) = value else {
+                bail!(
+                    "segment witness node ({}, {}) is not derivable from the staged segment",
+                    key.level,
+                    key.index
+                );
+            };
+            nodes.insert(key, value);
+        }
+        let siblings = witness_from_nodes(position, to_count, &nodes)?;
+        let recomputed = witness_root_be(*cmx_be, position, &siblings)?;
+        if recomputed != expected_root_be {
+            bail!(
+                "frozen segment witness at position {position} does not recompute the sealed root"
+            );
+        }
+        paths.push(FrozenSegmentPath {
+            cmx_be: *cmx_be,
+            position,
+            siblings,
+        });
+    }
+    Ok(paths)
+}
+
 fn collect_complete_cover(
     level: u8,
     index: u64,
@@ -637,6 +725,124 @@ mod tests {
                 assert_eq!(actual, expected, "count={count} position={position}");
             }
         }
+    }
+
+    /// Segment-end frozen paths must equal the reference historical witness at
+    /// the sealed prefix, for every prefix/segment-size combination, and must
+    /// keep recomputing the sealed root after the tip advances (they are frozen
+    /// by value — later appends never touch them).
+    #[test]
+    fn segment_frozen_paths_match_reference_and_stay_pinned() {
+        let leaves: Vec<_> = (1..=64u64).map(leaf).collect();
+        let mut reference = OrchardCommitmentTree::new();
+        for value in &leaves {
+            reference.append(*value);
+        }
+        for from in [0u64, 1, 5, 8, 15, 16, 29, 32] {
+            for j in [1usize, 2, 3, 7, 8] {
+                let to = from + j as u64;
+                if to > leaves.len() as u64 {
+                    continue;
+                }
+                let prefix = &leaves[..from as usize];
+                let segment = &leaves[from as usize..to as usize];
+
+                let mut frontier = frontier_from_leaves(prefix).unwrap();
+                let begin_filled = frontier.filled_be();
+                let mut segment_nodes = HashMap::new();
+                for cmx in segment {
+                    for node in frontier.append_be(*cmx).unwrap() {
+                        segment_nodes.insert(node.key, node.hash_be);
+                    }
+                }
+                let sealed_root = frontier.root_be();
+
+                let paths = export_segment_frozen_paths(
+                    &begin_filled,
+                    from,
+                    to,
+                    segment,
+                    &segment_nodes,
+                    sealed_root,
+                )
+                .unwrap();
+                assert_eq!(paths.len(), j, "from={from} j={j}");
+
+                for path in &paths {
+                    let expected = reference.merkle_path_at(path.position, to).unwrap();
+                    assert_eq!(
+                        path.siblings, expected.siblings,
+                        "from={from} j={j} position={}",
+                        path.position
+                    );
+                }
+
+                // Tip advances: frozen paths still open to the sealed root,
+                // which is no longer the tip root.
+                for value in &leaves[to as usize..] {
+                    frontier.append_be(*value).unwrap();
+                }
+                for path in &paths {
+                    let reopened =
+                        witness_root_be(path.cmx_be, path.position, &path.siblings).unwrap();
+                    assert_eq!(reopened, sealed_root, "from={from} j={j}");
+                }
+                if (to as usize) < leaves.len() {
+                    assert_ne!(frontier.root_be(), sealed_root);
+                }
+            }
+        }
+    }
+
+    /// A tampered pre-segment frontier or a wrong sealed root must fail closed:
+    /// no partial path set is ever returned.
+    #[test]
+    fn segment_frozen_paths_fail_closed_on_corrupt_inputs() {
+        let leaves: Vec<_> = (1..=24u64).map(leaf).collect();
+        let (prefix, segment) = leaves.split_at(16);
+        let segment = &segment[..8];
+
+        let mut frontier = frontier_from_leaves(prefix).unwrap();
+        let begin_filled = frontier.filled_be();
+        let mut segment_nodes = HashMap::new();
+        for cmx in segment {
+            for node in frontier.append_be(*cmx).unwrap() {
+                segment_nodes.insert(node.key, node.hash_be);
+            }
+        }
+        let sealed_root = frontier.root_be();
+
+        assert!(export_segment_frozen_paths(
+            &begin_filled,
+            16,
+            24,
+            segment,
+            &segment_nodes,
+            leaf(999),
+        )
+        .is_err());
+
+        let mut corrupt_filled = begin_filled.clone();
+        corrupt_filled[4] = leaf(777);
+        assert!(export_segment_frozen_paths(
+            &corrupt_filled,
+            16,
+            24,
+            segment,
+            &segment_nodes,
+            sealed_root,
+        )
+        .is_err());
+
+        assert!(export_segment_frozen_paths(
+            &begin_filled,
+            16,
+            23,
+            segment,
+            &segment_nodes,
+            sealed_root,
+        )
+        .is_err());
     }
 
     #[test]

@@ -23,9 +23,8 @@ use clap::Parser;
 use futures_util::stream::{self, StreamExt};
 use futures_util::SinkExt;
 use k256::ecdsa::{RecoveryId, SigningKey};
-use privacy_core::commitment_tree::{
-    frontier::{CmxConfirmWitnessInput, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX},
-    OrchardMerklePath,
+use privacy_core::commitment_tree::frontier::{
+    CmxConfirmWitnessInput, CMX_CONFIRM_MAX_BATCH, CMX_CONFIRM_MAX_PROOFS_PER_TX,
 };
 use privacy_core::ethereum::{
     bundle_actions_by_cmx,
@@ -75,8 +74,8 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 
 use compact_tree::{
-    frontier_from_leaves, required_witness_nodes, witness_from_nodes, witness_root_be,
-    CompactFrontier, MerkleNode, MerkleNodeKey, StreamingFrontierBuilder,
+    export_segment_frozen_paths, frontier_from_leaves, required_witness_nodes, witness_from_nodes,
+    witness_root_be, CompactFrontier, MerkleNode, MerkleNodeKey, StreamingFrontierBuilder,
 };
 
 /// BN254 Poseidon incremental tree (depth 32) with **zero leaves**, matching
@@ -475,6 +474,14 @@ struct PendingRootUpdate {
     to_count: u64,
     batch_size: u32,
     frontier: CompactFrontier,
+    /// Pre-segment frontier ommers, captured at `begin`. Together with
+    /// `segment_nodes` they let the seal export every leaf's frozen witness
+    /// without touching the (possibly lagging) node archive.
+    begin_filled_be: Vec<[u8; 32]>,
+    /// Confirmed leaves staged so far, in position order.
+    segment_cmxs: Vec<[u8; 32]>,
+    /// Complete nodes emitted by the staged appends.
+    segment_nodes: HashMap<MerkleNodeKey, [u8; 32]>,
 }
 
 impl PendingRootUpdate {
@@ -517,6 +524,9 @@ impl PendingRootUpdate {
             to_count,
             batch_size,
             frontier: confirmed_frontier.clone(),
+            begin_filled_be: confirmed_frontier.filled_be(),
+            segment_cmxs: Vec::with_capacity(batch_size as usize),
+            segment_nodes: HashMap::new(),
         })
     }
 
@@ -569,8 +579,49 @@ impl PendingRootUpdate {
             );
         }
         self.frontier = next;
+        self.segment_cmxs.push(cmx);
+        for node in &nodes {
+            self.segment_nodes.insert(node.key, node.hash_be);
+        }
         Ok((nodes, complete))
     }
+
+    /// Frozen witness per staged leaf, pinned to the sealed segment root.
+    /// Only valid on a complete segment; any failure means the staged state is
+    /// inconsistent and the caller must fail closed without writing paths.
+    fn export_frozen_paths(&self) -> Result<Vec<FrozenPathRecord>> {
+        let paths = export_segment_frozen_paths(
+            &self.begin_filled_be,
+            self.from_count,
+            self.to_count,
+            &self.segment_cmxs,
+            &self.segment_nodes,
+            self.target_root,
+        )?;
+        Ok(paths
+            .into_iter()
+            .map(|path| FrozenPathRecord {
+                cmx: path.cmx_be,
+                position: path.position,
+                siblings: path.siblings,
+                anchor_root: self.target_root,
+            })
+            .collect())
+    }
+}
+
+/// One leaf's long-lived frozen authentication path, written exactly once when
+/// its `RootUpdated` segment seals (docs/note-sync-indexer-frozen-merkle-path.md).
+/// `anchor_root` is that segment's `newRoot` in EVM byte order. The record is
+/// never rewritten by later appends and never deleted by reads; only a
+/// canonical rebuild replaces the whole table.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FrozenPathRecord {
+    cmx: [u8; 32],
+    position: u64,
+    /// 32 little-endian 0x-hex siblings — the `/merkle_path` wire encoding.
+    siblings: Vec<String>,
+    anchor_root: [u8; 32],
 }
 
 fn ensure_root_update_boundary_sealed(state: &SharedState) -> Result<()> {
@@ -4174,10 +4225,38 @@ async fn get_swap(
     Ok(Json(out))
 }
 
+/// `/merkle_path` response (docs/note-sync-indexer-frozen-merkle-path.md §4.3).
+///
+/// `anchor_root` is the root the siblings open to. For a frozen record that is
+/// the sealing segment's `newRoot` — a historical anchor the wallet validates
+/// with `isValidAnchor`, NOT the current tip. `root` repeats the same value for
+/// clients that expect that field name. Encoding is little-endian 0x hex, the
+/// same convention as `siblings` and the prover's `parse_fr_le`.
+#[derive(Serialize)]
+struct MerklePathResponse {
+    /// Canonical big-endian 0x hex, echoed from the query.
+    cmx: String,
+    position: u32,
+    siblings: Vec<String>,
+    anchor_root: String,
+    root: String,
+    /// True when served from the long-lived segment-end frozen store. False
+    /// only for legacy records ingested before frozen persistence existed,
+    /// which fall back to a tip-relative witness (the returned anchor is the
+    /// confirmed root at response time — still a valid anchor forever).
+    frozen: bool,
+}
+
+/// EVM/on-chain byte order → little-endian 0x hex (prover `parse_fr_le`).
+fn be32_to_le_hex_0x(mut bytes: [u8; 32]) -> String {
+    bytes.reverse();
+    format!("0x{}", hex::encode(bytes))
+}
+
 async fn get_merkle_path(
     State(reg): State<PoolRegistry>,
     Query(q): Query<MerklePathQuery>,
-) -> Result<Json<privacy_core::commitment_tree::OrchardMerklePath>, (StatusCode, String)> {
+) -> Result<Json<MerklePathResponse>, (StatusCode, String)> {
     let _history_permit = acquire_history_read(&reg).await?;
     let ctx = reg.resolve(q.pool.as_deref()).await?;
     let cmx = parse_hex32(&q.cmx)
@@ -4192,6 +4271,56 @@ async fn get_merkle_path(
         canonical_guard(state.tree_out_of_order)?;
         (state.confirmed_count, state.confirmed_frontier.root_be())
     };
+
+    // Authoritative source: the segment-end frozen record, written exactly once
+    // when this cmx's RootUpdated segment sealed. Reads never mutate the store,
+    // so repeated GETs return byte-identical siblings and anchor_root.
+    let frozen = ctx
+        .backend
+        .load_frozen_path(&ctx.contract_address, cmx)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("frozen path archive unavailable: {error:#}"),
+            )
+        })?;
+    if let Some(record) = frozen {
+        // Final integrity guard: a corrupted row can never leave the process
+        // as an unchecked path.
+        let reopened = witness_root_be(cmx, record.position, &record.siblings).map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("frozen path validation failed: {error:#}"),
+            )
+        })?;
+        if reopened != record.anchor_root {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "frozen path does not recompute its sealed anchor root".to_owned(),
+            ));
+        }
+        let position = u32::try_from(record.position).map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Merkle position exceeds the depth-32 tree capacity".to_owned(),
+            )
+        })?;
+        let anchor_root = be32_to_le_hex_0x(record.anchor_root);
+        return Ok(Json(MerklePathResponse {
+            cmx: format!("0x{}", hex::encode(cmx)),
+            position,
+            siblings: record.siblings,
+            root: anchor_root.clone(),
+            anchor_root,
+            frozen: true,
+        }));
+    }
+
+    // Legacy fallback (pre-frozen archives only): recompute a witness over the
+    // confirmed prefix from the immutable node archive. New segments always
+    // freeze at seal time, and a canonical rebuild backfills history, so this
+    // path shrinks to zero over time.
     let position = ctx
         .backend
         .load_cmx_position(&ctx.contract_address, cmx)
@@ -4257,7 +4386,15 @@ async fn get_merkle_path(
             "Merkle position exceeds the depth-32 tree capacity".to_owned(),
         )
     })?;
-    Ok(Json(OrchardMerklePath { position, siblings }))
+    let anchor_root = be32_to_le_hex_0x(expected_root);
+    Ok(Json(MerklePathResponse {
+        cmx: format!("0x{}", hex::encode(cmx)),
+        position,
+        siblings,
+        root: anchor_root.clone(),
+        anchor_root,
+        frozen: false,
+    }))
 }
 
 // ─── Compliance frozen Indexed-MT (rt_frozen) ────────────────────────────────
@@ -4957,6 +5094,8 @@ enum NoteArchiveMutation {
         position: u64,
         update: FrozenUpdate,
     },
+    /// Segment-end frozen witnesses for one sealed RootUpdated segment.
+    FrozenPaths(Vec<FrozenPathRecord>),
 }
 
 /// How often the `batches` ring failed to answer a re-emission lookup, and where
@@ -5027,6 +5166,7 @@ enum JsonNoteArchiveUpdate {
     Confirm { cmx_hex: String, position: u64 },
     ShieldAmount { cmx_hex: String, amount: u64 },
     Frozen { position: u64, update: FrozenUpdate },
+    FrozenPath(FrozenPathRecord),
 }
 
 #[derive(Clone)]
@@ -5113,6 +5253,14 @@ impl StateBackend {
                                     update: update.clone(),
                                 },
                             )?;
+                        }
+                        NoteArchiveMutation::FrozenPaths(records) => {
+                            for record in records {
+                                Self::append_json_line(
+                                    &archive_path,
+                                    &JsonNoteArchiveUpdate::FrozenPath(record.clone()),
+                                )?;
+                            }
                         }
                     }
                 }
@@ -5740,6 +5888,60 @@ impl StateBackend {
         }
     }
 
+    /// Point lookup of one segment-end frozen path record. Serving reads never
+    /// mutate the store, so repeated GETs stay byte-identical (idempotency
+    /// contract of `/merkle_path` in docs/note-sync-indexer-frozen-merkle-path.md).
+    async fn load_frozen_path(
+        &self,
+        pool_address: &str,
+        cmx: [u8; 32],
+    ) -> Result<Option<FrozenPathRecord>> {
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let archive_path = Self::json_archive_path(path);
+                let Ok(raw) = std::fs::read_to_string(archive_path) else {
+                    return Ok(None);
+                };
+                let mut found = None;
+                for line in raw.lines() {
+                    if let Ok(JsonNoteArchiveUpdate::FrozenPath(record)) =
+                        serde_json::from_str::<JsonNoteArchiveUpdate>(line)
+                    {
+                        if record.cmx == cmx {
+                            found = Some(record);
+                        }
+                    }
+                }
+                Ok(found)
+            }
+            StateBackend::Json(None) => Ok(None),
+            StateBackend::Pgsql(pool) => {
+                let row: Option<(i64, String, String)> = sqlx::query_as(
+                    "SELECT position, siblings_json, anchor_root_hex FROM frozen_paths \
+                     WHERE pool_address=$1 AND cmx_hex=$2",
+                )
+                .bind(pool_address)
+                .bind(hex::encode(cmx))
+                .fetch_optional(pool)
+                .await
+                .context("load frozen Merkle path")?;
+                let Some((position, siblings_json, anchor_root_hex)) = row else {
+                    return Ok(None);
+                };
+                let siblings: Vec<String> = serde_json::from_str(&siblings_json)
+                    .context("decode archived frozen path siblings")?;
+                let anchor_root = parse_hex32(&anchor_root_hex)
+                    .ok_or_else(|| anyhow!("invalid archived frozen path anchor root"))?;
+                Ok(Some(FrozenPathRecord {
+                    cmx,
+                    position: u64::try_from(position).context("negative frozen path position")?,
+                    siblings,
+                    anchor_root,
+                }))
+            }
+        }
+    }
+
     async fn load_frozen_updates_after(
         &self,
         pool_address: &str,
@@ -5896,6 +6098,7 @@ fn decode_json_note_archive(raw: &str, pool_address: &str) -> Vec<BatchEnvelope>
                 }
             }
             JsonNoteArchiveUpdate::Frozen { .. } => {}
+            JsonNoteArchiveUpdate::FrozenPath(_) => {}
         }
     }
     let mut out: Vec<BatchEnvelope> = by_cmx.into_values().collect();
@@ -6042,6 +6245,7 @@ struct CompactedNoteMutations {
     merkle_nodes: Vec<MerkleNode>,
     shield_amounts: Vec<([u8; 32], u64)>,
     frozen_updates: Vec<(u64, FrozenUpdate)>,
+    frozen_paths: Vec<FrozenPathRecord>,
 }
 
 fn compact_note_mutations(mutations: &[NoteArchiveMutation]) -> CompactedNoteMutations {
@@ -6050,6 +6254,7 @@ fn compact_note_mutations(mutations: &[NoteArchiveMutation]) -> CompactedNoteMut
     let mut merkle_nodes: HashMap<MerkleNodeKey, MerkleNode> = HashMap::new();
     let mut shield_amounts: HashMap<[u8; 32], u64> = HashMap::new();
     let mut frozen_updates: HashMap<u64, FrozenUpdate> = HashMap::new();
+    let mut frozen_paths: HashMap<[u8; 32], FrozenPathRecord> = HashMap::new();
     for mutation in mutations {
         match mutation {
             NoteArchiveMutation::Upsert(env) => {
@@ -6079,6 +6284,11 @@ fn compact_note_mutations(mutations: &[NoteArchiveMutation]) -> CompactedNoteMut
             NoteArchiveMutation::Frozen { position, update } => {
                 frozen_updates.insert(*position, update.clone());
             }
+            NoteArchiveMutation::FrozenPaths(records) => {
+                for record in records {
+                    frozen_paths.insert(record.cmx, record.clone());
+                }
+            }
         }
     }
     let mut upserts: Vec<ArchivedNoteRow> = upserts.into_values().collect();
@@ -6091,12 +6301,15 @@ fn compact_note_mutations(mutations: &[NoteArchiveMutation]) -> CompactedNoteMut
     shield_amounts.sort_by_key(|(cmx, _)| *cmx);
     let mut frozen_updates: Vec<(u64, FrozenUpdate)> = frozen_updates.into_iter().collect();
     frozen_updates.sort_by_key(|(position, _)| *position);
+    let mut frozen_paths: Vec<FrozenPathRecord> = frozen_paths.into_values().collect();
+    frozen_paths.sort_by_key(|record| record.position);
     CompactedNoteMutations {
         upserts,
         confirmations,
         merkle_nodes,
         shield_amounts,
         frozen_updates,
+        frozen_paths,
     }
 }
 
@@ -6447,6 +6660,76 @@ async fn pg_apply_frozen_updates(
     Ok(())
 }
 
+/// Persist segment-end frozen path records. Writes are once-per-cmx: an exact
+/// replay of the same sealed segment is a no-op, while a *different* record for
+/// an already-frozen cmx (same commitment sealed under another anchor) is a
+/// serious ingestion bug and fails the whole transaction — the conflicting
+/// upsert matches zero rows because the `WHERE` guard requires byte equality.
+async fn pg_apply_frozen_paths(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pool_address: &str,
+    rebuild_generation: Option<&str>,
+    records: &[FrozenPathRecord],
+) -> Result<()> {
+    for record in records {
+        let siblings_json =
+            serde_json::to_string(&record.siblings).context("serialize frozen path siblings")?;
+        let position =
+            i64::try_from(record.position).context("frozen path position exceeds i64")?;
+        let affected = if let Some(generation) = rebuild_generation {
+            sqlx::query(
+                "INSERT INTO frozen_paths_rebuild \
+                   (pool_address, rebuild_generation, cmx_hex, position, siblings_json, anchor_root_hex) \
+                 VALUES ($1,$2,$3,$4,$5,$6) \
+                 ON CONFLICT (pool_address, rebuild_generation, cmx_hex) DO UPDATE SET \
+                   position=EXCLUDED.position, siblings_json=EXCLUDED.siblings_json, \
+                   anchor_root_hex=EXCLUDED.anchor_root_hex \
+                 WHERE frozen_paths_rebuild.position=EXCLUDED.position \
+                   AND frozen_paths_rebuild.siblings_json=EXCLUDED.siblings_json \
+                   AND frozen_paths_rebuild.anchor_root_hex=EXCLUDED.anchor_root_hex",
+            )
+            .bind(pool_address)
+            .bind(generation)
+            .bind(hex::encode(record.cmx))
+            .bind(position)
+            .bind(&siblings_json)
+            .bind(hex::encode(record.anchor_root))
+            .execute(&mut **tx)
+            .await
+            .context("append staged frozen Merkle path")?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "INSERT INTO frozen_paths \
+                   (pool_address, cmx_hex, position, siblings_json, anchor_root_hex) \
+                 VALUES ($1,$2,$3,$4,$5) \
+                 ON CONFLICT (pool_address, cmx_hex) DO UPDATE SET \
+                   position=EXCLUDED.position, siblings_json=EXCLUDED.siblings_json, \
+                   anchor_root_hex=EXCLUDED.anchor_root_hex \
+                 WHERE frozen_paths.position=EXCLUDED.position \
+                   AND frozen_paths.siblings_json=EXCLUDED.siblings_json \
+                   AND frozen_paths.anchor_root_hex=EXCLUDED.anchor_root_hex",
+            )
+            .bind(pool_address)
+            .bind(hex::encode(record.cmx))
+            .bind(position)
+            .bind(&siblings_json)
+            .bind(hex::encode(record.anchor_root))
+            .execute(&mut **tx)
+            .await
+            .context("append frozen Merkle path")?
+            .rows_affected()
+        };
+        if affected != 1 {
+            bail!(
+                "frozen path for cmx {} conflicts with an existing record under a different anchor",
+                hex::encode(record.cmx)
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn pg_apply_compacted_note_mutations_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     pool_address: &str,
@@ -6471,6 +6754,7 @@ async fn pg_apply_compacted_note_mutations_tx(
         &compacted.frozen_updates,
     )
     .await?;
+    pg_apply_frozen_paths(tx, pool_address, rebuild_generation, &compacted.frozen_paths).await?;
 
     if !compacted.confirmations.is_empty() {
         let cmx_values: Vec<String> = compacted
@@ -6613,6 +6897,11 @@ async fn pg_begin_canonical_rebuild(
         .execute(pool)
         .await
         .context("clear stale frozen-current rebuild generations")?;
+    sqlx::query("DELETE FROM frozen_paths_rebuild WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(pool)
+        .await
+        .context("clear stale frozen-path rebuild generations")?;
     Ok(())
 }
 
@@ -6783,6 +7072,24 @@ async fn pg_finish_canonical_rebuild(
             snap.frozen_count
         );
     }
+    // Every confirmed leaf belongs to exactly one sealed RootUpdated segment,
+    // and every seal freezes exactly its own leaves — so a full finalized
+    // replay must have staged one frozen path per confirmed leaf.
+    let staged_frozen_paths: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM frozen_paths_rebuild \
+         WHERE pool_address=$1 AND rebuild_generation=$2",
+    )
+    .bind(pool_address)
+    .bind(generation)
+    .fetch_one(&mut *tx)
+    .await
+    .context("count staged frozen Merkle paths")?;
+    if staged_frozen_paths as u64 != snap.confirmed_count {
+        bail!(
+            "canonical frozen-path activation mismatch: staged={staged_frozen_paths}, confirmed={}",
+            snap.confirmed_count
+        );
+    }
 
     sqlx::query("DELETE FROM notes WHERE pool_address=$1")
         .bind(pool_address)
@@ -6885,6 +7192,24 @@ async fn pg_finish_canonical_rebuild(
     .await
     .context("activate staged frozen current set")?;
 
+    sqlx::query("DELETE FROM frozen_paths WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear previous frozen Merkle paths")?;
+    sqlx::query(
+        "INSERT INTO frozen_paths \
+           (pool_address, cmx_hex, position, siblings_json, anchor_root_hex) \
+         SELECT pool_address, cmx_hex, position, siblings_json, anchor_root_hex \
+         FROM frozen_paths_rebuild \
+         WHERE pool_address=$1 AND rebuild_generation=$2",
+    )
+    .bind(pool_address)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await
+    .context("activate staged frozen Merkle paths")?;
+
     pg_save_snapshot_tx(
         &mut tx,
         pool_address,
@@ -6912,6 +7237,11 @@ async fn pg_finish_canonical_rebuild(
         .execute(&mut *tx)
         .await
         .context("clear activated frozen-current staging rows")?;
+    sqlx::query("DELETE FROM frozen_paths_rebuild WHERE pool_address=$1")
+        .bind(pool_address)
+        .execute(&mut *tx)
+        .await
+        .context("clear activated frozen-path staging rows")?;
     tx.commit()
         .await
         .context("commit canonical rebuild activation")
@@ -9311,11 +9641,23 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
                 return Err(error.context("validate NoteConfirmed against RootUpdated segment"));
             }
         };
+        let mut frozen_path_records: Option<Vec<FrozenPathRecord>> = None;
         if complete {
             let sealed = state
                 .pending_root_update
                 .take()
                 .expect("completed RootUpdated segment remains staged");
+            // Segment-end freeze (docs/note-sync-indexer-frozen-merkle-path.md §4.2):
+            // export every staged leaf's witness against the sealed root before
+            // the confirmed frontier advances past it. A failure means the staged
+            // segment is inconsistent — fail closed and write no paths.
+            match sealed.export_frozen_paths() {
+                Ok(records) => frozen_path_records = Some(records),
+                Err(error) => {
+                    state.tree_out_of_order = true;
+                    return Err(error.context("export frozen segment Merkle paths"));
+                }
+            }
             state.confirmed_frontier = sealed.frontier;
             state.active_root = Some(sealed.target_root);
             state.confirmed_count = sealed.to_count;
@@ -9407,6 +9749,10 @@ async fn process_single_log(ctx: &PollContext, log: EthLog) -> Result<()> {
             nodes,
         })
         .await?;
+        if let Some(records) = frozen_path_records {
+            ctx.archive_note_mutation(NoteArchiveMutation::FrozenPaths(records))
+                .await?;
+        }
         if canonical_ready && !ctx.broadcast_paused.load(AtomicOrdering::Acquire) {
             if let Some(envelope) = envelope {
                 ctx.batch_tx.send(envelope).ok();
@@ -10578,17 +10924,18 @@ mod tests {
         checkpoint_is_complete_finalized_boundary, classify_selector, compact_note_mutations,
         crank_gas_limit, crank_next_delay_secs, decode_frozen_root_updated_log,
         decode_json_note_archive, eip1967_beacon_slot, encode_crank_root_calldata,
-        factory_log_matches, finalized_cursor_covers_block, frontier_from_leaves,
-        frozen_count_after_delta, frozen_root_updated_topic0, getlogs_window_end,
-        is_getlogs_range_error, latest_upserted_note, nonempty_trimmed, normalize_hex_0x,
-        parse_address_set, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
-        persist_request_is_current, pg_append_cmx_leaves, pg_append_merkle_nodes,
-        pg_apply_note_mutations, pg_archive_seq_bound, pg_begin_canonical_rebuild,
-        pg_bulk_upsert_notes, pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
-        pg_upgrade_legacy_compact_checkpoint, push_incremental_replay_mutation, replay_frozen_set,
-        require_admin, require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint,
-        strip_0x, validate_log_against_canonical, witness_from_nodes, witness_root_be,
-        ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, EthLog,
+        export_segment_frozen_paths, factory_log_matches, finalized_cursor_covers_block,
+        frontier_from_leaves, frozen_count_after_delta, frozen_root_updated_topic0,
+        getlogs_window_end, is_getlogs_range_error, latest_upserted_note, nonempty_trimmed,
+        normalize_hex_0x, parse_address_set, parse_bytes32_strict, parse_tx_meta,
+        perc20_deployed_topic0, persist_request_is_current, pg_append_cmx_leaves,
+        pg_append_merkle_nodes, pg_apply_note_mutations, pg_archive_seq_bound,
+        pg_begin_canonical_rebuild, pg_bulk_upsert_notes, pg_commit_incremental_replay,
+        pg_finish_canonical_rebuild, pg_load, pg_upgrade_legacy_compact_checkpoint,
+        push_incremental_replay_mutation, replay_frozen_set, require_admin, require_relayer,
+        required_witness_nodes, rlp_bytes, rlp_list, rlp_uint, strip_0x,
+        validate_log_against_canonical, witness_from_nodes, witness_root_be, ArchivedNoteRow,
+        BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, EthLog, FrozenPathRecord,
         FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
         NoteArchiveMutation, PendingRootUpdate, RecentEventIds, RpcClient, StateBackend,
         StreamingFrontierBuilder, DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS,
@@ -10935,6 +11282,87 @@ mod tests {
         }
         assert_eq!(pending.frontier.next_index(), 8);
         assert_eq!(pending.frontier.root_be(), target_root);
+    }
+
+    /// Sealing a segment must yield one frozen path per leaf, every path
+    /// pinned to the event's `newRoot` — and later segments must not change a
+    /// single byte of the earlier exports (spec: freeze-at-seal, no tip chase).
+    #[test]
+    fn sealed_segments_export_frozen_paths_pinned_to_their_own_new_root() {
+        let leaves: Vec<_> = (1..=19).map(canonical_test_leaf).collect();
+        let tx_hash = format!("0x{}", "55".repeat(32));
+        let mut committed = CompactFrontier::new();
+        let mut exported: Vec<(Vec<FrozenPathRecord>, [u8; 32])> = Vec::new();
+
+        // Two full segments plus one tail segment (j = 8, 8, 3).
+        for (from, to) in [(0u64, 8u64), (8, 16), (16, 19)] {
+            let segment_leaves = &leaves[from as usize..to as usize];
+            let expected = append_test_leaves(committed.clone(), segment_leaves);
+            let target_root = expected.root_be();
+            let batch = (to - from) as u32;
+            let mut pending = PendingRootUpdate::begin(
+                &committed, from, 19, &tx_hash, target_root, from, to, batch,
+            )
+            .unwrap();
+            for (offset, cmx) in segment_leaves.iter().copied().enumerate() {
+                pending
+                    .append_confirmation(&tx_hash, cmx, target_root, from + offset as u64, 19)
+                    .unwrap();
+            }
+            let records = pending.export_frozen_paths().unwrap();
+            assert_eq!(records.len(), (to - from) as usize);
+            for (offset, record) in records.iter().enumerate() {
+                assert_eq!(record.position, from + offset as u64);
+                assert_eq!(record.cmx, segment_leaves[offset]);
+                assert_eq!(record.anchor_root, target_root);
+                assert_eq!(
+                    witness_root_be(record.cmx, record.position, &record.siblings).unwrap(),
+                    target_root
+                );
+            }
+            committed = pending.frontier;
+            exported.push((records, target_root));
+        }
+
+        // All three anchors differ, and every earlier export still opens to
+        // its own sealed root even though the tree has grown since.
+        assert_ne!(exported[0].1, exported[1].1);
+        assert_ne!(exported[1].1, exported[2].1);
+        for (records, sealed_root) in &exported {
+            for record in records {
+                assert_eq!(
+                    witness_root_be(record.cmx, record.position, &record.siblings).unwrap(),
+                    *sealed_root
+                );
+            }
+        }
+    }
+
+    /// Replaying the same sealed segment (WS + catch-up overlap) must compact
+    /// to one frozen record per cmx, exactly like Confirm mutations.
+    #[test]
+    fn frozen_path_mutations_compact_to_one_record_per_cmx() {
+        let record = |value: u64, position: u64| FrozenPathRecord {
+            cmx: canonical_test_leaf(value),
+            position,
+            siblings: vec!["0x00".to_owned(); 32],
+            anchor_root: canonical_test_leaf(1000 + position),
+        };
+        let first = vec![record(1, 0), record(2, 1)];
+        let compacted = compact_note_mutations(&[
+            NoteArchiveMutation::FrozenPaths(first.clone()),
+            NoteArchiveMutation::FrozenPaths(first),
+            NoteArchiveMutation::FrozenPaths(vec![record(3, 2)]),
+        ]);
+        assert_eq!(compacted.frozen_paths.len(), 3);
+        assert_eq!(
+            compacted
+                .frozen_paths
+                .iter()
+                .map(|r| r.position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]
@@ -11682,6 +12110,124 @@ mod tests {
         let _ = std::fs::remove_file(&archive_path);
     }
 
+    /// Frozen paths in the JSON development backend: persisted once, served
+    /// byte-identically on repeated reads, never mutated by serving.
+    #[tokio::test]
+    async fn json_frozen_paths_persist_and_serve_idempotently() {
+        let dir = std::env::temp_dir().join(format!("indexer-frozenpath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("state.json").to_str().unwrap().to_owned();
+        let archive_path = StateBackend::json_archive_path(&state_path);
+        let _ = std::fs::remove_file(&archive_path);
+        let backend = StateBackend::Json(Some(state_path));
+        let pool = format!("0x{}", "12".repeat(20));
+
+        let record = FrozenPathRecord {
+            cmx: canonical_test_leaf(7),
+            position: 6,
+            siblings: (0..32)
+                .map(|level| format!("0x{}", hex::encode([level as u8; 32])))
+                .collect(),
+            anchor_root: canonical_test_leaf(99),
+        };
+        backend
+            .apply_note_mutations(
+                &pool,
+                None,
+                &[NoteArchiveMutation::FrozenPaths(vec![record.clone()])],
+            )
+            .await
+            .unwrap();
+
+        let first = backend
+            .load_frozen_path(&pool, record.cmx)
+            .await
+            .unwrap()
+            .expect("frozen path persisted");
+        let second = backend
+            .load_frozen_path(&pool, record.cmx)
+            .await
+            .unwrap()
+            .expect("frozen path still persisted after a read");
+        assert_eq!(first.position, record.position);
+        assert_eq!(first.siblings, record.siblings);
+        assert_eq!(first.anchor_root, record.anchor_root);
+        assert_eq!(first.siblings, second.siblings);
+        assert_eq!(first.anchor_root, second.anchor_root);
+        assert!(backend
+            .load_frozen_path(&pool, canonical_test_leaf(8))
+            .await
+            .unwrap()
+            .is_none());
+
+        let _ = std::fs::remove_file(&archive_path);
+    }
+
+    /// PostgreSQL frozen paths: write-once per cmx. An exact replay is a no-op;
+    /// a divergent record for the same cmx (different anchor) fails closed.
+    #[tokio::test]
+    async fn pg_frozen_paths_freeze_once_and_reject_divergent_reseals() {
+        let Ok(database_url) = std::env::var("PRIVACY_INDEXER_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pg = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pg).await.unwrap();
+        let pool_address = format!("0x{}", "c9".repeat(20));
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
+        let backend = StateBackend::Pgsql(pg.clone());
+
+        let record = FrozenPathRecord {
+            cmx: canonical_test_leaf(21),
+            position: 20,
+            siblings: (0..32)
+                .map(|level| format!("0x{}", hex::encode([level as u8; 32])))
+                .collect(),
+            anchor_root: canonical_test_leaf(500),
+        };
+        let mutation = NoteArchiveMutation::FrozenPaths(vec![record.clone()]);
+        backend
+            .apply_note_mutations(&pool_address, None, std::slice::from_ref(&mutation))
+            .await
+            .unwrap();
+        // Exact replay (WS + catch-up overlap) is idempotent.
+        backend
+            .apply_note_mutations(&pool_address, None, std::slice::from_ref(&mutation))
+            .await
+            .unwrap();
+
+        let stored = backend
+            .load_frozen_path(&pool_address, record.cmx)
+            .await
+            .unwrap()
+            .expect("frozen path persisted");
+        assert_eq!(stored.position, record.position);
+        assert_eq!(stored.siblings, record.siblings);
+        assert_eq!(stored.anchor_root, record.anchor_root);
+
+        // Same cmx sealed under a different anchor = ingestion bug: fail closed
+        // and keep the original record byte-identical.
+        let mut divergent = record.clone();
+        divergent.anchor_root = canonical_test_leaf(501);
+        let error = backend
+            .apply_note_mutations(
+                &pool_address,
+                None,
+                &[NoteArchiveMutation::FrozenPaths(vec![divergent])],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicts with an existing"));
+        let unchanged = backend
+            .load_frozen_path(&pool_address, record.cmx)
+            .await
+            .unwrap()
+            .expect("original record survives the rejected reseal");
+        assert_eq!(unchanged.anchor_root, record.anchor_root);
+        assert_eq!(unchanged.siblings, record.siblings);
+
+        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
+    }
+
     /// The PostgreSQL `/tx` predicate must match `notes_tx_hash_idx` (migration
     /// 0007). `enable_seqscan=off` asserts the index is *usable* by the query —
     /// asserting the planner *chose* it would fail spuriously on a small table,
@@ -11787,9 +12333,11 @@ mod tests {
         for statement in [
             "DELETE FROM frozen_current_rebuild WHERE pool_address=$1",
             "DELETE FROM frozen_updates_rebuild WHERE pool_address=$1",
+            "DELETE FROM frozen_paths_rebuild WHERE pool_address=$1",
             "DELETE FROM merkle_nodes_rebuild WHERE pool_address=$1",
             "DELETE FROM notes_rebuild WHERE pool_address=$1",
             "DELETE FROM frozen_current WHERE pool_address=$1",
+            "DELETE FROM frozen_paths WHERE pool_address=$1",
             "DELETE FROM merkle_nodes WHERE pool_address=$1",
             "DELETE FROM notes WHERE pool_address=$1",
             "DELETE FROM cmx_leaves WHERE pool_address=$1",
@@ -12103,8 +12651,30 @@ mod tests {
         let mut rebuilt = sample_note_envelope_for_cmx(cmx, 1);
         rebuilt.batch.abi_notes[0].cmx_position = Some(0);
         rebuilt.batch.abi_notes[0].is_confirmed = true;
+        let begin_filled = CompactFrontier::new().filled_be();
         let mut frontier = CompactFrontier::new();
         let nodes = frontier.append_be(cmx).unwrap();
+        let segment_nodes: std::collections::HashMap<_, _> = nodes
+            .iter()
+            .map(|node| (node.key, node.hash_be))
+            .collect();
+        let frozen_records: Vec<FrozenPathRecord> = export_segment_frozen_paths(
+            &begin_filled,
+            0,
+            1,
+            &[cmx],
+            &segment_nodes,
+            frontier.root_be(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|path| FrozenPathRecord {
+            cmx: path.cmx_be,
+            position: path.position,
+            siblings: path.siblings,
+            anchor_root: frontier.root_be(),
+        })
+        .collect();
         pg_apply_note_mutations(
             &pool,
             &pool_address,
@@ -12117,6 +12687,7 @@ mod tests {
                     nodes,
                 },
                 NoteArchiveMutation::ShieldAmount { cmx, amount: 77 },
+                NoteArchiveMutation::FrozenPaths(frozen_records),
             ],
         )
         .await
@@ -12149,6 +12720,21 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows, vec![(hex::encode(cmx), Some(0), true, Some(77))]);
+        let activated_frozen_paths: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT cmx_hex, position, anchor_root_hex FROM frozen_paths WHERE pool_address=$1",
+        )
+        .bind(&pool_address)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            activated_frozen_paths,
+            vec![(
+                hex::encode(cmx),
+                0,
+                hex::encode(snap.confirmed_frontier.root_be())
+            )]
+        );
         let staged: i64 =
             sqlx::query_scalar("SELECT count(*) FROM notes_rebuild WHERE pool_address=$1")
                 .bind(&pool_address)
