@@ -3483,6 +3483,16 @@ fn classify_selector(input: &[u8]) -> Option<&'static str> {
         [0xb7, 0x45, 0x34, 0xe9] => Some("burn"),
         [0xb2, 0xd4, 0x79, 0x7b] => Some("transfer"),
         [0x5e, 0x09, 0xe2, 0xb1] => Some("transfer"),
+        // Protocol-fee release. `ERC20Shield.unshield` grew `(bytes32 context,
+        // address executor)` between `recipient` and `call`, which changed its
+        // selector; `Perc20FeeGateway.transferWithFee` is new. Pools created
+        // before the fee release keep the 3-argument form above, so BOTH must
+        // stay classified — this is history for existing and new pools alike.
+        [0x73, 0xa9, 0x3e, 0x1b] => Some("unshield"), // unshield(uint256,address,bytes32,address,(bytes,uint256[8]))
+        // The target is the GATEWAY, not a pool, and arg0 is the pool address
+        // rather than a uint amount — classifying it as "transfer" is what keeps
+        // it out of the arg0-is-an-amount decoding in `parse_tx_meta`.
+        [0x4c, 0x4b, 0xa9, 0x3b] => Some("transfer"), // transferWithFee(address,(bytes,uint256[8]),(bytes,uint256[8]))
         [0xd4, 0x1e, 0x4a, 0x7a] => Some("swap"),
         [0x74, 0xda, 0x02, 0xc8] => Some("swap"),
         [0xe3, 0xb3, 0xfa, 0xe4] => Some("swap"),
@@ -3535,9 +3545,14 @@ fn parse_tx_meta(input: &[u8]) -> TxMeta {
         _ => None,
     };
     // Recipient is public ONLY for unshield. Burn has no recipient, so match the
-    // exact v3 or historical v2 selector here.
+    // exact selector here rather than the `op` label.
+    //
+    // The protocol-fee `unshield` appended its two new arguments AFTER `recipient`,
+    // so arg1 keeps calldata[36..68] and the same slice works for all three forms.
     let recipient = if input.len() >= 68
-        && (input[0..4] == [0x19, 0x52, 0xce, 0x65] || input[0..4] == [0x53, 0x64, 0x4c, 0x61])
+        && (input[0..4] == [0x19, 0x52, 0xce, 0x65]     // v3 unshield
+            || input[0..4] == [0x73, 0xa9, 0x3e, 0x1b]  // v3 unshield, protocol-fee release
+            || input[0..4] == [0x53, 0x64, 0x4c, 0x61]) // historical v2
     {
         Some(format!("0x{}", hex::encode(&input[48..68])))
     } else {
@@ -11197,6 +11212,63 @@ mod tests {
             parse_tx_meta(&unshield).recipient,
             Some(format!("0x{}", "42".repeat(20)))
         );
+    }
+
+    /// The protocol-fee release changed `ERC20Shield.unshield`'s signature (it gained
+    /// `(bytes32 context, address executor)`) and added `Perc20FeeGateway.transferWithFee`.
+    /// Both selectors are new; leaving them unclassified would silently drop the op,
+    /// amount and recipient from the history view of every fee-release pool while the
+    /// stack otherwise looked healthy.
+    #[test]
+    fn protocol_fee_release_selectors_are_classified() {
+        // unshield(uint256,address,bytes32,address,(bytes,uint256[8]))
+        assert_eq!(
+            classify_selector(&hex::decode("73a93e1b").unwrap()),
+            Some("unshield")
+        );
+        // transferWithFee(address,(bytes,uint256[8]),(bytes,uint256[8]))
+        assert_eq!(
+            classify_selector(&hex::decode("4c4ba93b").unwrap()),
+            Some("transfer")
+        );
+        // ...and the pre-fee form must keep working: existing pools are unchanged.
+        assert_eq!(
+            classify_selector(&hex::decode("1952ce65").unwrap()),
+            Some("unshield")
+        );
+    }
+
+    /// The two new arguments were appended AFTER `recipient`, so arg0/arg1 keep their
+    /// calldata offsets and the existing decoding stays correct.
+    #[test]
+    fn protocol_fee_unshield_still_exposes_amount_and_recipient() {
+        let mut unshield = vec![0u8; 68];
+        unshield[..4].copy_from_slice(&hex::decode("73a93e1b").unwrap());
+        unshield[35] = 0x07; // arg0: amount = 7
+        unshield[48..68].fill(0x42); // arg1: recipient
+        let meta = parse_tx_meta(&unshield);
+        assert_eq!(meta.op, Some("unshield"));
+        assert_eq!(
+            meta.recipient,
+            Some(format!("0x{}", "42".repeat(20)))
+        );
+        assert_eq!(
+            meta.amount_hex,
+            Some(format!("0x{}07", "00".repeat(31)))
+        );
+    }
+
+    /// `transferWithFee`'s arg0 is the POOL ADDRESS, not a uint amount. Decoding it as
+    /// one would publish a nonsensical "amount" on every sponsored transfer.
+    #[test]
+    fn gateway_transfer_publishes_no_amount_or_recipient() {
+        let mut gateway = vec![0u8; 68];
+        gateway[..4].copy_from_slice(&hex::decode("4c4ba93b").unwrap());
+        gateway[16..36].fill(0x11); // arg0: pool address
+        let meta = parse_tx_meta(&gateway);
+        assert_eq!(meta.op, Some("transfer"));
+        assert_eq!(meta.amount_hex, None);
+        assert_eq!(meta.recipient, None);
     }
 
     #[test]
