@@ -6061,11 +6061,21 @@ impl StateBackend {
                     .map(|key| i64::try_from(key.index).context("Merkle node index exceeds i64"))
                     .collect::<Result<_>>()?;
                 let rows: Vec<(i16, i64, String)> = sqlx::query_as(
+                    // Keep the requested key set on the outer side and force one
+                    // composite-PK probe per key. A plain JOIN lets PostgreSQL
+                    // choose merkle_nodes as the outer relation; at production
+                    // scale that degenerates into a multi-million-row scan for
+                    // every freeze page despite the exact primary key.
                     "SELECT node.level, node.node_index, node.hash_hex \
-                     FROM merkle_nodes AS node \
-                     JOIN UNNEST($2::smallint[], $3::bigint[]) AS wanted(level, node_index) \
-                       ON node.level=wanted.level AND node.node_index=wanted.node_index \
-                     WHERE node.pool_address=$1",
+                     FROM UNNEST($2::smallint[], $3::bigint[]) AS wanted(level, node_index) \
+                     CROSS JOIN LATERAL ( \
+                       SELECT stored.level, stored.node_index, stored.hash_hex \
+                       FROM merkle_nodes AS stored \
+                       WHERE stored.pool_address=$1 \
+                         AND stored.level=wanted.level \
+                         AND stored.node_index=wanted.node_index \
+                       LIMIT 1 \
+                     ) AS node",
                 )
                 .bind(pool_address)
                 .bind(&levels)
