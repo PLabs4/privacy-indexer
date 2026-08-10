@@ -736,6 +736,8 @@ impl SignerConfig {
 #[derive(Clone)]
 struct AppContext {
     state: Arc<RwLock<SharedState>>,
+    /// False while the opt-in legacy frozen-path bootstrap is still running.
+    frozen_paths_ready: Arc<AtomicBool>,
     contract_address: String,
     persist: Persist,
     /// Shared ordering lock used by chain replay and persistence-relevant HTTP writes.
@@ -899,6 +901,7 @@ impl PoolBuilder {
 
         let ingest_lock = Arc::new(tokio::sync::Mutex::new(()));
         let ring_recovery = Arc::new(RingRecoveryMetrics::default());
+        let frozen_paths_ready = Arc::new(AtomicBool::new(!self.freeze_tip_paths));
         let poll_ctx = PollContext {
             rpc: self.rpc.clone(),
             wss_url: self.wss_url.clone(),
@@ -918,6 +921,7 @@ impl PoolBuilder {
             broadcast_paused: Arc::new(AtomicBool::new(false)),
             shadow_mode: self.shadow_mode,
             freeze_tip_paths: self.freeze_tip_paths,
+            frozen_paths_ready: Arc::clone(&frozen_paths_ready),
             ring_recovery: Arc::clone(&ring_recovery),
         };
         let addr_label = contract_address.to_string();
@@ -929,6 +933,7 @@ impl PoolBuilder {
 
         AppContext {
             state: shared,
+            frozen_paths_ready,
             contract_address: contract_address.to_string(),
             persist,
             ingest_lock,
@@ -1681,6 +1686,8 @@ struct MerklePathQuery {
 struct StatusResponse {
     next_block: u64,
     canonical: bool,
+    /// True only after the optional legacy frozen-path bootstrap has completed.
+    frozen_paths_ready: bool,
     /// `pending`, `checkpoint`, `full_replay`, or a fail-closed rejection state.
     startup_source: String,
     shadow_mode: bool,
@@ -2824,6 +2831,17 @@ async fn require_canonical_context(ctx: &AppContext) -> Result<(), (StatusCode, 
     canonical_guard(ctx.state.read().await.tree_out_of_order)
 }
 
+async fn require_serving_context(ctx: &AppContext) -> Result<(), (StatusCode, String)> {
+    require_canonical_context(ctx).await?;
+    if !ctx.frozen_paths_ready.load(AtomicOrdering::Acquire) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "indexer frozen-path initialization is not ready".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 async fn acquire_history_read(
     reg: &PoolRegistry,
 ) -> Result<tokio::sync::SemaphorePermit<'_>, (StatusCode, String)> {
@@ -2846,7 +2864,7 @@ async fn canonical_api_gate(
     }
     let contexts: Vec<AppContext> = reg.pools.read().await.values().cloned().collect();
     for ctx in contexts {
-        if let Err(error) = require_canonical_context(&ctx).await {
+        if let Err(error) = require_serving_context(&ctx).await {
             return error.into_response();
         }
     }
@@ -2862,13 +2880,10 @@ async fn healthz(State(reg): State<PoolRegistry>) -> Result<&'static str, (Statu
         ));
     }
     for ctx in contexts {
-        require_canonical_context(&ctx).await.map_err(|_| {
+        require_serving_context(&ctx).await.map_err(|error| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "pool {} canonical finalized replay is not ready",
-                    ctx.contract_address
-                ),
+                format!("pool {} is not ready: {}", ctx.contract_address, error.1),
             )
         })?;
     }
@@ -3117,6 +3132,7 @@ async fn status(
     Ok(Json(StatusResponse {
         next_block: s.next_block,
         canonical: !s.tree_out_of_order,
+        frozen_paths_ready: ctx.frozen_paths_ready.load(AtomicOrdering::Acquire),
         startup_source: s.startup_source.clone(),
         shadow_mode: ctx.shadow_mode,
         last_finalized_block: s.last_finalized_block,
@@ -4257,10 +4273,7 @@ struct MerklePathResponse {
     siblings: Vec<String>,
     anchor_root: String,
     root: String,
-    /// True when served from the long-lived segment-end frozen store. False
-    /// only for legacy records ingested before frozen persistence existed,
-    /// which fall back to a tip-relative witness (the returned anchor is the
-    /// confirmed root at response time — still a valid anchor forever).
+    /// Always true: `/merkle_path` serves only durable frozen records.
     frozen: bool,
 }
 
@@ -4283,10 +4296,10 @@ async fn get_merkle_path(
     // NoteConfirmed state update and its immutable-node transaction. The lock is
     // held only across bounded point/node reads, never a historical scan.
     let _ingest = ctx.ingest_lock.lock().await;
-    let (confirmed_count, expected_root) = {
+    let confirmed_count = {
         let state = ctx.state.read().await;
         canonical_guard(state.tree_out_of_order)?;
-        (state.confirmed_count, state.confirmed_frontier.root_be())
+        state.confirmed_count
     };
 
     // Authoritative source: the segment-end frozen record, written exactly once
@@ -4334,10 +4347,9 @@ async fn get_merkle_path(
         }));
     }
 
-    // Legacy fallback (pre-frozen archives only): recompute a witness over the
-    // confirmed prefix from the immutable node archive. New segments always
-    // freeze at seal time, and a canonical rebuild backfills history, so this
-    // path shrinks to zero over time.
+    // No compatibility fallback: a confirmed cmx without a durable frozen row
+    // means initialization or canonical persistence is incomplete. Never hide
+    // that condition by manufacturing a tip-relative path at request time.
     let position = ctx
         .backend
         .load_cmx_position(&ctx.contract_address, cmx)
@@ -4350,9 +4362,8 @@ async fn get_merkle_path(
         })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "cmx not found in tree".to_owned()))?;
 
-    // Batch-update model: witnesses must open to the CONFIRMED root (`/root`), so they
-    // are computed over the confirmed prefix only. A pending note (position >= watermark)
-    // has no anchor that includes it yet — it becomes spendable after the next updateRoot.
+    // A pending note has no sealed path yet. It becomes available after the
+    // segment seals and its frozen row is persisted.
     if position >= confirmed_count {
         return Err((
             StatusCode::CONFLICT,
@@ -4363,55 +4374,11 @@ async fn get_merkle_path(
         ));
     }
 
-    let keys = required_witness_nodes(position, confirmed_count).map_err(|error| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("cannot plan Merkle witness: {error:#}"),
-        )
-    })?;
-    let nodes = ctx
-        .backend
-        .load_merkle_nodes(&ctx.contract_address, &keys)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Merkle node archive unavailable: {error:#}"),
-            )
-        })?;
-    let siblings = witness_from_nodes(position, confirmed_count, &nodes).map_err(|error| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Merkle witness archive is incomplete: {error:#}"),
-        )
-    })?;
-    let actual_root = witness_root_be(cmx, position, &siblings).map_err(|error| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Merkle witness validation failed: {error:#}"),
-        )
-    })?;
-    if actual_root != expected_root {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Merkle witness does not open to the canonical confirmed root".to_owned(),
-        ));
-    }
-    let position = u32::try_from(position).map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Merkle position exceeds the depth-32 tree capacity".to_owned(),
-        )
-    })?;
-    let anchor_root = be32_to_le_hex_0x(expected_root);
-    Ok(Json(MerklePathResponse {
-        cmx: format!("0x{}", hex::encode(cmx)),
-        position,
-        siblings,
-        root: anchor_root.clone(),
-        anchor_root,
-        frozen: false,
-    }))
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "confirmed cmx has no persisted frozen Merkle path; indexer archive is incomplete"
+            .to_owned(),
+    ))
 }
 
 // ─── Compliance frozen Indexed-MT (rt_frozen) ────────────────────────────────
@@ -5802,8 +5769,8 @@ impl StateBackend {
         }
     }
 
-    /// Point lookup used by the compatibility `/merkle_path` endpoint. No
-    /// historical position map is retained in RAM.
+    /// Point lookup used to distinguish unknown, pending and confirmed cmxs
+    /// when a durable frozen-path lookup misses.
     async fn load_cmx_position(&self, pool_address: &str, cmx: [u8; 32]) -> Result<Option<u64>> {
         match self {
             StateBackend::Json(Some(path)) => Ok(Self::read_json_archive(path, pool_address)
@@ -8226,6 +8193,8 @@ struct PollContext {
     shadow_mode: bool,
     /// Opt-in tip-snapshot bootstrap for missing `frozen_paths` rows.
     freeze_tip_paths: bool,
+    /// Shared serving-readiness gate for the one-shot bootstrap.
+    frozen_paths_ready: Arc<AtomicBool>,
     /// Ring-miss / recovery-source counters, shared with this pool's HTTP context.
     ring_recovery: Arc<RingRecoveryMetrics>,
 }
@@ -9480,6 +9449,7 @@ async fn run_event_loop(ctx: PollContext) -> Result<()> {
         loop {
             match freeze_confirmed_paths_at_tip(&ctx).await {
                 Ok(report) => {
+                    ctx.frozen_paths_ready.store(true, AtomicOrdering::Release);
                     println!(
                         "[indexer][{label}] tip-path freeze report: confirmed={} already={} written={} skipped={}",
                         report.confirmed_count,
