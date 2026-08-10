@@ -11632,15 +11632,16 @@ mod tests {
         finalized_cursor_covers_block, freeze_confirmed_prefix, frontier_from_leaves,
         frozen_count_after_delta, frozen_root_updated_topic0, getlogs_window_end,
         is_getlogs_range_error, latest_upserted_note, nonempty_trimmed, normalize_hex_0x,
-        parse_address_set, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
-        persist_request_is_current, pg_append_cmx_leaves, pg_append_merkle_nodes,
-        pg_apply_note_mutations, pg_archive_seq_bound, pg_begin_canonical_rebuild,
-        pg_bulk_upsert_notes, pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
-        pg_upgrade_legacy_compact_checkpoint, push_incremental_replay_mutation, replay_frozen_set,
-        require_admin, require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint,
-        strip_0x, validate_log_against_canonical, witness_from_nodes, witness_root_be,
-        ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, EthLog,
-        FrozenPathRecord, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
+        parse_address_set, parse_bool_flag, parse_bytes32_strict, parse_tx_meta,
+        perc20_deployed_topic0, persist_request_is_current, pg_append_cmx_leaves,
+        pg_append_merkle_nodes, pg_apply_note_mutations, pg_archive_seq_bound,
+        pg_begin_canonical_rebuild, pg_bulk_upsert_notes, pg_commit_incremental_replay,
+        pg_finish_canonical_rebuild, pg_load, pg_upgrade_legacy_compact_checkpoint,
+        push_incremental_replay_mutation, replay_frozen_set, require_admin, require_relayer,
+        required_witness_nodes, rlp_bytes, rlp_list, rlp_uint, strip_0x,
+        validate_log_against_canonical, witness_from_nodes, witness_root_be, ArchivedNoteRow,
+        BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, EthLog, FrozenPathRecord,
+        FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
         NoteArchiveMutation, PendingRootUpdate, RecentEventIds, RpcClient, StateBackend,
         StreamingFrontierBuilder, TipFreezeConfig, DEFAULT_MAX_BATCHES_IN_MEMORY,
         MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS, MAX_TIP_FREEZE_PAGE_SIZE,
@@ -13088,14 +13089,52 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4);
+        let reuse_seed = std::env::var("PRIVACY_INDEXER_BENCHMARK_REUSE_SEED")
+            .ok()
+            .map(|value| parse_bool_flag(&value).expect("valid benchmark reuse flag"))
+            .unwrap_or(false);
         assert!(leaf_count > 0 && leaf_count <= 2_000_000);
         assert!((1..=MAX_TIP_FREEZE_PAGE_SIZE).contains(&page_size));
         assert!((1..=MAX_TIP_FREEZE_WORKERS).contains(&workers));
 
         let pool_address = format!("0x{}", "b7".repeat(20));
-        clear_pg_rebuild_test_pool(&pg, &pool_address).await;
         let seed_started = Instant::now();
-        let frontier = seed_pg_confirmed_prefix(&pg, &pool_address, leaf_count).await;
+        let tip_root = if reuse_seed {
+            let counts: (i64, i64, i64) = sqlx::query_as(
+                "SELECT \
+                   (SELECT count(*) FROM cmx_leaves WHERE pool_address=$1), \
+                   (SELECT count(*) FROM merkle_nodes WHERE pool_address=$1), \
+                   (SELECT count(*) FROM frozen_paths WHERE pool_address=$1)",
+            )
+            .bind(&pool_address)
+            .fetch_one(&pg)
+            .await
+            .unwrap();
+            assert_eq!(counts.0, leaf_count as i64, "reused leaf count mismatch");
+            assert!(
+                counts.1 >= leaf_count as i64,
+                "reused node archive is incomplete"
+            );
+            assert_eq!(
+                counts.2, 0,
+                "reused benchmark already contains frozen paths"
+            );
+            let backend = StateBackend::Pgsql(pg.clone());
+            let keys = required_witness_nodes(0, leaf_count).unwrap();
+            let nodes = backend
+                .load_merkle_nodes(&pool_address, &keys)
+                .await
+                .expect("load reused benchmark witness nodes");
+            let siblings = witness_from_nodes(0, leaf_count, &nodes)
+                .expect("rebuild reused benchmark witness");
+            witness_root_be(canonical_test_leaf(1), 0, &siblings)
+                .expect("rebuild reused benchmark tip root")
+        } else {
+            clear_pg_rebuild_test_pool(&pg, &pool_address).await;
+            seed_pg_confirmed_prefix(&pg, &pool_address, leaf_count)
+                .await
+                .root_be()
+        };
         let seed_elapsed = seed_started.elapsed();
         let bytes_before: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())")
             .fetch_one(&pg)
@@ -13109,7 +13148,7 @@ mod tests {
             None,
             &pool_address,
             leaf_count,
-            frontier.root_be(),
+            tip_root,
             TipFreezeConfig { page_size, workers },
         )
         .await
@@ -13131,10 +13170,10 @@ mod tests {
                 .unwrap()
                 .expect("benchmark frozen path");
             assert_eq!(frozen.position, position);
-            assert_eq!(frozen.anchor_root, frontier.root_be());
+            assert_eq!(frozen.anchor_root, tip_root);
             assert_eq!(
                 witness_root_be(frozen.cmx, frozen.position, &frozen.siblings).unwrap(),
-                frontier.root_be()
+                tip_root
             );
         }
         let rerun_started = Instant::now();
@@ -13143,7 +13182,7 @@ mod tests {
             None,
             &pool_address,
             leaf_count,
-            frontier.root_be(),
+            tip_root,
             TipFreezeConfig { page_size, workers },
         )
         .await
@@ -13161,6 +13200,7 @@ mod tests {
                 "leaves": leaf_count,
                 "page_size": page_size,
                 "workers": workers,
+                "reused_seed": reuse_seed,
                 "seed_elapsed_ms": seed_elapsed.as_millis(),
                 "freeze_elapsed_ms": freeze_elapsed.as_millis(),
                 "idempotent_rerun_elapsed_ms": rerun_elapsed.as_millis(),
