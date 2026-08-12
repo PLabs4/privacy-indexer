@@ -3844,10 +3844,11 @@ struct TxsListResponse {
 /// explorer's default "show everything" view (search is only quick-locate). Groups
 /// notes by tx hash and orders by `block_number` descending (the global chronological
 /// order across pools — per-pool `seq` is NOT comparable between pools). The newest
-/// page reads the in-memory ring (cheap, hot poll path); older pages (cursor set)
-/// read FULL history (ring + persisted archive) so deep pagination doesn't dead-end
-/// at the ring's edge. The cursor never splits a block across pages, so callers can't
-/// skip or double-count boundary txs.
+/// page prefers the in-memory ring (cheap, hot poll path); if that ring is empty
+/// (Postgres warm-start does not refill it), the same request falls back to the
+/// persisted archive so explorers are not blank until the next live ingest. Older
+/// pages (cursor set) always read the archive. The cursor never splits a block
+/// across pages, so callers can't skip or double-count boundary txs.
 async fn get_txs(
     State(reg): State<PoolRegistry>,
     Query(q): Query<TxsListQuery>,
@@ -3862,11 +3863,24 @@ async fn get_txs(
 
     // Aggregate notes into per-tx buckets. A tx can appear across pools (a swap
     // settle emits a note in each leg's pool), so key by hash and merge.
-    // Newest page (no cursor) reads only the in-memory ring — cheap, and it's the
-    // hot path the live poll hits every few seconds. Any older page (cursor set)
-    // reads a bounded PostgreSQL block page, so deep pagination reaches beyond
-    // the ring without materializing the full archive.
-    let full_history = q.before_block.is_some();
+    // Newest page (no cursor) reads the in-memory ring when it has data. Any older
+    // page (cursor set) — or a newest page whose rings are all empty — reads a
+    // bounded PostgreSQL/JSONL block page so history survives warm-start and deep
+    // pagination reaches beyond the ring without materializing the full archive.
+    let mut full_history = q.before_block.is_some();
+    if !full_history {
+        let mut ring_empty = true;
+        for ctx in &contexts {
+            let s = ctx.state.read().await;
+            if !s.batches.is_empty() {
+                ring_empty = false;
+                break;
+            }
+        }
+        if ring_empty {
+            full_history = true;
+        }
+    }
     let mut by_tx: HashMap<String, TxSummary> = HashMap::new();
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
     // On the newest (ring-only) page, track the safe cutoff for excluding blocks
