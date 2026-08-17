@@ -2682,6 +2682,13 @@ fn bump_eip1559_fee(value: u128) -> u128 {
     value.saturating_add((value / 8).max(1))
 }
 
+fn broadcasted_crank_attempts(journal: &CrankTxJournal) -> impl Iterator<Item = &CrankTxAttempt> {
+    journal
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.broadcast_at.is_some())
+}
+
 fn validate_crank_journal_signed_payloads(
     journal: &CrankTxJournal,
     signing_key: &SigningKey,
@@ -2861,6 +2868,44 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
     }
 
     loop {
+        // A journal can be created successfully and then fail before the first broadcast
+        // (for example, a transient/malformed RPC response). Startup recovery alone is not
+        // enough for that case because the task is already running: every later pool would
+        // merely refuse to overwrite the unresolved signer lane forever. Resolve the durable
+        // lane before doing any new proof work on every tick.
+        if cfg.tx_type == CrankTxType::Eip1559 {
+            if let Some(path) = cfg.tx_journal.as_deref() {
+                match CrankTxJournal::load(path, cfg.signer.chain_id, &signer_hex) {
+                    Ok(Some(journal)) => {
+                        eprintln!(
+                            "[crank] recovering durable transaction nonce={} pool={} attempts={}",
+                            journal.nonce,
+                            journal.pool,
+                            journal.attempts.len()
+                        );
+                        match drive_crank_journal(&rpc, &cfg, &mut tx_budget, journal).await {
+                            Ok(ok) => println!(
+                                "[crank] recovered transaction reached terminal status={}",
+                                if ok { "confirmed" } else { "reverted" }
+                            ),
+                            Err(error) => {
+                                eprintln!("[crank] durable transaction recovery paused: {error:#}");
+                                tokio::time::sleep(Duration::from_secs(cfg.interval_secs.max(1)))
+                                    .await;
+                                continue;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("[crank] durable transaction journal rejected: {error:#}");
+                        tokio::time::sleep(Duration::from_secs(cfg.interval_secs.max(1))).await;
+                        continue;
+                    }
+                }
+            }
+        }
+
         let mut made_progress = false;
         let pools: Vec<AppContext> = { reg.pools.read().await.values().cloned().collect() };
         for ctx in pools {
@@ -3306,7 +3351,10 @@ async fn drive_crank_journal(
         ));
     }
     validate_crank_journal_signed_payloads(&journal, &cfg.signer.signing_key)?;
-    for attempt in &journal.attempts {
+    // A prepared-but-not-yet-broadcast attempt cannot have a receipt. Querying it here is
+    // both wasted work and a liveness hazard: an RPC error would abort before the first
+    // `eth_sendRawTransaction`, leaving a durable journal that never got on-chain.
+    for attempt in broadcasted_crank_attempts(&journal) {
         if let Some(ok) = rpc.get_transaction_receipt_status(&attempt.tx_hash).await? {
             CrankTxJournal::clear(path)?;
             return Ok(ok);
@@ -12411,29 +12459,30 @@ mod tests {
     use k256::ecdsa::SigningKey;
 
     use super::{
-        advance_cursor, batch_page_end, beacon_words_match, build_and_sign_eip1559_tx,
-        build_tip_frozen_paths, canonical_guard, checkpoint_is_complete_finalized_boundary,
-        classify_selector, compact_note_mutations, crank_gas_limit, crank_next_delay_secs,
-        decode_frozen_root_updated_log, decode_json_note_archive, effective_pool_start_block,
-        eip1559_crank_fees, eip1967_beacon_slot, encode_crank_root_calldata,
-        export_segment_frozen_paths, factory_log_matches, finalized_cursor_covers_block,
-        freeze_confirmed_prefix, frontier_from_leaves, frozen_count_after_delta,
-        frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
-        latest_upserted_note, nonempty_trimmed, normalize_hex_0x, parse_address_set,
-        parse_bool_flag, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
-        persist_request_is_current, pg_append_cmx_leaves, pg_append_merkle_nodes,
-        pg_apply_note_mutations, pg_archive_seq_bound, pg_begin_canonical_rebuild,
-        pg_bulk_upsert_notes, pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
-        pg_upgrade_legacy_compact_checkpoint, push_incremental_replay_mutation, raw_tx_hash,
-        replay_frozen_set, require_admin, require_relayer, required_witness_nodes, rlp_bytes,
-        rlp_list, rlp_uint, strip_0x, unix_seconds, validate_crank_journal_parent,
-        validate_crank_journal_signed_payloads, validate_log_against_canonical, witness_from_nodes,
-        witness_root_be, ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier,
-        CrankTxAttempt, CrankTxJournal, EthLog, FrozenPathRecord, FrozenUpdate, HourlyTxBudget,
-        IndexerCheckpoint, JsonNoteArchiveUpdate, NoteArchiveMutation, PendingRootUpdate,
-        RecentEventIds, RpcClient, StateBackend, StreamingFrontierBuilder, TipFreezeConfig,
-        DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS,
-        MAX_TIP_FREEZE_PAGE_SIZE, MAX_TIP_FREEZE_WORKERS,
+        advance_cursor, batch_page_end, beacon_words_match, broadcasted_crank_attempts,
+        build_and_sign_eip1559_tx, build_tip_frozen_paths, canonical_guard,
+        checkpoint_is_complete_finalized_boundary, classify_selector, compact_note_mutations,
+        crank_gas_limit, crank_next_delay_secs, decode_frozen_root_updated_log,
+        decode_json_note_archive, effective_pool_start_block, eip1559_crank_fees,
+        eip1967_beacon_slot, encode_crank_root_calldata, export_segment_frozen_paths,
+        factory_log_matches, finalized_cursor_covers_block, freeze_confirmed_prefix,
+        frontier_from_leaves, frozen_count_after_delta, frozen_root_updated_topic0,
+        getlogs_window_end, is_getlogs_range_error, latest_upserted_note, nonempty_trimmed,
+        normalize_hex_0x, parse_address_set, parse_bool_flag, parse_bytes32_strict, parse_tx_meta,
+        perc20_deployed_topic0, persist_request_is_current, pg_append_cmx_leaves,
+        pg_append_merkle_nodes, pg_apply_note_mutations, pg_archive_seq_bound,
+        pg_begin_canonical_rebuild, pg_bulk_upsert_notes, pg_commit_incremental_replay,
+        pg_finish_canonical_rebuild, pg_load, pg_upgrade_legacy_compact_checkpoint,
+        push_incremental_replay_mutation, raw_tx_hash, replay_frozen_set, require_admin,
+        require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint, strip_0x,
+        unix_seconds, validate_crank_journal_parent, validate_crank_journal_signed_payloads,
+        validate_log_against_canonical, witness_from_nodes, witness_root_be, ArchivedNoteRow,
+        BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, CrankTxAttempt, CrankTxJournal,
+        EthLog, FrozenPathRecord, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
+        JsonNoteArchiveUpdate, NoteArchiveMutation, PendingRootUpdate, RecentEventIds, RpcClient,
+        StateBackend, StreamingFrontierBuilder, TipFreezeConfig, DEFAULT_MAX_BATCHES_IN_MEMORY,
+        MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS, MAX_TIP_FREEZE_PAGE_SIZE,
+        MAX_TIP_FREEZE_WORKERS,
     };
     use std::time::Instant;
 
@@ -15245,6 +15294,34 @@ mod tests {
         CrankTxJournal::clear(&path_string).unwrap();
         assert!(!path.exists());
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn prepared_crank_attempt_is_not_a_receipt_candidate_until_broadcast() {
+        let attempt = |tx_hash: &str, broadcast_at| CrankTxAttempt {
+            tx_hash: tx_hash.to_string(),
+            raw_tx_hex: "0x02c0".to_string(),
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 2,
+            prepared_at: 3,
+            broadcast_at,
+        };
+        let journal = CrankTxJournal {
+            schema: CrankTxJournal::SCHEMA.to_string(),
+            chain_id: 1,
+            signer: "0x2222222222222222222222222222222222222222".to_string(),
+            pool: "0x1111111111111111111111111111111111111111".to_string(),
+            method: "updateRoot".to_string(),
+            nonce: 0,
+            gas_limit: 4_000_000,
+            calldata_hex: "0xaabb".to_string(),
+            attempts: vec![attempt("0xprepared", None), attempt("0xbroadcast", Some(4))],
+        };
+
+        let candidates = broadcasted_crank_attempts(&journal)
+            .map(|attempt| attempt.tx_hash.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(candidates, vec!["0xbroadcast"]);
     }
 
     #[test]
