@@ -3681,10 +3681,16 @@ fn classify_selector(input: &[u8]) -> Option<&'static str> {
         // before the fee release keep the 3-argument form above, so BOTH must
         // stay classified — this is history for existing and new pools alike.
         [0x73, 0xa9, 0x3e, 0x1b] => Some("unshield"), // unshield(uint256,address,bytes32,address,(bytes,uint256[8]))
-        // The target is the GATEWAY, not a pool, and arg0 is the pool address
-        // rather than a uint amount — classifying it as "transfer" is what keeps
-        // it out of the arg0-is-an-amount decoding in `parse_tx_meta`.
-        [0x4c, 0x4b, 0xa9, 0x3b] => Some("transfer"), // transferWithFee(address,(bytes,uint256[8]),(bytes,uint256[8]))
+        // The target is the GATEWAY, not a pool, and the leading args are pool
+        // addresses rather than a uint amount — classifying it as "transfer" is
+        // what keeps it out of the arg0-is-an-amount decoding in `parse_tx_meta`.
+        //
+        // The multi-fee-asset release put `address feePool` in FRONT of the target
+        // pool, which moved the selector. Both stay classified: the old one is
+        // history for every sponsored transfer already mined, and dropping it would
+        // silently blank the op label on those rows.
+        [0x25, 0x78, 0x4a, 0x2e] => Some("transfer"), // transferWithFee(address,address,(bytes,uint256[8]),(bytes,uint256[8]))
+        [0x4c, 0x4b, 0xa9, 0x3b] => Some("transfer"), // historical: transferWithFee(address,(bytes,uint256[8]),(bytes,uint256[8]))
         [0xd4, 0x1e, 0x4a, 0x7a] => Some("swap"),
         [0x74, 0xda, 0x02, 0xc8] => Some("swap"),
         [0xe3, 0xb3, 0xfa, 0xe4] => Some("swap"),
@@ -12387,6 +12393,11 @@ mod tests {
             classify_selector(&hex::decode("4c4ba93b").unwrap()),
             Some("transfer")
         );
+        // ...and its multi-fee-asset successor, which inserted `address feePool` first.
+        assert_eq!(
+            classify_selector(&hex::decode("25784a2e").unwrap()),
+            Some("transfer")
+        );
         // ...and the pre-fee form must keep working: existing pools are unchanged.
         assert_eq!(
             classify_selector(&hex::decode("1952ce65").unwrap()),
@@ -12408,17 +12419,23 @@ mod tests {
         assert_eq!(meta.amount_hex, Some(format!("0x{}07", "00".repeat(31))));
     }
 
-    /// `transferWithFee`'s arg0 is the POOL ADDRESS, not a uint amount. Decoding it as
+    /// `transferWithFee`'s leading args are POOL ADDRESSES, not a uint amount. Decoding arg0 as
     /// one would publish a nonsensical "amount" on every sponsored transfer.
+    ///
+    /// This is why the multi-fee-asset release needed nothing but a selector entry: the pool
+    /// moved from calldata[4..36] to [36..68], and no decoding here reads either word.
     #[test]
     fn gateway_transfer_publishes_no_amount_or_recipient() {
-        let mut gateway = vec![0u8; 68];
-        gateway[..4].copy_from_slice(&hex::decode("4c4ba93b").unwrap());
-        gateway[16..36].fill(0x11); // arg0: pool address
-        let meta = parse_tx_meta(&gateway);
-        assert_eq!(meta.op, Some("transfer"));
-        assert_eq!(meta.amount_hex, None);
-        assert_eq!(meta.recipient, None);
+        for selector in ["4c4ba93b", "25784a2e"] {
+            let mut gateway = vec![0u8; 100];
+            gateway[..4].copy_from_slice(&hex::decode(selector).unwrap());
+            gateway[16..36].fill(0x11); // arg0
+            gateway[48..68].fill(0x22); // arg1
+            let meta = parse_tx_meta(&gateway);
+            assert_eq!(meta.op, Some("transfer"), "selector {selector}");
+            assert_eq!(meta.amount_hex, None, "selector {selector}");
+            assert_eq!(meta.recipient, None, "selector {selector}");
+        }
     }
 
     #[test]
