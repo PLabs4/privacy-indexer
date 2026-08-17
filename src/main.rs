@@ -3,7 +3,10 @@ mod compact_tree;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
+    io::Write,
     net::SocketAddr,
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
     sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -19,7 +22,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures_util::stream::{self, StreamExt};
 use futures_util::SinkExt;
 use k256::ecdsa::{RecoveryId, SigningKey};
@@ -320,14 +323,55 @@ struct Cli {
     /// This is release-bound and therefore intentionally has no default.
     #[arg(long, env = "PRIVACYBTC_INDEXER_EXPECTED_VERIFIER_SET_ID")]
     expected_verifier_set_id: String,
-    /// Gas price in wei for crank transactions. Default: 1 Gwei.
-    /// Networks with a higher minimum gas price must set this explicitly.
+    /// Transaction envelope used by the crank signer. `legacy` preserves the
+    /// current Monad path; Ethereum deployments must explicitly select `eip1559`.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_TX_TYPE",
+        value_enum,
+        default_value = "legacy"
+    )]
+    crank_tx_type: CrankTxType,
+    /// Gas price in wei for legacy crank transactions. Default: 1 Gwei.
     #[arg(
         long,
         env = "PRIVACYBTC_INDEXER_GAS_PRICE",
         default_value_t = 1_000_000_000u64
     )]
     gas_price: u64,
+    /// Priority fee for EIP-1559 crank transactions. Ignored in legacy mode.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_MAX_PRIORITY_FEE_PER_GAS",
+        default_value_t = 1_000_000_000u64
+    )]
+    crank_max_priority_fee_per_gas: u64,
+    /// Hard maxFeePerGas ceiling for EIP-1559 crank transactions. Required and
+    /// non-zero in eip1559 mode; a base-fee spike above it fails closed.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_MAX_FEE_PER_GAS_CAP",
+        default_value_t = 0u64
+    )]
+    crank_max_fee_per_gas_cap: u64,
+    /// Durable single-signer transaction journal. Required for EIP-1559 mode:
+    /// raw bytes are fsynced here before broadcast and replayed after restart.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_CRANK_TX_JOURNAL")]
+    crank_tx_journal: Option<String>,
+    /// Seconds before an unmined EIP-1559 crank transaction may be replaced.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_REPLACEMENT_AFTER_SECS",
+        default_value_t = 120u64
+    )]
+    crank_replacement_after_secs: u64,
+    /// Maximum same-nonce EIP-1559 replacements retained in the durable journal.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_CRANK_MAX_REPLACEMENTS",
+        default_value_t = 3u32
+    )]
+    crank_max_replacements: u32,
     /// Override `NoteConfirmed(bytes32,bytes32)` topic0 (default: canonical hash).
     #[arg(long)]
     confirm_topic0: Option<String>,
@@ -747,6 +791,12 @@ struct SignerConfig {
     address: [u8; 20],
     chain_id: u64,
     gas_price: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CrankTxType {
+    Legacy,
+    Eip1559,
 }
 
 impl SignerConfig {
@@ -2056,6 +2106,39 @@ async fn main() -> Result<()> {
                 "PRIVACYBTC_INDEXER_CRANK_GAS_MARGIN_BPS must be <= {MAX_CRANK_GAS_MARGIN_BPS}"
             ));
         }
+        if cli.crank_tx_type == CrankTxType::Eip1559 {
+            if cli.crank_max_priority_fee_per_gas == 0 {
+                return Err(anyhow!(
+                    "EIP-1559 crank requires PRIVACYBTC_INDEXER_CRANK_MAX_PRIORITY_FEE_PER_GAS > 0"
+                ));
+            }
+            if cli.crank_max_fee_per_gas_cap == 0 {
+                return Err(anyhow!(
+                    "EIP-1559 crank requires PRIVACYBTC_INDEXER_CRANK_MAX_FEE_PER_GAS_CAP > 0"
+                ));
+            }
+            if cli.crank_max_priority_fee_per_gas > cli.crank_max_fee_per_gas_cap {
+                return Err(anyhow!("EIP-1559 crank priority fee exceeds max fee cap"));
+            }
+            let journal = cli
+                .crank_tx_journal
+                .as_deref()
+                .filter(|path| !path.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow!("EIP-1559 crank requires PRIVACYBTC_INDEXER_CRANK_TX_JOURNAL")
+                })?;
+            validate_crank_journal_parent(journal)?;
+            if !(30..=3_600).contains(&cli.crank_replacement_after_secs) {
+                return Err(anyhow!(
+                    "PRIVACYBTC_INDEXER_CRANK_REPLACEMENT_AFTER_SECS must be in 30..=3600"
+                ));
+            }
+            if cli.crank_max_replacements > 10 {
+                return Err(anyhow!(
+                    "PRIVACYBTC_INDEXER_CRANK_MAX_REPLACEMENTS must be <= 10"
+                ));
+            }
+        }
         if cli
             .crank_prover_api_token
             .as_deref()
@@ -2169,6 +2252,12 @@ async fn main() -> Result<()> {
                         max_proofs_per_tx: cli.crank_max_proofs_per_tx,
                         gas_limit_cap: cli.gas_limit_update_root,
                         gas_margin_bps: cli.crank_gas_margin_bps,
+                        tx_type: cli.crank_tx_type,
+                        max_priority_fee_per_gas: cli.crank_max_priority_fee_per_gas,
+                        max_fee_per_gas_cap: cli.crank_max_fee_per_gas_cap,
+                        tx_journal: cli.crank_tx_journal.clone(),
+                        replacement_after_secs: cli.crank_replacement_after_secs,
+                        max_replacements: cli.crank_max_replacements,
                         allowed_pools: parse_address_set(
                             "PRIVACYBTC_INDEXER_CRANK_ALLOWED_POOLS",
                             &cli.crank_allowed_pool,
@@ -2406,8 +2495,185 @@ struct CrankConfig {
     max_proofs_per_tx: usize,
     gas_limit_cap: u64,
     gas_margin_bps: u64,
+    tx_type: CrankTxType,
+    max_priority_fee_per_gas: u64,
+    max_fee_per_gas_cap: u64,
+    tx_journal: Option<String>,
+    replacement_after_secs: u64,
+    max_replacements: u32,
     allowed_pools: HashSet<String>,
     max_tx_per_hour: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CrankTxAttempt {
+    tx_hash: String,
+    raw_tx_hex: String,
+    max_priority_fee_per_gas: u128,
+    max_fee_per_gas: u128,
+    prepared_at: u64,
+    broadcast_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CrankTxJournal {
+    schema: String,
+    chain_id: u64,
+    signer: String,
+    pool: String,
+    method: String,
+    nonce: u64,
+    gas_limit: u64,
+    calldata_hex: String,
+    attempts: Vec<CrankTxAttempt>,
+}
+
+impl CrankTxJournal {
+    const SCHEMA: &'static str = "privacy-indexer-crank-tx/v1";
+
+    fn load(path: &str, chain_id: u64, signer: &str) -> Result<Option<Self>> {
+        validate_crank_journal_parent(path)?;
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("read crank journal {path}")),
+        };
+        let journal: Self =
+            serde_json::from_str(&raw).with_context(|| format!("decode crank journal {path}"))?;
+        if journal.schema != Self::SCHEMA {
+            return Err(anyhow!(
+                "unsupported crank journal schema {}",
+                journal.schema
+            ));
+        }
+        if journal.chain_id != chain_id || !journal.signer.eq_ignore_ascii_case(signer) {
+            return Err(anyhow!(
+                "crank journal belongs to chain {} signer {}, expected chain {chain_id} signer {signer}",
+                journal.chain_id,
+                journal.signer
+            ));
+        }
+        if journal.attempts.is_empty() {
+            return Err(anyhow!("crank journal has no signed attempts"));
+        }
+        for attempt in &journal.attempts {
+            let raw_tx = hex::decode(strip_0x(&attempt.raw_tx_hex))
+                .context("crank journal raw transaction is not hex")?;
+            let expected = raw_tx_hash(&raw_tx);
+            if !expected.eq_ignore_ascii_case(&attempt.tx_hash) {
+                return Err(anyhow!("crank journal raw transaction hash mismatch"));
+            }
+        }
+        Ok(Some(journal))
+    }
+
+    fn save(&self, path: &str) -> Result<()> {
+        let parent = validate_crank_journal_parent(path)?;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("crank-tx"),
+            std::process::id(),
+            unique
+        ));
+        let bytes = serde_json::to_vec(self).context("serialize crank transaction journal")?;
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&tmp)
+                .with_context(|| format!("create crank journal temp {}", tmp.display()))?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, path).with_context(|| format!("replace crank journal {path}"))?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    fn clear(path: &str) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                std::fs::File::open(validate_crank_journal_parent(path)?)?.sync_all()?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("remove crank journal {path}")),
+        }
+    }
+}
+
+fn validate_crank_journal_parent(path: &str) -> Result<&Path> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(anyhow!("crank transaction journal path must be absolute"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("crank transaction journal has no parent"))?;
+    let metadata = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("stat crank journal parent {}", parent.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "crank transaction journal parent must be a real directory"
+        ));
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(anyhow!("crank transaction journal must not be a symlink"));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(anyhow!("crank transaction journal must be a regular file"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("stat crank transaction journal"),
+    }
+    Ok(parent)
+}
+
+fn raw_tx_hash(raw_tx: &[u8]) -> String {
+    format!("0x{}", hex::encode(Keccak256::digest(raw_tx)))
+}
+
+fn bump_eip1559_fee(value: u128) -> u128 {
+    value.saturating_add((value / 8).max(1))
+}
+
+fn validate_crank_journal_signed_payloads(
+    journal: &CrankTxJournal,
+    signing_key: &SigningKey,
+) -> Result<()> {
+    let calldata = hex::decode(strip_0x(&journal.calldata_hex))
+        .context("crank journal calldata is not hex")?;
+    for attempt in &journal.attempts {
+        let expected = build_and_sign_eip1559_tx(
+            journal.nonce,
+            attempt.max_priority_fee_per_gas,
+            attempt.max_fee_per_gas,
+            journal.gas_limit,
+            &journal.pool,
+            0,
+            &calldata,
+            journal.chain_id,
+            signing_key,
+        )?;
+        let persisted = hex::decode(strip_0x(&attempt.raw_tx_hex))
+            .context("crank journal raw transaction is not hex")?;
+        if persisted != expected {
+            return Err(anyhow!(
+                "crank journal signed payload does not match its durable transaction fields"
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct HourlyTxBudget {
@@ -2505,6 +2771,7 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
     // Confirmed-state frontier per pool (advanced only after an on-chain success).
     let mut frontiers: HashMap<String, CompactFrontier> = HashMap::new();
     let mut tx_budget = HourlyTxBudget::new(cfg.max_tx_per_hour);
+    let signer_hex = format!("0x{}", hex::encode(cfg.signer.address));
 
     println!(
         "[crank] root crank ON (prover={}, interval={}s, max_proofs_per_tx={}, max_leaves_per_tx={}, max_tx_per_hour={}, account=0x{})",
@@ -2515,6 +2782,48 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
         cfg.max_tx_per_hour,
         hex::encode(cfg.signer.address)
     );
+
+    // EIP-1559 mode is a single durable signer lane. A crash may occur after
+    // fsync but before broadcast, or after broadcast but before the receipt was
+    // persisted. Resolve that exact signed transaction (and any same-nonce
+    // replacements) before reading/proving new work or allocating another nonce.
+    if cfg.tx_type == CrankTxType::Eip1559 {
+        if let Some(path) = cfg.tx_journal.as_deref() {
+            loop {
+                match CrankTxJournal::load(path, cfg.signer.chain_id, &signer_hex) {
+                    Ok(None) => break,
+                    Ok(Some(journal)) => {
+                        eprintln!(
+                            "[crank] recovering durable transaction nonce={} pool={} attempts={}",
+                            journal.nonce,
+                            journal.pool,
+                            journal.attempts.len()
+                        );
+                        match drive_crank_journal(&rpc, &cfg, &mut tx_budget, journal).await {
+                            Ok(ok) => {
+                                println!(
+                                    "[crank] recovered transaction reached terminal status={}",
+                                    if ok { "confirmed" } else { "reverted" }
+                                );
+                                break;
+                            }
+                            Err(error) => {
+                                eprintln!("[crank] durable transaction recovery paused: {error:#}");
+                                tokio::time::sleep(Duration::from_secs(cfg.interval_secs.max(1)))
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        // A corrupt or foreign journal is an operator-repair
+                        // condition. Never delete it or allocate a new nonce.
+                        eprintln!("[crank] durable transaction journal rejected: {error:#}");
+                        tokio::time::sleep(Duration::from_secs(cfg.interval_secs.max(1))).await;
+                    }
+                }
+            }
+        }
+    }
 
     loop {
         let mut made_progress = false;
@@ -2832,37 +3141,277 @@ async fn submit_crank_tx(
         "[crank] {what} gas: estimate={estimated_gas} margin_bps={} signed_limit={gas_limit} cap={}",
         cfg.gas_margin_bps, cfg.gas_limit_cap
     );
+    let nonce = match cfg.tx_type {
+        CrankTxType::Legacy => rpc.get_transaction_count(&from_hex).await?,
+        CrankTxType::Eip1559 => rpc.get_pending_transaction_count(&from_hex).await?,
+    };
+    let (raw, dynamic_fees) = match cfg.tx_type {
+        CrankTxType::Legacy => (
+            build_and_sign_raw_tx(
+                nonce,
+                cfg.signer.gas_price,
+                gas_limit,
+                pool,
+                0u64,
+                calldata,
+                cfg.signer.chain_id,
+                &cfg.signer.signing_key,
+            )?,
+            None,
+        ),
+        CrankTxType::Eip1559 => {
+            let base_fee = rpc.base_fee_per_gas().await?;
+            let (priority_fee, max_fee) = eip1559_crank_fees(
+                base_fee,
+                cfg.max_priority_fee_per_gas,
+                cfg.max_fee_per_gas_cap,
+            )?;
+            println!(
+                "[crank] {what} EIP-1559 fees: base={base_fee} priority={priority_fee} max={max_fee} cap={}",
+                cfg.max_fee_per_gas_cap
+            );
+            (
+                build_and_sign_eip1559_tx(
+                    nonce,
+                    priority_fee,
+                    max_fee,
+                    gas_limit,
+                    pool,
+                    0u64,
+                    calldata,
+                    cfg.signer.chain_id,
+                    &cfg.signer.signing_key,
+                )?,
+                Some((priority_fee, max_fee)),
+            )
+        }
+    };
+    if cfg.tx_type == CrankTxType::Eip1559 {
+        let path = cfg
+            .tx_journal
+            .as_deref()
+            .ok_or_else(|| anyhow!("EIP-1559 crank has no durable journal path"))?;
+        if CrankTxJournal::load(path, cfg.signer.chain_id, &from_hex)?.is_some() {
+            return Err(anyhow!(
+                "refusing to overwrite unresolved crank transaction journal {path}"
+            ));
+        }
+        let tx_hash = raw_tx_hash(&raw);
+        let now = unix_seconds();
+        let (priority_fee, max_fee) = dynamic_fees.expect("EIP-1559 fees were selected");
+        let journal = CrankTxJournal {
+            schema: CrankTxJournal::SCHEMA.to_string(),
+            chain_id: cfg.signer.chain_id,
+            signer: from_hex,
+            pool: normalize_hex_0x(pool),
+            method: what.to_string(),
+            nonce,
+            gas_limit,
+            calldata_hex: format!("0x{}", hex::encode(calldata)),
+            attempts: vec![CrankTxAttempt {
+                tx_hash,
+                raw_tx_hex: format!("0x{}", hex::encode(raw)),
+                max_priority_fee_per_gas: priority_fee,
+                max_fee_per_gas: max_fee,
+                prepared_at: now,
+                broadcast_at: None,
+            }],
+        };
+        journal.save(path)?;
+        return drive_crank_journal(rpc, cfg, budget, journal).await;
+    }
+
     if !budget.try_take(unix_seconds()) {
         return Err(anyhow!(
             "hourly crank transaction budget exhausted (limit={})",
             cfg.max_tx_per_hour
         ));
     }
-
-    let nonce = rpc.get_transaction_count(&from_hex).await?;
-    let raw = build_and_sign_raw_tx(
-        nonce,
-        cfg.signer.gas_price,
-        gas_limit,
-        pool,
-        0u64,
-        calldata,
-        cfg.signer.chain_id,
-        &cfg.signer.signing_key,
-    )?;
     let tx_hash = rpc.send_raw_transaction(&raw).await?;
     println!("[crank] {what} submitted: {tx_hash}");
+    wait_for_crank_receipt(rpc, &tx_hash, what, 90).await
+}
 
-    // Wait for the receipt so ticks never pipeline conflicting txs.
-    for _ in 0..45 {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        match rpc.get_transaction_receipt_status(&tx_hash).await {
+async fn wait_for_crank_receipt(
+    rpc: &RpcClient,
+    tx_hash: &str,
+    what: &str,
+    timeout_secs: u64,
+) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs.max(1));
+    loop {
+        match rpc.get_transaction_receipt_status(tx_hash).await {
             Ok(Some(ok)) => return Ok(ok),
-            Ok(None) => continue,
-            Err(_) => continue,
+            Ok(None) | Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Ok(None) | Err(_) => {
+                return Err(anyhow!(
+                    "{what} tx {tx_hash} did not reach a receipt before timeout"
+                ));
+            }
         }
     }
-    Err(anyhow!("{what} tx {tx_hash} not mined within 90s"))
+}
+
+async fn drive_crank_journal(
+    rpc: &RpcClient,
+    cfg: &CrankConfig,
+    budget: &mut HourlyTxBudget,
+    mut journal: CrankTxJournal,
+) -> Result<bool> {
+    let path = cfg
+        .tx_journal
+        .as_deref()
+        .ok_or_else(|| anyhow!("EIP-1559 crank has no durable journal path"))?;
+    if !cfg.allowed_pools.contains(&journal.pool.to_lowercase()) {
+        return Err(anyhow!(
+            "durable crank journal pool {} is not in the current allowlist",
+            journal.pool
+        ));
+    }
+    validate_crank_journal_signed_payloads(&journal, &cfg.signer.signing_key)?;
+    for attempt in &journal.attempts {
+        if let Some(ok) = rpc.get_transaction_receipt_status(&attempt.tx_hash).await? {
+            CrankTxJournal::clear(path)?;
+            return Ok(ok);
+        }
+    }
+
+    loop {
+        let attempt = journal
+            .attempts
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("crank journal has no current attempt"))?;
+        let raw = hex::decode(strip_0x(&attempt.raw_tx_hex))?;
+        if attempt.broadcast_at.is_none() && !budget.try_take(unix_seconds()) {
+            return Err(anyhow!(
+                "hourly crank transaction budget exhausted before durable broadcast (limit={})",
+                cfg.max_tx_per_hour
+            ));
+        }
+        match rpc.send_raw_transaction(&raw).await {
+            Ok(rpc_hash) if rpc_hash.eq_ignore_ascii_case(&attempt.tx_hash) => {}
+            Ok(rpc_hash) => {
+                return Err(anyhow!(
+                    "RPC returned crank tx hash {rpc_hash}, expected {}",
+                    attempt.tx_hash
+                ));
+            }
+            Err(error) if rpc_error_already_known(&error) => {}
+            Err(error) if rpc_error_nonce_too_low(&error) => {
+                for alias in &journal.attempts {
+                    if let Some(ok) = rpc.get_transaction_receipt_status(&alias.tx_hash).await? {
+                        CrankTxJournal::clear(path)?;
+                        return Ok(ok);
+                    }
+                }
+                return Err(anyhow!(
+                    "crank nonce {} is too low but no persisted hash has a receipt; refusing a new nonce: {error:#}",
+                    journal.nonce
+                ));
+            }
+            Err(error) => return Err(error).context("broadcast persisted crank transaction"),
+        }
+        let now = unix_seconds();
+        if journal
+            .attempts
+            .last()
+            .and_then(|entry| entry.broadcast_at)
+            .is_none()
+        {
+            journal
+                .attempts
+                .last_mut()
+                .expect("attempt exists")
+                .broadcast_at = Some(now);
+            journal.save(path)?;
+        }
+
+        let broadcast_at = journal
+            .attempts
+            .last()
+            .and_then(|entry| entry.broadcast_at)
+            .unwrap_or(now);
+        let wait_secs = broadcast_at
+            .saturating_add(cfg.replacement_after_secs.max(1))
+            .saturating_sub(unix_seconds());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
+        loop {
+            for alias in &journal.attempts {
+                if let Some(ok) = rpc.get_transaction_receipt_status(&alias.tx_hash).await? {
+                    CrankTxJournal::clear(path)?;
+                    return Ok(ok);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
+        let replacements = journal.attempts.len().saturating_sub(1) as u32;
+        if replacements >= cfg.max_replacements {
+            return Err(anyhow!(
+                "crank tx nonce {} is still pending after {} replacement(s); durable journal retained",
+                journal.nonce,
+                replacements
+            ));
+        }
+        let base_fee = rpc.base_fee_per_gas().await?;
+        let suggested = eip1559_crank_fees(
+            base_fee,
+            cfg.max_priority_fee_per_gas,
+            cfg.max_fee_per_gas_cap,
+        )?;
+        let priority = bump_eip1559_fee(attempt.max_priority_fee_per_gas).max(suggested.0);
+        let max_fee = bump_eip1559_fee(attempt.max_fee_per_gas)
+            .max(suggested.1)
+            .max(priority);
+        if max_fee > u128::from(cfg.max_fee_per_gas_cap) {
+            return Err(anyhow!(
+                "replacement maxFeePerGas {max_fee} exceeds configured cap {}",
+                cfg.max_fee_per_gas_cap
+            ));
+        }
+        let calldata = hex::decode(strip_0x(&journal.calldata_hex))?;
+        let replacement_raw = build_and_sign_eip1559_tx(
+            journal.nonce,
+            priority,
+            max_fee,
+            journal.gas_limit,
+            &journal.pool,
+            0,
+            &calldata,
+            journal.chain_id,
+            &cfg.signer.signing_key,
+        )?;
+        let replacement_hash = raw_tx_hash(&replacement_raw);
+        journal.attempts.push(CrankTxAttempt {
+            tx_hash: replacement_hash,
+            raw_tx_hex: format!("0x{}", hex::encode(replacement_raw)),
+            max_priority_fee_per_gas: priority,
+            max_fee_per_gas: max_fee,
+            prepared_at: unix_seconds(),
+            broadcast_at: None,
+        });
+        // Persist the same-nonce signed replacement before its first broadcast.
+        journal.save(path)?;
+    }
+}
+
+fn rpc_error_already_known(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("already known")
+        || message.contains("known transaction")
+        || message.contains("already imported")
+}
+
+fn rpc_error_nonce_too_low(error: &anyhow::Error) -> bool {
+    format!("{error:#}")
+        .to_ascii_lowercase()
+        .contains("nonce too low")
 }
 
 /// Same env as relayer: comma-separated origins in `PRIVACYBTC_CORS_ORIGINS`.
@@ -3691,6 +4240,13 @@ fn classify_selector(input: &[u8]) -> Option<&'static str> {
         // silently blank the op label on those rows.
         [0x25, 0x78, 0x4a, 0x2e] => Some("transfer"), // transferWithFee(address,address,(bytes,uint256[8]),(bytes,uint256[8]))
         [0x4c, 0x4b, 0xa9, 0x3b] => Some("transfer"), // historical: transferWithFee(address,(bytes,uint256[8]),(bytes,uint256[8]))
+        // Ethereum native-asset UX adapter. The indexer sees the pool's NoteAdded/
+        // Shielded/Unshielded logs, but the containing transaction targets the
+        // gateway, so classify its top-level calldata as the same logical pool op.
+        // Both functions retain amount at arg0; native unshield's final recipient
+        // is arg1 and is decoded below just like a direct pool unshield.
+        [0xa6, 0xc3, 0x58, 0x9d] => Some("shield"), // shieldETH(uint256,(bytes,uint256[8]))
+        [0xd6, 0xc7, 0x5f, 0xd4] => Some("unshield"), // unshieldETH(uint256,address,(bytes,uint256[8]))
         [0xd4, 0x1e, 0x4a, 0x7a] => Some("swap"),
         [0x74, 0xda, 0x02, 0xc8] => Some("swap"),
         [0xe3, 0xb3, 0xfa, 0xe4] => Some("swap"),
@@ -3750,6 +4306,7 @@ fn parse_tx_meta(input: &[u8]) -> TxMeta {
     let recipient = if input.len() >= 68
         && (input[0..4] == [0x19, 0x52, 0xce, 0x65]     // v3 unshield
             || input[0..4] == [0x73, 0xa9, 0x3e, 0x1b]  // v3 unshield, protocol-fee release
+            || input[0..4] == [0xd6, 0xc7, 0x5f, 0xd4]  // NativeEthGateway.unshieldETH
             || input[0..4] == [0x53, 0x64, 0x4c, 0x61])
     // historical v2
     {
@@ -10937,6 +11494,27 @@ impl RpcClient {
         parse_hex_u64(&hex_num).context("invalid eth_getTransactionCount")
     }
 
+    async fn get_pending_transaction_count(&self, address: &str) -> Result<u64> {
+        let hex_num: String = self
+            .rpc_call(
+                "eth_getTransactionCount",
+                serde_json::json!([address, "pending"]),
+            )
+            .await?;
+        parse_hex_u64(&hex_num).context("invalid pending eth_getTransactionCount")
+    }
+
+    async fn base_fee_per_gas(&self) -> Result<u64> {
+        let block: serde_json::Value = self
+            .rpc_call("eth_getBlockByNumber", serde_json::json!(["latest", false]))
+            .await?;
+        let value = block
+            .get("baseFeePerGas")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("latest block has no baseFeePerGas; refusing EIP-1559 crank"))?;
+        parse_hex_u64(value).context("invalid latest baseFeePerGas")
+    }
+
     /// Unix timestamp (seconds) of a block's header. Used to age transactions in
     /// the explorer; block timestamps are immutable so callers cache the result.
     async fn get_block_timestamp(&self, block: u64) -> Result<u64> {
@@ -11385,6 +11963,28 @@ impl RpcClient {
 
 // ─── Ethereum raw transaction ─────────────────────────────────────────────────
 
+fn eip1559_crank_fees(base_fee: u64, priority_fee: u64, max_fee_cap: u64) -> Result<(u128, u128)> {
+    if priority_fee == 0 || max_fee_cap == 0 {
+        return Err(anyhow!(
+            "EIP-1559 priority fee and max fee cap must be non-zero"
+        ));
+    }
+    if priority_fee > max_fee_cap {
+        return Err(anyhow!("EIP-1559 priority fee exceeds max fee cap"));
+    }
+    let priority = u128::from(priority_fee);
+    let required = u128::from(base_fee)
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(priority))
+        .ok_or_else(|| anyhow!("EIP-1559 fee calculation overflow"))?;
+    if required > u128::from(max_fee_cap) {
+        return Err(anyhow!(
+            "EIP-1559 base fee {base_fee} requires maxFeePerGas {required}, above configured cap {max_fee_cap}"
+        ));
+    }
+    Ok((priority, required))
+}
+
 /// Builds and signs an EIP-155 legacy raw transaction.
 #[allow(clippy::too_many_arguments)]
 fn build_and_sign_raw_tx(
@@ -11441,6 +12041,67 @@ fn build_and_sign_raw_tx(
     Ok(signed_rlp)
 }
 
+/// Builds and signs an EIP-1559 type-2 raw transaction with an empty access list.
+#[allow(clippy::too_many_arguments)]
+fn build_and_sign_eip1559_tx(
+    nonce: u64,
+    max_priority_fee_per_gas: u128,
+    max_fee_per_gas: u128,
+    gas_limit: u64,
+    to: &str,
+    value: u64,
+    data: &[u8],
+    chain_id: u64,
+    signing_key: &SigningKey,
+) -> Result<Vec<u8>> {
+    if max_priority_fee_per_gas == 0 || max_priority_fee_per_gas > max_fee_per_gas {
+        return Err(anyhow!("invalid EIP-1559 fee relationship"));
+    }
+    let to_bytes = hex::decode(strip_0x(to)).context("invalid contract address hex")?;
+    if to_bytes.len() != 20 {
+        return Err(anyhow!("contract address must be 20 bytes"));
+    }
+    let access_list = rlp_list(vec![]);
+    let unsigned_payload = rlp_list(vec![
+        rlp_uint(chain_id as u128),
+        rlp_uint(nonce as u128),
+        rlp_uint(max_priority_fee_per_gas),
+        rlp_uint(max_fee_per_gas),
+        rlp_uint(gas_limit as u128),
+        rlp_bytes(&to_bytes),
+        rlp_uint(value as u128),
+        rlp_bytes(data),
+        access_list.clone(),
+    ]);
+    let mut signing_payload = Vec::with_capacity(1 + unsigned_payload.len());
+    signing_payload.push(0x02);
+    signing_payload.extend_from_slice(&unsigned_payload);
+    let tx_hash: [u8; 32] = Keccak256::digest(&signing_payload).into();
+    let (sig, recid): (k256::ecdsa::Signature, RecoveryId) = signing_key
+        .sign_prehash_recoverable(&tx_hash)
+        .map_err(|e| anyhow!("signing failed: {e}"))?;
+    let r: [u8; 32] = sig.r().to_bytes().into();
+    let s: [u8; 32] = sig.s().to_bytes().into();
+    let signed_payload = rlp_list(vec![
+        rlp_uint(chain_id as u128),
+        rlp_uint(nonce as u128),
+        rlp_uint(max_priority_fee_per_gas),
+        rlp_uint(max_fee_per_gas),
+        rlp_uint(gas_limit as u128),
+        rlp_bytes(&to_bytes),
+        rlp_uint(value as u128),
+        rlp_bytes(data),
+        access_list,
+        rlp_uint(recid.to_byte() as u128),
+        rlp_uint256(&r),
+        rlp_uint256(&s),
+    ]);
+    let mut raw = Vec::with_capacity(1 + signed_payload.len());
+    raw.push(0x02);
+    raw.extend_from_slice(&signed_payload);
+    Ok(raw)
+}
+
 /// Derives the Ethereum address from a SigningKey.
 fn eth_address_from_signing_key(signing_key: &SigningKey) -> [u8; 20] {
     let vk = signing_key.verifying_key();
@@ -11464,6 +12125,14 @@ fn rlp_uint(n: u128) -> Vec<u8> {
     let start = bytes.iter().position(|&b| b != 0).unwrap_or(15);
     let trimmed = &bytes[start..];
     rlp_bytes(trimmed)
+}
+
+fn rlp_uint256(bytes: &[u8; 32]) -> Vec<u8> {
+    let start = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
+    rlp_bytes(&bytes[start..])
 }
 
 fn rlp_bytes(bytes: &[u8]) -> Vec<u8> {
@@ -11643,27 +12312,30 @@ fn strip_0x(s: &str) -> &str {
 mod tests {
     use std::collections::HashMap;
 
+    use k256::ecdsa::SigningKey;
+
     use super::{
-        advance_cursor, batch_page_end, beacon_words_match, build_tip_frozen_paths,
-        canonical_guard, checkpoint_is_complete_finalized_boundary, classify_selector,
-        compact_note_mutations, crank_gas_limit, crank_next_delay_secs,
-        decode_frozen_root_updated_log, decode_json_note_archive, eip1967_beacon_slot,
-        encode_crank_root_calldata, export_segment_frozen_paths, factory_log_matches,
-        finalized_cursor_covers_block, freeze_confirmed_prefix, frontier_from_leaves,
-        frozen_count_after_delta, frozen_root_updated_topic0, getlogs_window_end,
-        is_getlogs_range_error, latest_upserted_note, nonempty_trimmed, normalize_hex_0x,
-        parse_address_set, parse_bool_flag, parse_bytes32_strict, parse_tx_meta,
+        advance_cursor, batch_page_end, beacon_words_match, build_and_sign_eip1559_tx,
+        build_tip_frozen_paths, canonical_guard, checkpoint_is_complete_finalized_boundary,
+        classify_selector, compact_note_mutations, crank_gas_limit, crank_next_delay_secs,
+        decode_frozen_root_updated_log, decode_json_note_archive, eip1559_crank_fees,
+        eip1967_beacon_slot, encode_crank_root_calldata, export_segment_frozen_paths,
+        factory_log_matches, finalized_cursor_covers_block, freeze_confirmed_prefix,
+        frontier_from_leaves, frozen_count_after_delta, frozen_root_updated_topic0,
+        getlogs_window_end, is_getlogs_range_error, latest_upserted_note, nonempty_trimmed,
+        normalize_hex_0x, parse_address_set, parse_bool_flag, parse_bytes32_strict, parse_tx_meta,
         perc20_deployed_topic0, persist_request_is_current, pg_append_cmx_leaves,
         pg_append_merkle_nodes, pg_apply_note_mutations, pg_archive_seq_bound,
         pg_begin_canonical_rebuild, pg_bulk_upsert_notes, pg_commit_incremental_replay,
         pg_finish_canonical_rebuild, pg_load, pg_upgrade_legacy_compact_checkpoint,
-        push_incremental_replay_mutation, replay_frozen_set, require_admin, require_relayer,
-        required_witness_nodes, rlp_bytes, rlp_list, rlp_uint, strip_0x,
+        push_incremental_replay_mutation, raw_tx_hash, replay_frozen_set, require_admin,
+        require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint, strip_0x,
+        unix_seconds, validate_crank_journal_parent, validate_crank_journal_signed_payloads,
         validate_log_against_canonical, witness_from_nodes, witness_root_be, ArchivedNoteRow,
-        BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, EthLog, FrozenPathRecord,
-        FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
-        NoteArchiveMutation, PendingRootUpdate, RecentEventIds, RpcClient, StateBackend,
-        StreamingFrontierBuilder, TipFreezeConfig, DEFAULT_MAX_BATCHES_IN_MEMORY,
+        BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, CrankTxAttempt, CrankTxJournal,
+        EthLog, FrozenPathRecord, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
+        JsonNoteArchiveUpdate, NoteArchiveMutation, PendingRootUpdate, RecentEventIds, RpcClient,
+        StateBackend, StreamingFrontierBuilder, TipFreezeConfig, DEFAULT_MAX_BATCHES_IN_MEMORY,
         MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS, MAX_TIP_FREEZE_PAGE_SIZE,
         MAX_TIP_FREEZE_WORKERS,
     };
@@ -12417,6 +13089,39 @@ mod tests {
         assert_eq!(meta.op, Some("unshield"));
         assert_eq!(meta.recipient, Some(format!("0x{}", "42".repeat(20))));
         assert_eq!(meta.amount_hex, Some(format!("0x{}07", "00".repeat(31))));
+    }
+
+    /// Gateway-wrapped ETH operations still emit the authoritative note events from
+    /// the sETH pool. Their transaction selector, public amount, depositor and final
+    /// recipient must therefore remain visible in the same explorer model as direct
+    /// ERC20Shield operations.
+    #[test]
+    fn native_eth_gateway_selectors_preserve_public_history_fields() {
+        let mut shield = vec![0u8; 36];
+        shield[..4].copy_from_slice(&hex::decode("a6c3589d").unwrap());
+        shield[35] = 0x09;
+        let shield_meta = parse_tx_meta(&shield);
+        assert_eq!(shield_meta.op, Some("shield"));
+        assert_eq!(
+            shield_meta.amount_hex,
+            Some(format!("0x{}09", "00".repeat(31)))
+        );
+        assert_eq!(shield_meta.recipient, None);
+
+        let mut unshield = vec![0u8; 68];
+        unshield[..4].copy_from_slice(&hex::decode("d6c75fd4").unwrap());
+        unshield[35] = 0x07;
+        unshield[48..68].fill(0x42);
+        let unshield_meta = parse_tx_meta(&unshield);
+        assert_eq!(unshield_meta.op, Some("unshield"));
+        assert_eq!(
+            unshield_meta.amount_hex,
+            Some(format!("0x{}07", "00".repeat(31)))
+        );
+        assert_eq!(
+            unshield_meta.recipient,
+            Some(format!("0x{}", "42".repeat(20)))
+        );
     }
 
     /// `transferWithFee`'s leading args are POOL ADDRESSES, not a uint amount. Decoding arg0 as
@@ -14361,6 +15066,109 @@ mod tests {
     #[test]
     fn rlp_bytes_empty() {
         assert_eq!(rlp_bytes(&[]), vec![0x80]);
+    }
+
+    #[test]
+    fn eip1559_crank_fee_policy_is_dynamic_and_cap_bounded() {
+        assert_eq!(
+            eip1559_crank_fees(20_000_000_000, 1_000_000_000, 60_000_000_000).unwrap(),
+            (1_000_000_000, 41_000_000_000)
+        );
+        assert!(eip1559_crank_fees(40_000_000_000, 1_000_000_000, 60_000_000_000).is_err());
+        assert!(eip1559_crank_fees(1, 2, 1).is_err());
+    }
+
+    #[test]
+    fn eip1559_crank_signer_emits_type_two_envelope() {
+        let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let raw = build_and_sign_eip1559_tx(
+            3,
+            1_000_000_000,
+            31_000_000_000,
+            4_000_000,
+            "0x1111111111111111111111111111111111111111",
+            0,
+            &[0xaa, 0xbb],
+            1,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(raw[0], 0x02);
+        assert!(raw.len() > 80);
+    }
+
+    #[test]
+    fn crank_transaction_journal_roundtrips_and_rejects_tampering() {
+        let dir = std::env::temp_dir().join(format!(
+            "privacy-indexer-crank-journal-{}-{}",
+            std::process::id(),
+            unix_seconds()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pending.json");
+        let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let raw = build_and_sign_eip1559_tx(
+            3,
+            1_000_000_000,
+            31_000_000_000,
+            4_000_000,
+            "0x1111111111111111111111111111111111111111",
+            0,
+            &[0xaa, 0xbb],
+            1,
+            &key,
+        )
+        .unwrap();
+        let signer = "0x2222222222222222222222222222222222222222";
+        let mut journal = CrankTxJournal {
+            schema: CrankTxJournal::SCHEMA.to_string(),
+            chain_id: 1,
+            signer: signer.to_string(),
+            pool: "0x1111111111111111111111111111111111111111".to_string(),
+            method: "updateRoot".to_string(),
+            nonce: 3,
+            gas_limit: 4_000_000,
+            calldata_hex: "0xaabb".to_string(),
+            attempts: vec![CrankTxAttempt {
+                tx_hash: raw_tx_hash(&raw),
+                raw_tx_hex: format!("0x{}", hex::encode(&raw)),
+                max_priority_fee_per_gas: 1_000_000_000,
+                max_fee_per_gas: 31_000_000_000,
+                prepared_at: 1,
+                broadcast_at: None,
+            }],
+        };
+        let path_string = path.to_string_lossy().to_string();
+        journal.save(&path_string).unwrap();
+        let loaded = CrankTxJournal::load(&path_string, 1, signer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, journal);
+        validate_crank_journal_signed_payloads(&loaded, &key).unwrap();
+
+        journal.calldata_hex = "0xdead".to_string();
+        journal.save(&path_string).unwrap();
+        let tampered_fields = CrankTxJournal::load(&path_string, 1, signer)
+            .unwrap()
+            .unwrap();
+        assert!(validate_crank_journal_signed_payloads(&tampered_fields, &key).is_err());
+
+        journal.calldata_hex = "0xaabb".to_string();
+        journal.attempts[0].raw_tx_hex = "0x02c0".to_string();
+        journal.save(&path_string).unwrap();
+        assert!(CrankTxJournal::load(&path_string, 1, signer).is_err());
+        CrankTxJournal::clear(&path_string).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn crank_journal_requires_an_absolute_real_parent() {
+        assert!(validate_crank_journal_parent("relative.json").is_err());
+        let missing = std::env::temp_dir()
+            .join("privacy-indexer-no-such-journal-parent")
+            .join("pending.json");
+        assert!(validate_crank_journal_parent(&missing.to_string_lossy()).is_err());
     }
 
     #[test]
