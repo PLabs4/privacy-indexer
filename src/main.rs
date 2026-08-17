@@ -822,6 +822,9 @@ struct AppContext {
     /// False while the opt-in legacy frozen-path bootstrap is still running.
     frozen_paths_ready: Arc<AtomicBool>,
     contract_address: String,
+    /// Reviewed lower bound for this pool's deployment and event history.
+    /// Admission and metadata lookups must never fall back to genesis-wide scans.
+    start_block: u64,
     persist: Persist,
     /// Shared ordering lock used by chain replay and persistence-relevant HTTP writes.
     ingest_lock: Arc<tokio::sync::Mutex<()>>,
@@ -1020,6 +1023,7 @@ impl PoolBuilder {
             state: shared,
             frozen_paths_ready,
             contract_address: contract_address.to_string(),
+            start_block,
             persist,
             ingest_lock,
             batch_tx,
@@ -1047,6 +1051,9 @@ struct PoolRegistry {
     /// Fail health until at least one configured/discovered pool is ready.
     require_pool: bool,
     registry_file: Option<String>,
+    /// Global reviewed deployment floor used when a runtime registration omits
+    /// its pool-specific start block.
+    default_start_block: u64,
     /// Cache of addresses already verified as genuine pERC20 assets (lowercase
     /// 0x). Avoids a repeat `eth_getLogs` on every re-registration attempt.
     verified_pools: Arc<RwLock<HashSet<String>>>,
@@ -1315,7 +1322,8 @@ impl PoolRegistry {
         persist: bool,
     ) -> Result<bool> {
         let address = normalize_hex_0x(raw_addr).to_lowercase();
-        if !self.verify_pool_admitted(&address).await? {
+        let start_block = effective_pool_start_block(start_block, self.default_start_block);
+        if !self.verify_pool_admitted(&address, start_block).await? {
             return Err(anyhow!(
                 "pool {address} is not from a trusted factory or explicit static allowlist"
             ));
@@ -1375,11 +1383,12 @@ impl PoolRegistry {
     /// Confirm pool provenance from a trusted factory event or the explicit
     /// standalone allowlist, and pin its runtime bytecode hash. A pool's own
     /// self-emitted genesis event is supplemental metadata, never trust evidence.
-    async fn verify_pool_admitted(&self, pool_lc: &str) -> Result<bool> {
+    async fn verify_pool_admitted(&self, pool_lc: &str, start_block: u64) -> Result<bool> {
         if self.verified_pools.read().await.contains(pool_lc) {
             return Ok(true);
         }
-        if let Some(provenance) = self.resolve_pool_provenance(pool_lc).await? {
+        let start_block = effective_pool_start_block(start_block, self.default_start_block);
+        if let Some(provenance) = self.resolve_pool_provenance(pool_lc, start_block).await? {
             self.ensure_pool_protocol(pool_lc).await?;
             self.verified_pools
                 .write()
@@ -1410,10 +1419,19 @@ impl PoolRegistry {
             .cloned()
         {
             Some(value) => value,
-            None => match self.resolve_pool_provenance(pool_lc).await? {
-                Some(value) => value,
-                None => return Ok(false),
-            },
+            None => {
+                let start_block = self
+                    .pools
+                    .read()
+                    .await
+                    .get(pool_lc)
+                    .map(|ctx| ctx.start_block)
+                    .unwrap_or(self.default_start_block);
+                match self.resolve_pool_provenance(pool_lc, start_block).await? {
+                    Some(value) => value,
+                    None => return Ok(false),
+                }
+            }
         };
         match provenance {
             PoolProvenance::Static => Ok(true),
@@ -1430,7 +1448,11 @@ impl PoolRegistry {
         }
     }
 
-    async fn resolve_pool_provenance(&self, pool_lc: &str) -> Result<Option<PoolProvenance>> {
+    async fn resolve_pool_provenance(
+        &self,
+        pool_lc: &str,
+        start_block: u64,
+    ) -> Result<Option<PoolProvenance>> {
         let codehash = self.builder.rpc.runtime_codehash(pool_lc).await?;
         if !self.admission.pool_codehashes.contains(&codehash) {
             return Ok(None);
@@ -1442,7 +1464,7 @@ impl PoolRegistry {
             if self
                 .builder
                 .rpc
-                .was_pool_deployed_by(&factory, pool_lc, &topic0)
+                .was_pool_deployed_by(&factory, pool_lc, &topic0, start_block)
                 .await?
                 && self
                     .builder
@@ -1506,7 +1528,19 @@ impl PoolRegistry {
         if let Some(m) = self.metadata.read().await.get(pool_lc).cloned() {
             return Some(m);
         }
-        match self.builder.rpc.fetch_pool_metadata(pool_lc).await {
+        let start_block = self
+            .pools
+            .read()
+            .await
+            .get(pool_lc)
+            .map(|ctx| ctx.start_block)
+            .unwrap_or(self.default_start_block);
+        match self
+            .builder
+            .rpc
+            .fetch_pool_metadata(pool_lc, start_block)
+            .await
+        {
             Ok(Some(meta)) => {
                 self.metadata
                     .write()
@@ -2161,6 +2195,7 @@ async fn main() -> Result<()> {
         allow_runtime_pool_registration: cli.allow_runtime_pool_registration,
         require_pool: cli.shadow_mode || cli.discover_pools || !cli.contract_address.is_empty(),
         registry_file: cli.pools_registry.clone(),
+        default_start_block: cli.start_block,
         verified_pools: Arc::new(RwLock::new(HashSet::new())),
         verified_pool_provenance: Arc::new(RwLock::new(HashMap::new())),
         metadata: Arc::new(RwLock::new(HashMap::new())),
@@ -3732,7 +3767,8 @@ async fn register_pool(
         ));
     }
     let addr_lc = normalize_hex_0x(&req.contract_address).to_lowercase();
-    match reg.verify_pool_admitted(&addr_lc).await {
+    let start_block = effective_pool_start_block(req.start_block, reg.default_start_block);
+    match reg.verify_pool_admitted(&addr_lc, start_block).await {
         Ok(true) => {}
         Ok(false) => {
             return Err((
@@ -3749,7 +3785,7 @@ async fn register_pool(
         }
     }
     let added = reg
-        .add_admitted_pool(&req.contract_address, req.start_block, true)
+        .add_admitted_pool(&req.contract_address, start_block, true)
         .await
         .map_err(|e| {
             (
@@ -3768,7 +3804,7 @@ async fn register_pool(
         Json(serde_json::json!({
             "pool": address,
             "added": added,
-            "start_block": req.start_block,
+            "start_block": start_block,
         })),
     ))
 }
@@ -11336,6 +11372,17 @@ fn getlogs_window_end(lo: u64, to: u64, span: u64) -> u64 {
     lo.saturating_add(span.max(1) - 1).min(to)
 }
 
+/// Resolve an omitted per-pool floor to the environment's reviewed deployment
+/// floor. Keeping this decision in one place prevents runtime registration from
+/// silently reintroducing a genesis-wide admission or metadata query.
+fn effective_pool_start_block(requested: u64, default_start_block: u64) -> u64 {
+    if requested == 0 {
+        default_start_block
+    } else {
+        requested
+    }
+}
+
 #[derive(Clone)]
 struct RpcClient {
     http: Client,
@@ -11743,46 +11790,76 @@ impl RpcClient {
     /// Fetch pool metadata by reading the pool's genesis event. Returns shield-pool metadata
     /// (scale/underlying/name/symbol/decimals) when `ShieldPoolCreated` is present, else issuer
     /// metadata (name/symbol/decimals) from `Perc20Created`, else `None`.
-    async fn fetch_pool_metadata(&self, pool: &str) -> Result<Option<PoolMeta>> {
+    async fn fetch_pool_metadata(&self, pool: &str, start_block: u64) -> Result<Option<PoolMeta>> {
         let addr = normalize_hex_0x(pool);
         let topic1 = format!("0x{:0>64}", addr.trim_start_matches("0x"));
-        // Prefer the shield-pool genesis event (carries scale + underlying).
-        let shield_filter = serde_json::json!({
-            "fromBlock": "0x0",
-            "toBlock":   "finalized",
-            "address":   addr,
-            "topics":    [shield_pool_created_topic0_hex(), topic1],
-        });
-        let logs: Vec<EthLog> = self
-            .rpc_call("eth_getLogs", serde_json::json!([shield_filter]))
-            .await
-            .context("eth_getLogs (ShieldPoolCreated metadata) failed")?;
-        self.validate_canonical_logs(&logs).await?;
-        if let Some(l) = logs.first() {
-            if let Some(topics) = l.topics.as_ref() {
-                if let Ok(d) = decode_shield_pool_created_log(topics, &l.data) {
-                    return Ok(Some(PoolMeta::from_shield_pool(&addr, &d)));
+        let shield_topic = shield_pool_created_topic0_hex();
+        let issuer_topic = perc20_created_topic0();
+        let (head, _) = self.finalized_block().await?;
+        let mut lo = start_block;
+        while lo <= head {
+            let hi = getlogs_window_end(lo, head, self.getlogs_span());
+            // Both supported genesis events are queried together so an issuer
+            // pool does not require scanning the entire chain once for the absent
+            // shield event before falling back to Perc20Created.
+            let filter = serde_json::json!({
+                "fromBlock": format!("0x{lo:x}"),
+                "toBlock":   format!("0x{hi:x}"),
+                "address":   addr.clone(),
+                "topics":    [[shield_topic.clone(), issuer_topic.clone()], topic1.clone()],
+            });
+            let logs: Vec<EthLog> = match self
+                .rpc_call("eth_getLogs", serde_json::json!([filter]))
+                .await
+            {
+                Ok(logs) => logs,
+                Err(error) if hi > lo && is_getlogs_range_error(&error) => {
+                    self.shrink_getlogs_span(hi - lo + 1);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("eth_getLogs (pool metadata) [{lo},{hi}] failed"))
+                }
+            };
+            self.validate_canonical_logs(&logs).await?;
+
+            // Prefer the shield-pool event because it carries scale + underlying.
+            for log in &logs {
+                if log
+                    .topics
+                    .as_ref()
+                    .and_then(|topics| topics.first())
+                    .map(|topic| topic.eq_ignore_ascii_case(&shield_topic))
+                    .unwrap_or(false)
+                {
+                    if let Some(topics) = log.topics.as_ref() {
+                        if let Ok(decoded) = decode_shield_pool_created_log(topics, &log.data) {
+                            return Ok(Some(PoolMeta::from_shield_pool(&addr, &decoded)));
+                        }
+                    }
                 }
             }
-        }
-        // Fall back to issuer genesis (name/symbol/decimals only).
-        let issuer_filter = serde_json::json!({
-            "fromBlock": "0x0",
-            "toBlock":   "finalized",
-            "address":   addr,
-            "topics":    [perc20_created_topic0(), topic1],
-        });
-        let logs: Vec<EthLog> = self
-            .rpc_call("eth_getLogs", serde_json::json!([issuer_filter]))
-            .await
-            .context("eth_getLogs (Perc20Created metadata) failed")?;
-        self.validate_canonical_logs(&logs).await?;
-        if let Some(l) = logs.first() {
-            if let Some(meta) = PoolMeta::try_from_perc20_created(&addr, &l.data) {
-                return Ok(Some(meta));
+            for log in &logs {
+                if log
+                    .topics
+                    .as_ref()
+                    .and_then(|topics| topics.first())
+                    .map(|topic| topic.eq_ignore_ascii_case(&issuer_topic))
+                    .unwrap_or(false)
+                {
+                    if let Some(meta) = PoolMeta::try_from_perc20_created(&addr, &log.data) {
+                        return Ok(Some(meta));
+                    }
+                    // Event present but body not decodable — still a known issuer pool.
+                    return Ok(Some(PoolMeta::issuer_minimal(&addr)));
+                }
             }
-            // Event present but body not decodable — still a known issuer pool.
-            return Ok(Some(PoolMeta::issuer_minimal(&addr)));
+
+            if hi == u64::MAX {
+                break;
+            }
+            lo = hi + 1;
         }
         Ok(None)
     }
@@ -11849,21 +11926,46 @@ impl RpcClient {
         factory: &str,
         pool: &str,
         event_topic: &str,
+        start_block: u64,
     ) -> Result<bool> {
-        let filter = serde_json::json!({
-            "fromBlock": "0x0",
-            "toBlock":   "finalized",
-            "address":   normalize_hex_0x(factory),
-            "topics":    [event_topic, address_to_topic(pool)],
-        });
-        let logs: Vec<EthLog> = self
-            .rpc_call("eth_getLogs", serde_json::json!([filter]))
-            .await
-            .with_context(|| format!("eth_getLogs deployment proof failed for pool {pool}"))?;
-        self.validate_canonical_logs(&logs).await?;
-        Ok(logs
-            .iter()
-            .any(|log| factory_log_matches(log, factory, event_topic, pool)))
+        let (head, _) = self.finalized_block().await?;
+        let mut lo = start_block;
+        while lo <= head {
+            let hi = getlogs_window_end(lo, head, self.getlogs_span());
+            let filter = serde_json::json!({
+                "fromBlock": format!("0x{lo:x}"),
+                "toBlock":   format!("0x{hi:x}"),
+                "address":   normalize_hex_0x(factory),
+                "topics":    [event_topic, address_to_topic(pool)],
+            });
+            let logs: Vec<EthLog> = match self
+                .rpc_call("eth_getLogs", serde_json::json!([filter]))
+                .await
+            {
+                Ok(logs) => logs,
+                Err(error) if hi > lo && is_getlogs_range_error(&error) => {
+                    self.shrink_getlogs_span(hi - lo + 1);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("eth_getLogs deployment proof failed for pool {pool} [{lo},{hi}]")
+                    })
+                }
+            };
+            self.validate_canonical_logs(&logs).await?;
+            if logs
+                .iter()
+                .any(|log| factory_log_matches(log, factory, event_topic, pool))
+            {
+                return Ok(true);
+            }
+            if hi == u64::MAX {
+                break;
+            }
+            lo = hi + 1;
+        }
+        Ok(false)
     }
 
     async fn pool_uses_factory_beacon(
@@ -12318,26 +12420,26 @@ mod tests {
         advance_cursor, batch_page_end, beacon_words_match, build_and_sign_eip1559_tx,
         build_tip_frozen_paths, canonical_guard, checkpoint_is_complete_finalized_boundary,
         classify_selector, compact_note_mutations, crank_gas_limit, crank_next_delay_secs,
-        decode_frozen_root_updated_log, decode_json_note_archive, eip1559_crank_fees,
-        eip1967_beacon_slot, encode_crank_root_calldata, export_segment_frozen_paths,
-        factory_log_matches, finalized_cursor_covers_block, freeze_confirmed_prefix,
-        frontier_from_leaves, frozen_count_after_delta, frozen_root_updated_topic0,
-        getlogs_window_end, is_getlogs_range_error, latest_upserted_note, nonempty_trimmed,
-        normalize_hex_0x, parse_address_set, parse_bool_flag, parse_bytes32_strict, parse_tx_meta,
-        perc20_deployed_topic0, persist_request_is_current, pg_append_cmx_leaves,
-        pg_append_merkle_nodes, pg_apply_note_mutations, pg_archive_seq_bound,
-        pg_begin_canonical_rebuild, pg_bulk_upsert_notes, pg_commit_incremental_replay,
-        pg_finish_canonical_rebuild, pg_load, pg_upgrade_legacy_compact_checkpoint,
-        push_incremental_replay_mutation, raw_tx_hash, replay_frozen_set, require_admin,
-        require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint, strip_0x,
-        unix_seconds, validate_crank_journal_parent, validate_crank_journal_signed_payloads,
-        validate_log_against_canonical, witness_from_nodes, witness_root_be, ArchivedNoteRow,
-        BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, CrankTxAttempt, CrankTxJournal,
-        EthLog, FrozenPathRecord, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
-        JsonNoteArchiveUpdate, NoteArchiveMutation, PendingRootUpdate, RecentEventIds, RpcClient,
-        StateBackend, StreamingFrontierBuilder, TipFreezeConfig, DEFAULT_MAX_BATCHES_IN_MEMORY,
-        MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS, MAX_TIP_FREEZE_PAGE_SIZE,
-        MAX_TIP_FREEZE_WORKERS,
+        decode_frozen_root_updated_log, decode_json_note_archive, effective_pool_start_block,
+        eip1559_crank_fees, eip1967_beacon_slot, encode_crank_root_calldata,
+        export_segment_frozen_paths, factory_log_matches, finalized_cursor_covers_block,
+        freeze_confirmed_prefix, frontier_from_leaves, frozen_count_after_delta,
+        frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
+        latest_upserted_note, nonempty_trimmed, normalize_hex_0x, parse_address_set,
+        parse_bool_flag, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
+        persist_request_is_current, pg_append_cmx_leaves, pg_append_merkle_nodes,
+        pg_apply_note_mutations, pg_archive_seq_bound, pg_begin_canonical_rebuild,
+        pg_bulk_upsert_notes, pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
+        pg_upgrade_legacy_compact_checkpoint, push_incremental_replay_mutation, raw_tx_hash,
+        replay_frozen_set, require_admin, require_relayer, required_witness_nodes, rlp_bytes,
+        rlp_list, rlp_uint, strip_0x, unix_seconds, validate_crank_journal_parent,
+        validate_crank_journal_signed_payloads, validate_log_against_canonical, witness_from_nodes,
+        witness_root_be, ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier,
+        CrankTxAttempt, CrankTxJournal, EthLog, FrozenPathRecord, FrozenUpdate, HourlyTxBudget,
+        IndexerCheckpoint, JsonNoteArchiveUpdate, NoteArchiveMutation, PendingRootUpdate,
+        RecentEventIds, RpcClient, StateBackend, StreamingFrontierBuilder, TipFreezeConfig,
+        DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS,
+        MAX_TIP_FREEZE_PAGE_SIZE, MAX_TIP_FREEZE_WORKERS,
     };
     use std::time::Instant;
 
@@ -15200,6 +15302,16 @@ mod tests {
         assert_eq!(getlogs_window_end(7, 100, 0), 7); // span 0 treated as 1
                                                       // No overflow at the top of the u64 range.
         assert_eq!(getlogs_window_end(u64::MAX - 1, u64::MAX, 5_000), u64::MAX);
+    }
+
+    #[test]
+    fn omitted_pool_start_uses_reviewed_global_floor() {
+        assert_eq!(effective_pool_start_block(0, 11_506_049), 11_506_049);
+        assert_eq!(
+            effective_pool_start_block(11_506_075, 11_506_049),
+            11_506_075
+        );
+        assert_eq!(effective_pool_start_block(0, 0), 0);
     }
 
     #[test]
