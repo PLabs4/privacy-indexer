@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
+    body::{to_bytes, Body},
     extract::{DefaultBodyLimit, Query, State},
     http::{HeaderMap, Method, Request, StatusCode},
     middleware::{self, Next},
@@ -131,6 +132,18 @@ const DEFAULT_TIP_FREEZE_PAGE_SIZE: usize = 4_096;
 const MAX_TIP_FREEZE_PAGE_SIZE: usize = 16_384;
 const DEFAULT_TIP_FREEZE_WORKERS: usize = 4;
 const MAX_TIP_FREEZE_WORKERS: usize = 32;
+const DEFAULT_MERKLE_PATH_CONCURRENCY: usize = 16;
+const DEFAULT_MERKLE_PATH_MAX_RESPONSE_BYTES: usize = 128 * 1024;
+const DEFAULT_MERKLE_PATH_HOURLY_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_MERKLE_PATH_DAILY_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PublicApiMode {
+    /// Backwards-compatible developer/internal behavior.
+    Full,
+    /// Public callers receive only health and immutable frozen Merkle paths.
+    Minimal,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -168,6 +181,42 @@ struct Cli {
         default_value = "127.0.0.1:8787"
     )]
     bind: String,
+    /// Public HTTP surface. `minimal` removes historical/browser APIs while an
+    /// independent internal bearer token retains them for reviewed services.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_PUBLIC_API_MODE",
+        default_value = "full",
+        value_enum
+    )]
+    public_api_mode: PublicApiMode,
+    /// Global concurrency fuse for the only retained public data route.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_MERKLE_PATH_MAX_CONCURRENCY",
+        default_value_t = DEFAULT_MERKLE_PATH_CONCURRENCY
+    )]
+    merkle_path_max_concurrency: usize,
+    /// Maximum serialized body accepted from the Merkle path handler.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_MERKLE_PATH_MAX_RESPONSE_BYTES",
+        default_value_t = DEFAULT_MERKLE_PATH_MAX_RESPONSE_BYTES
+    )]
+    merkle_path_max_response_bytes: usize,
+    /// Process-wide hard egress budget. Buckets reset on UTC wall-clock boundaries.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_MERKLE_PATH_HOURLY_BYTES",
+        default_value_t = DEFAULT_MERKLE_PATH_HOURLY_BYTES
+    )]
+    merkle_path_hourly_bytes: u64,
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_MERKLE_PATH_DAILY_BYTES",
+        default_value_t = DEFAULT_MERKLE_PATH_DAILY_BYTES
+    )]
+    merkle_path_daily_bytes: u64,
     #[arg(long, default_value_t = DEFAULT_MAX_BATCHES_IN_MEMORY)]
     max_batches_in_memory: usize,
     /// Path to a JSON file for persisting the last scanned block height.
@@ -1078,6 +1127,14 @@ struct PoolRegistry {
     admin_token: Option<Arc<str>>,
     /// Separate token used only by the relayer to wake receipt recovery.
     relayer_token: Option<Arc<str>>,
+    /// Independent read token for Official Prover/Store/Relayer/LP Bot. It does
+    /// not authorize admin writes or relayer notifications by itself.
+    internal_read_token: Option<Arc<str>>,
+    public_api_mode: PublicApiMode,
+    egress_metrics: Arc<EgressMetrics>,
+    merkle_path_semaphore: Arc<Semaphore>,
+    merkle_path_max_response_bytes: usize,
+    merkle_path_budget: Arc<Mutex<EgressBudget>>,
     /// Bounds expensive runtime registration RPC work.
     write_semaphore: Arc<Semaphore>,
     /// Bounds archive reads and their JSON serialization. Historical catch-up
@@ -1087,6 +1144,74 @@ struct PoolRegistry {
     /// Single-flight cache so Browser polling cannot cause repeated aggregate
     /// reads. PostgreSQL refreshes it from the compact one-row-per-tx index.
     system_stats_cache: Arc<Mutex<Option<(Instant, u64)>>>,
+}
+
+#[derive(Default)]
+struct EgressMetrics {
+    merkle_path_requests: AtomicU64,
+    merkle_path_bytes: AtomicU64,
+    merkle_path_2xx: AtomicU64,
+    merkle_path_4xx: AtomicU64,
+    merkle_path_5xx: AtomicU64,
+    merkle_path_limited: AtomicU64,
+    public_denied: AtomicU64,
+}
+
+#[derive(Debug)]
+struct EgressBudget {
+    hour_bucket: u64,
+    day_bucket: u64,
+    hour_bytes: u64,
+    day_bytes: u64,
+    max_hour_bytes: u64,
+    max_day_bytes: u64,
+}
+
+impl EgressBudget {
+    fn new(max_hour_bytes: u64, max_day_bytes: u64) -> Self {
+        Self {
+            hour_bucket: 0,
+            day_bucket: 0,
+            hour_bytes: 0,
+            day_bytes: 0,
+            max_hour_bytes,
+            max_day_bytes,
+        }
+    }
+
+    fn refresh(&mut self, now: u64) {
+        let hour = now / 3_600;
+        let day = now / 86_400;
+        if self.hour_bucket != hour {
+            self.hour_bucket = hour;
+            self.hour_bytes = 0;
+        }
+        if self.day_bucket != day {
+            self.day_bucket = day;
+            self.day_bytes = 0;
+        }
+    }
+
+    fn has_capacity(&mut self, now: u64) -> bool {
+        self.refresh(now);
+        self.hour_bytes < self.max_hour_bytes && self.day_bytes < self.max_day_bytes
+    }
+
+    fn try_consume(&mut self, now: u64, bytes: u64) -> bool {
+        self.refresh(now);
+        let Some(next_hour) = self.hour_bytes.checked_add(bytes) else {
+            return false;
+        };
+        let Some(next_day) = self.day_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if next_hour > self.max_hour_bytes || next_day > self.max_day_bytes {
+            return false;
+        }
+        self.hour_bytes = next_hour;
+        self.day_bytes = next_day;
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2190,6 +2315,35 @@ async fn main() -> Result<()> {
             ));
         }
     }
+    let internal_read_token = std::env::var("PRIVACYBTC_INDEXER_INTERNAL_READ_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.len() < 32 {
+                Err(anyhow!(
+                    "PRIVACYBTC_INDEXER_INTERNAL_READ_TOKEN must contain at least 32 characters"
+                ))
+            } else {
+                Ok(Arc::<str>::from(value))
+            }
+        })
+        .transpose()?;
+    if cli.public_api_mode == PublicApiMode::Minimal && internal_read_token.is_none() {
+        return Err(anyhow!(
+            "minimal public API mode requires PRIVACYBTC_INDEXER_INTERNAL_READ_TOKEN"
+        ));
+    }
+    if cli.merkle_path_max_concurrency == 0
+        || cli.merkle_path_max_response_bytes == 0
+        || cli.merkle_path_hourly_bytes == 0
+        || cli.merkle_path_daily_bytes == 0
+        || cli.merkle_path_daily_bytes < cli.merkle_path_hourly_bytes
+    {
+        return Err(anyhow!(
+            "Merkle path egress limits must be positive and daily bytes must be >= hourly bytes"
+        ));
+    }
     let registry = PoolRegistry {
         pools: Arc::new(RwLock::new(HashMap::new())),
         primary: Arc::new(RwLock::new(None)),
@@ -2216,6 +2370,15 @@ async fn main() -> Result<()> {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
             .map(Arc::<str>::from),
+        internal_read_token,
+        public_api_mode: cli.public_api_mode,
+        egress_metrics: Arc::new(EgressMetrics::default()),
+        merkle_path_semaphore: Arc::new(Semaphore::new(cli.merkle_path_max_concurrency)),
+        merkle_path_max_response_bytes: cli.merkle_path_max_response_bytes,
+        merkle_path_budget: Arc::new(Mutex::new(EgressBudget::new(
+            cli.merkle_path_hourly_bytes,
+            cli.merkle_path_daily_bytes,
+        ))),
         write_semaphore: Arc::new(Semaphore::new(2)),
         history_read_semaphore: Arc::new(Semaphore::new(HISTORY_READ_CONCURRENCY)),
         system_stats_cache: Arc::new(Mutex::new(None)),
@@ -2331,6 +2494,7 @@ async fn main() -> Result<()> {
         .route("/frozen_root", get(get_frozen_root))
         .route("/frozen_updates", get(get_frozen_updates))
         .route("/frozen_leaves", get(get_frozen_leaves))
+        .route("/internal/egress_metrics", get(get_egress_metrics))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -3559,6 +3723,71 @@ fn require_relayer(
     Ok(())
 }
 
+fn bearer_matches(headers: &HeaderMap, token: Option<&Arc<str>>) -> bool {
+    let Some(expected) = token else {
+        return false;
+    };
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|supplied| !supplied.is_empty() && supplied == expected.as_ref())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiAccess {
+    Allow,
+    Gone,
+    Hidden,
+}
+
+fn public_api_access(
+    mode: PublicApiMode,
+    method: &Method,
+    path: &str,
+    internal_read: bool,
+) -> ApiAccess {
+    let read_method = method == Method::GET || method == Method::HEAD || method == Method::OPTIONS;
+    if path == "/internal/egress_metrics" {
+        return if internal_read && read_method {
+            ApiAccess::Allow
+        } else {
+            ApiAccess::Hidden
+        };
+    }
+    if mode == PublicApiMode::Full {
+        return ApiAccess::Allow;
+    }
+    // The internal token is read-only by construction. It can never open a
+    // POST/PUT/PATCH/DELETE route; those continue through their distinct admin
+    // or relayer authorization paths below.
+    if internal_read && read_method {
+        return ApiAccess::Allow;
+    }
+    if read_method && (path == "/healthz" || path == "/merkle_path") {
+        return ApiAccess::Allow;
+    }
+    // Permit only these two POSTs to reach their existing, independent token
+    // validators. No internal-read credential is consulted by those handlers.
+    if method == Method::POST && (path == "/notify_tx" || path == "/pools") {
+        return ApiAccess::Allow;
+    }
+    if read_method
+        && matches!(
+            path,
+            "/batches" | "/batches/page" | "/batches/stream" | "/txs"
+        )
+    {
+        ApiAccess::Gone
+    } else {
+        ApiAccess::Hidden
+    }
+}
+
+fn is_public_merkle_path(path: &str, internal_read: bool) -> bool {
+    path == "/merkle_path" && !internal_read
+}
+
 // ─── HTTP handlers ────────────────────────────────────────────────────────────
 
 fn canonical_guard(tree_out_of_order: bool) -> Result<(), (StatusCode, String)> {
@@ -3603,7 +3832,71 @@ async fn canonical_api_gate(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let path = request.uri().path();
+    let path = request.uri().path().to_owned();
+    let method = request.method().clone();
+    let internal_read = bearer_matches(request.headers(), reg.internal_read_token.as_ref());
+    match public_api_access(reg.public_api_mode, &method, &path, internal_read) {
+        ApiAccess::Allow => {}
+        ApiAccess::Gone => {
+            reg.egress_metrics
+                .public_denied
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return (StatusCode::GONE, "public historical API is disabled").into_response();
+        }
+        ApiAccess::Hidden => {
+            reg.egress_metrics
+                .public_denied
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    // Anonymous public reads consume the traffic/cost fuse. Authenticated
+    // internal services remain available even when abusive public traffic has
+    // exhausted that budget; their access is protected by the separate
+    // read-only bearer token and private network boundary.
+    let public_merkle_path = is_public_merkle_path(&path, internal_read);
+    let _merkle_path_permit = if public_merkle_path {
+        reg.egress_metrics
+            .merkle_path_requests
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        let permit = match reg.merkle_path_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                reg.egress_metrics
+                    .merkle_path_4xx
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                reg.egress_metrics
+                    .merkle_path_limited
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Merkle path concurrency limit",
+                )
+                    .into_response();
+            }
+        };
+        if !reg
+            .merkle_path_budget
+            .lock()
+            .await
+            .has_capacity(unix_seconds())
+        {
+            reg.egress_metrics
+                .merkle_path_4xx
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            reg.egress_metrics
+                .merkle_path_limited
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Merkle path egress budget exhausted",
+            )
+                .into_response();
+        }
+        Some(permit)
+    } else {
+        None
+    };
     if path == "/status" || path == "/healthz" {
         return next.run(request).await;
     }
@@ -3613,7 +3906,73 @@ async fn canonical_api_gate(
             return error.into_response();
         }
     }
-    next.run(request).await
+    let response = next.run(request).await;
+    if !public_merkle_path {
+        return response;
+    }
+    let response_status = response.status();
+    let (parts, body) = response.into_parts();
+    match to_bytes(body, reg.merkle_path_max_response_bytes).await {
+        Ok(bytes) => {
+            if !reg
+                .merkle_path_budget
+                .lock()
+                .await
+                .try_consume(unix_seconds(), bytes.len() as u64)
+            {
+                reg.egress_metrics
+                    .merkle_path_4xx
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                reg.egress_metrics
+                    .merkle_path_limited
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Merkle path egress budget exhausted",
+                )
+                    .into_response();
+            }
+            match response_status.as_u16() {
+                200..=299 => &reg.egress_metrics.merkle_path_2xx,
+                400..=499 => &reg.egress_metrics.merkle_path_4xx,
+                _ => &reg.egress_metrics.merkle_path_5xx,
+            }
+            .fetch_add(1, AtomicOrdering::Relaxed);
+            reg.egress_metrics
+                .merkle_path_bytes
+                .fetch_add(bytes.len() as u64, AtomicOrdering::Relaxed);
+            Response::from_parts(parts, Body::from(bytes))
+        }
+        Err(error) => {
+            reg.egress_metrics
+                .merkle_path_5xx
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("measure /merkle_path response: {error}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_egress_metrics(State(reg): State<PoolRegistry>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "schema": "privacy-indexer-egress/v1",
+        "public_api_mode": match reg.public_api_mode {
+            PublicApiMode::Full => "full",
+            PublicApiMode::Minimal => "minimal",
+        },
+        "merkle_path": {
+            "requests": reg.egress_metrics.merkle_path_requests.load(AtomicOrdering::Relaxed),
+            "bytes": reg.egress_metrics.merkle_path_bytes.load(AtomicOrdering::Relaxed),
+            "status_2xx": reg.egress_metrics.merkle_path_2xx.load(AtomicOrdering::Relaxed),
+            "status_4xx": reg.egress_metrics.merkle_path_4xx.load(AtomicOrdering::Relaxed),
+            "status_5xx": reg.egress_metrics.merkle_path_5xx.load(AtomicOrdering::Relaxed),
+            "limited": reg.egress_metrics.merkle_path_limited.load(AtomicOrdering::Relaxed),
+        },
+        "public_denied": reg.egress_metrics.public_denied.load(AtomicOrdering::Relaxed),
+    }))
 }
 
 async fn healthz(State(reg): State<PoolRegistry>) -> Result<&'static str, (StatusCode, String)> {
@@ -12498,21 +12857,23 @@ mod tests {
         export_segment_frozen_paths, factory_log_matches, finalized_cursor_covers_block,
         freeze_confirmed_prefix, frontier_from_leaves, frozen_count_after_delta,
         frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
-        latest_upserted_note, nonempty_trimmed, normalize_hex_0x, parse_address_set,
-        parse_bool_flag, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
-        persist_request_is_current, pg_append_cmx_leaves, pg_append_merkle_nodes,
-        pg_apply_note_mutations, pg_archive_seq_bound, pg_begin_canonical_rebuild,
-        pg_bulk_upsert_notes, pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
-        pg_upgrade_legacy_compact_checkpoint, push_incremental_replay_mutation, raw_tx_hash,
-        replay_frozen_set, require_admin, require_relayer, required_witness_nodes, rlp_bytes,
-        rlp_list, rlp_uint, strip_0x, unix_seconds, validate_crank_journal_parent,
+        is_public_merkle_path, latest_upserted_note, nonempty_trimmed, normalize_hex_0x,
+        parse_address_set, parse_bool_flag, parse_bytes32_strict, parse_tx_meta,
+        perc20_deployed_topic0, persist_request_is_current, pg_append_cmx_leaves,
+        pg_append_merkle_nodes, pg_apply_note_mutations, pg_archive_seq_bound,
+        pg_begin_canonical_rebuild, pg_bulk_upsert_notes, pg_commit_incremental_replay,
+        pg_finish_canonical_rebuild, pg_load, pg_upgrade_legacy_compact_checkpoint,
+        public_api_access, push_incremental_replay_mutation, raw_tx_hash, replay_frozen_set,
+        require_admin, require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint,
+        strip_0x, unix_seconds, validate_crank_journal_parent,
         validate_crank_journal_signed_payloads, validate_log_against_canonical, witness_from_nodes,
-        witness_root_be, ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier,
-        CrankTxAttempt, CrankTxJournal, EthLog, FrozenPathRecord, FrozenUpdate, HourlyTxBudget,
-        IndexerCheckpoint, JsonNoteArchiveUpdate, NoteArchiveMutation, PendingRootUpdate,
-        RecentEventIds, RpcClient, StateBackend, StreamingFrontierBuilder, TipFreezeConfig,
-        DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS,
-        MAX_TIP_FREEZE_PAGE_SIZE, MAX_TIP_FREEZE_WORKERS,
+        witness_root_be, ApiAccess, ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli,
+        CompactFrontier, CrankTxAttempt, CrankTxJournal, EgressBudget, EthLog, FrozenPathRecord,
+        FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
+        NoteArchiveMutation, PendingRootUpdate, PublicApiMode, RecentEventIds, RpcClient,
+        StateBackend, StreamingFrontierBuilder, TipFreezeConfig, DEFAULT_MAX_BATCHES_IN_MEMORY,
+        MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS, MAX_TIP_FREEZE_PAGE_SIZE,
+        MAX_TIP_FREEZE_WORKERS,
     };
     use std::time::Instant;
 
@@ -12718,7 +13079,7 @@ mod tests {
         assert!(d.cmx_changed.is_empty());
         assert!(d.is_add.is_empty());
     }
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
     use clap::CommandFactory;
     use ff::PrimeField;
     use halo2curves::bn256::Fr;
@@ -15213,6 +15574,64 @@ mod tests {
             HeaderValue::from_static("Bearer relayer-secret"),
         );
         assert!(require_relayer(&headers, Some(&token)).is_ok());
+    }
+
+    #[test]
+    fn minimal_public_api_exposes_only_health_and_frozen_paths() {
+        assert_eq!(
+            public_api_access(PublicApiMode::Minimal, &Method::GET, "/healthz", false),
+            ApiAccess::Allow
+        );
+        assert_eq!(
+            public_api_access(PublicApiMode::Minimal, &Method::GET, "/merkle_path", false),
+            ApiAccess::Allow
+        );
+        assert_eq!(
+            public_api_access(PublicApiMode::Minimal, &Method::GET, "/batches/page", false),
+            ApiAccess::Gone
+        );
+        assert_eq!(
+            public_api_access(PublicApiMode::Minimal, &Method::GET, "/status", false),
+            ApiAccess::Hidden
+        );
+    }
+
+    #[test]
+    fn merkle_path_egress_budget_is_hard_bounded_and_resets_by_utc_bucket() {
+        let mut budget = EgressBudget::new(100, 250);
+        assert!(budget.has_capacity(3_600));
+        assert!(budget.try_consume(3_600, 60));
+        assert!(!budget.try_consume(3_600, 41));
+        // New hour resets only the hourly bucket; the daily total remains 60.
+        assert!(budget.try_consume(7_200, 100));
+        assert!(!budget.try_consume(10_800, 91));
+        // New UTC day resets both buckets.
+        assert!(budget.try_consume(86_400, 100));
+    }
+
+    #[test]
+    fn internal_merkle_path_does_not_consume_the_public_egress_fuse() {
+        assert!(is_public_merkle_path("/merkle_path", false));
+        assert!(!is_public_merkle_path("/merkle_path", true));
+        assert!(!is_public_merkle_path("/status", false));
+    }
+
+    #[test]
+    fn internal_read_token_never_authorizes_mutation_routes() {
+        assert_eq!(
+            public_api_access(PublicApiMode::Minimal, &Method::GET, "/status", true),
+            ApiAccess::Allow
+        );
+        assert_eq!(
+            public_api_access(PublicApiMode::Minimal, &Method::DELETE, "/pools", true),
+            ApiAccess::Hidden
+        );
+        // POST reaches the pre-existing admin validator, not an internal-token
+        // bypass. The pure gate does not itself authorize the operation.
+        assert_eq!(
+            public_api_access(PublicApiMode::Minimal, &Method::POST, "/pools", true),
+            ApiAccess::Allow
+        );
     }
 
     #[test]
