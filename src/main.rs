@@ -242,6 +242,11 @@ struct Cli {
     /// First block to scan when no checkpoint exists; resume never goes below this.
     #[arg(long, env = "PRIVACYBTC_START_BLOCK", default_value_t = 0)]
     start_block: u64,
+    /// Number of blocks required before an event is ingested. `0` preserves the
+    /// chain's `finalized` boundary; `1` accepts the current mined/latest block.
+    /// Values above one scan through `latest - (confirmations - 1)`.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_CONFIRMATIONS", default_value_t = 0)]
+    confirmations: u64,
     /// Hex-encoded secp256k1 private key for the indexer's crank signing account.
     /// Required when --crank is enabled.
     #[arg(long, env = "PRIVACYBTC_INDEXER_SIGNER_KEY")]
@@ -1999,7 +2004,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let rpc = RpcClient::new(cli.rpc_url.clone());
+    let rpc = RpcClient::new(cli.rpc_url.clone(), cli.confirmations);
     let note_confirmed = cli
         .confirm_topic0
         .as_deref()
@@ -2424,7 +2429,7 @@ async fn pool_discovery_task(
 ) {
     let mut from = start_block;
     loop {
-        if let Ok((head, _)) = rpc.finalized_block().await {
+        if let Ok((head, _)) = rpc.confirmation_head().await {
             let mut lo = from;
             while lo <= head {
                 let hi = getlogs_window_end(lo, head, rpc.getlogs_span());
@@ -4908,7 +4913,7 @@ async fn get_swap(
         .ok_or((StatusCode::BAD_REQUEST, "invalid swap_id hex".to_owned()))?;
     let coordinator = normalize_hex_0x(&q.coordinator).to_lowercase();
     let finalized = rpc
-        .finalized_block()
+        .confirmation_head()
         .await
         .map_err(|e| {
             (
@@ -9406,7 +9411,7 @@ async fn try_warm_start(ctx: &PollContext) -> Result<Option<u64>> {
     }
     let (finalized_head, _) = ctx
         .rpc
-        .finalized_block()
+        .confirmation_head()
         .await
         .context("resolve finalized head for warm-start")?;
     if !persisted_finalized_cursor_matches(ctx, finalized_head).await? {
@@ -9494,7 +9499,7 @@ async fn backfill_from_chain(ctx: &PollContext) -> Result<()> {
     let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
     let (head, finalized_hash) = ctx
         .rpc
-        .finalized_block()
+        .confirmation_head()
         .await
         .context("resolve finalized head for backfill")?;
     if !persisted_finalized_cursor_matches(ctx, head).await? {
@@ -9706,7 +9711,7 @@ fn advance_cursor(current: u64, head: u64) -> u64 {
 /// `next_block` advancing toward the finalized head instead of freezing.
 async fn catchup_from_chain(ctx: &PollContext) {
     let label = ctx.contract_address[..10.min(ctx.contract_address.len())].to_string();
-    let (head, finalized_hash) = match ctx.rpc.finalized_block().await {
+    let (head, finalized_hash) = match ctx.rpc.confirmation_head().await {
         Ok(value) => value,
         Err(_) => return, // transient RPC error — retry next tick from the same cursor
     };
@@ -10000,7 +10005,7 @@ async fn ingest_ws_log(ctx: &PollContext, log: EthLog) -> Result<()> {
 
     let mut visible = false;
     for attempt in 0u64..6 {
-        let (finalized_head, _) = ctx.rpc.finalized_block().await?;
+        let (finalized_head, _) = ctx.rpc.confirmation_head().await?;
         if block_number > finalized_head {
             // Monad publishes Voted logs before finalization. The periodic
             // catch-up will ingest this block after it becomes finalized.
@@ -10626,7 +10631,7 @@ async fn recover_pending_txs(ctx: &PollContext) {
     for tx_hash in hashes {
         match ctx.rpc.get_transaction_receipt_logs(&tx_hash).await {
             Ok(Some(receipt)) => {
-                let finalized = match ctx.rpc.finalized_block().await {
+                let finalized = match ctx.rpc.confirmation_head().await {
                     Ok(value) => value,
                     Err(e) => {
                         eprintln!(
@@ -11420,6 +11425,13 @@ fn getlogs_window_end(lo: u64, to: u64, span: u64) -> u64 {
     lo.saturating_add(span.max(1) - 1).min(to)
 }
 
+/// `confirmations=1` includes the mined tip itself; each additional confirmation
+/// moves the scan boundary back by one block. `0` is handled by the caller as the
+/// special finalized policy and therefore leaves its resolved tip unchanged.
+fn confirmation_head_number(tip: u64, confirmations: u64) -> u64 {
+    tip.saturating_sub(confirmations.saturating_sub(1))
+}
+
 /// Resolve an omitted per-pool floor to the environment's reviewed deployment
 /// floor. Keeping this decision in one place prevents runtime registration from
 /// silently reintroducing a genesis-wide admission or metadata query.
@@ -11435,6 +11447,9 @@ fn effective_pool_start_block(requested: u64, default_start_block: u64) -> u64 {
 struct RpcClient {
     http: Client,
     urls: Vec<String>,
+    /// `0` uses the RPC's finalized tag. Positive values count mined blocks,
+    /// where `1` means the current latest block.
+    confirmations: u64,
     /// Largest `eth_getLogs` block span the provider is known to accept.
     /// Starts at `GETLOGS_DEFAULT_SPAN` (or `PRIVACYBTC_INDEXER_GETLOGS_MAX_SPAN`)
     /// and only ever shrinks — halved each time the provider rejects a window,
@@ -11444,7 +11459,7 @@ struct RpcClient {
 }
 
 impl RpcClient {
-    fn new(url: String) -> Self {
+    fn new(url: String, confirmations: u64) -> Self {
         // HTTP RPC calls must use https:// / http://, not wss:// / ws://.
         let http_url = url
             .replacen("wss://", "https://", 1)
@@ -11496,6 +11511,7 @@ impl RpcClient {
         Self {
             http,
             urls,
+            confirmations,
             getlogs_span: Arc::new(AtomicU64::new(initial_span)),
         }
     }
@@ -11521,26 +11537,34 @@ impl RpcClient {
         effective
     }
 
-    /// Monad's authoritative event boundary. `eth_blockNumber` and ordinary
-    /// `latest` data can describe a Voted block that is still reversible; state
-    /// derived by the indexer only advances through this finalized header.
-    async fn finalized_block(&self) -> Result<(u64, String)> {
+    /// Resolve the configured canonical ingest boundary. Monad deployments keep
+    /// `confirmations=0` and therefore use `finalized`; Ethereum deployments may
+    /// explicitly select mined-block confirmations (one means `latest`).
+    async fn confirmation_head(&self) -> Result<(u64, String)> {
         #[derive(Deserialize)]
         struct BlockHeader {
             number: String,
             hash: String,
         }
+        let tag = if self.confirmations == 0 {
+            "finalized"
+        } else {
+            "latest"
+        };
         let header: Option<BlockHeader> = self
-            .rpc_call(
-                "eth_getBlockByNumber",
-                serde_json::json!(["finalized", false]),
-            )
+            .rpc_call("eth_getBlockByNumber", serde_json::json!([tag, false]))
             .await
-            .context("eth_getBlockByNumber(finalized)")?;
-        let header = header.ok_or_else(|| anyhow!("RPC returned no finalized block"))?;
-        let number = parse_hex_u64(&header.number).context("invalid finalized block number")?;
-        let hash = normalize_block_hash(&header.hash).context("invalid finalized block hash")?;
-        Ok((number, hash))
+            .with_context(|| format!("eth_getBlockByNumber({tag})"))?;
+        let header = header.ok_or_else(|| anyhow!("RPC returned no {tag} block"))?;
+        let tip =
+            parse_hex_u64(&header.number).with_context(|| format!("invalid {tag} block number"))?;
+        let tip_hash = normalize_block_hash(&header.hash)
+            .with_context(|| format!("invalid {tag} block hash"))?;
+        let head = confirmation_head_number(tip, self.confirmations);
+        if head == tip {
+            return Ok((head, tip_hash));
+        }
+        Ok((head, self.block_hash(head).await?))
     }
 
     async fn block_hash(&self, block: u64) -> Result<String> {
@@ -11843,7 +11867,7 @@ impl RpcClient {
         let topic1 = format!("0x{:0>64}", addr.trim_start_matches("0x"));
         let shield_topic = shield_pool_created_topic0_hex();
         let issuer_topic = perc20_created_topic0();
-        let (head, _) = self.finalized_block().await?;
+        let (head, _) = self.confirmation_head().await?;
         let mut lo = start_block;
         while lo <= head {
             let hi = getlogs_window_end(lo, head, self.getlogs_span());
@@ -11976,7 +12000,7 @@ impl RpcClient {
         event_topic: &str,
         start_block: u64,
     ) -> Result<bool> {
-        let (head, _) = self.finalized_block().await?;
+        let (head, _) = self.confirmation_head().await?;
         let mut lo = start_block;
         while lo <= head {
             let hi = getlogs_window_end(lo, head, self.getlogs_span());
@@ -12468,27 +12492,27 @@ mod tests {
         advance_cursor, batch_page_end, beacon_words_match, broadcasted_crank_attempts,
         build_and_sign_eip1559_tx, build_tip_frozen_paths, canonical_guard,
         checkpoint_is_complete_finalized_boundary, classify_selector, compact_note_mutations,
-        crank_gas_limit, crank_next_delay_secs, decode_frozen_root_updated_log,
-        decode_json_note_archive, effective_pool_start_block, eip1559_crank_fees,
-        eip1967_beacon_slot, encode_crank_root_calldata, export_segment_frozen_paths,
-        factory_log_matches, finalized_cursor_covers_block, freeze_confirmed_prefix,
-        frontier_from_leaves, frozen_count_after_delta, frozen_root_updated_topic0,
-        getlogs_window_end, is_getlogs_range_error, latest_upserted_note, nonempty_trimmed,
-        normalize_hex_0x, parse_address_set, parse_bool_flag, parse_bytes32_strict, parse_tx_meta,
-        perc20_deployed_topic0, persist_request_is_current, pg_append_cmx_leaves,
-        pg_append_merkle_nodes, pg_apply_note_mutations, pg_archive_seq_bound,
-        pg_begin_canonical_rebuild, pg_bulk_upsert_notes, pg_commit_incremental_replay,
-        pg_finish_canonical_rebuild, pg_load, pg_upgrade_legacy_compact_checkpoint,
-        push_incremental_replay_mutation, raw_tx_hash, replay_frozen_set, require_admin,
-        require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint, strip_0x,
-        unix_seconds, validate_crank_journal_parent, validate_crank_journal_signed_payloads,
-        validate_log_against_canonical, witness_from_nodes, witness_root_be, ArchivedNoteRow,
-        BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, CrankTxAttempt, CrankTxJournal,
-        EthLog, FrozenPathRecord, FrozenUpdate, HourlyTxBudget, IndexerCheckpoint,
-        JsonNoteArchiveUpdate, NoteArchiveMutation, PendingRootUpdate, RecentEventIds, RpcClient,
-        StateBackend, StreamingFrontierBuilder, TipFreezeConfig, DEFAULT_MAX_BATCHES_IN_MEMORY,
-        MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS, MAX_TIP_FREEZE_PAGE_SIZE,
-        MAX_TIP_FREEZE_WORKERS,
+        confirmation_head_number, crank_gas_limit, crank_next_delay_secs,
+        decode_frozen_root_updated_log, decode_json_note_archive, effective_pool_start_block,
+        eip1559_crank_fees, eip1967_beacon_slot, encode_crank_root_calldata,
+        export_segment_frozen_paths, factory_log_matches, finalized_cursor_covers_block,
+        freeze_confirmed_prefix, frontier_from_leaves, frozen_count_after_delta,
+        frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
+        latest_upserted_note, nonempty_trimmed, normalize_hex_0x, parse_address_set,
+        parse_bool_flag, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
+        persist_request_is_current, pg_append_cmx_leaves, pg_append_merkle_nodes,
+        pg_apply_note_mutations, pg_archive_seq_bound, pg_begin_canonical_rebuild,
+        pg_bulk_upsert_notes, pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
+        pg_upgrade_legacy_compact_checkpoint, push_incremental_replay_mutation, raw_tx_hash,
+        replay_frozen_set, require_admin, require_relayer, required_witness_nodes, rlp_bytes,
+        rlp_list, rlp_uint, strip_0x, unix_seconds, validate_crank_journal_parent,
+        validate_crank_journal_signed_payloads, validate_log_against_canonical, witness_from_nodes,
+        witness_root_be, ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier,
+        CrankTxAttempt, CrankTxJournal, EthLog, FrozenPathRecord, FrozenUpdate, HourlyTxBudget,
+        IndexerCheckpoint, JsonNoteArchiveUpdate, NoteArchiveMutation, PendingRootUpdate,
+        RecentEventIds, RpcClient, StateBackend, StreamingFrontierBuilder, TipFreezeConfig,
+        DEFAULT_MAX_BATCHES_IN_MEMORY, MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS,
+        MAX_TIP_FREEZE_PAGE_SIZE, MAX_TIP_FREEZE_WORKERS,
     };
     use std::time::Instant;
 
@@ -15382,6 +15406,24 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_boundary_counts_the_mined_tip_as_one_block() {
+        assert_eq!(confirmation_head_number(1_000, 0), 1_000);
+        assert_eq!(confirmation_head_number(1_000, 1), 1_000);
+        assert_eq!(confirmation_head_number(1_000, 2), 999);
+        assert_eq!(confirmation_head_number(2, 10), 0);
+
+        let command = Cli::command();
+        let confirmations = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "confirmations")
+            .expect("confirmations CLI argument");
+        assert_eq!(
+            confirmations.get_env(),
+            Some(std::ffi::OsStr::new("PRIVACYBTC_INDEXER_CONFIRMATIONS"))
+        );
+    }
+
+    #[test]
     fn omitted_pool_start_uses_reviewed_global_floor() {
         assert_eq!(effective_pool_start_block(0, 11_506_049), 11_506_049);
         assert_eq!(
@@ -15406,7 +15448,7 @@ mod tests {
 
     #[test]
     fn shrink_getlogs_span_halves_monotonically_with_floor_of_one() {
-        let rpc = RpcClient::new("http://127.0.0.1:1".to_string());
+        let rpc = RpcClient::new("http://127.0.0.1:1".to_string(), 0);
         let initial = rpc.getlogs_span();
         assert!(initial >= 1);
         // Provider rejected a 5000-block window: learn 2500.
