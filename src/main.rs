@@ -136,6 +136,11 @@ const DEFAULT_MERKLE_PATH_CONCURRENCY: usize = 16;
 const DEFAULT_MERKLE_PATH_MAX_RESPONSE_BYTES: usize = 128 * 1024;
 const DEFAULT_MERKLE_PATH_HOURLY_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_MERKLE_PATH_DAILY_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_TXS_CONCURRENCY: usize = 8;
+const DEFAULT_TXS_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const DEFAULT_TXS_HOURLY_BYTES: u64 = 128 * 1024 * 1024;
+const DEFAULT_TXS_DAILY_BYTES: u64 = 1024 * 1024 * 1024;
+const MINIMAL_TXS_MAX_LIMIT: usize = 25;
 /// Re-scan a short finalized tail so a provider that transiently returns an
 /// incomplete `eth_getLogs` result cannot permanently hide a newly-created
 /// pool. Explicit startup pools have an independent admission retry loop.
@@ -221,6 +226,31 @@ struct Cli {
         default_value_t = DEFAULT_MERKLE_PATH_DAILY_BYTES
     )]
     merkle_path_daily_bytes: u64,
+    /// Independent public Browser fuse. It cannot consume the Merkle-path budget.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_TXS_MAX_CONCURRENCY",
+        default_value_t = DEFAULT_TXS_CONCURRENCY
+    )]
+    txs_max_concurrency: usize,
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_TXS_MAX_RESPONSE_BYTES",
+        default_value_t = DEFAULT_TXS_MAX_RESPONSE_BYTES
+    )]
+    txs_max_response_bytes: usize,
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_TXS_HOURLY_BYTES",
+        default_value_t = DEFAULT_TXS_HOURLY_BYTES
+    )]
+    txs_hourly_bytes: u64,
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_TXS_DAILY_BYTES",
+        default_value_t = DEFAULT_TXS_DAILY_BYTES
+    )]
+    txs_daily_bytes: u64,
     #[arg(long, default_value_t = DEFAULT_MAX_BATCHES_IN_MEMORY)]
     max_batches_in_memory: usize,
     /// Path to a JSON file for persisting the last scanned block height.
@@ -1139,6 +1169,9 @@ struct PoolRegistry {
     merkle_path_semaphore: Arc<Semaphore>,
     merkle_path_max_response_bytes: usize,
     merkle_path_budget: Arc<Mutex<EgressBudget>>,
+    txs_semaphore: Arc<Semaphore>,
+    txs_max_response_bytes: usize,
+    txs_budget: Arc<Mutex<EgressBudget>>,
     /// Bounds expensive runtime registration RPC work.
     write_semaphore: Arc<Semaphore>,
     /// Bounds archive reads and their JSON serialization. Historical catch-up
@@ -1158,6 +1191,12 @@ struct EgressMetrics {
     merkle_path_4xx: AtomicU64,
     merkle_path_5xx: AtomicU64,
     merkle_path_limited: AtomicU64,
+    txs_requests: AtomicU64,
+    txs_bytes: AtomicU64,
+    txs_2xx: AtomicU64,
+    txs_4xx: AtomicU64,
+    txs_5xx: AtomicU64,
+    txs_limited: AtomicU64,
     public_denied: AtomicU64,
 }
 
@@ -2463,6 +2502,16 @@ async fn main() -> Result<()> {
             "Merkle path egress limits must be positive and daily bytes must be >= hourly bytes"
         ));
     }
+    if cli.txs_max_concurrency == 0
+        || cli.txs_max_response_bytes == 0
+        || cli.txs_hourly_bytes == 0
+        || cli.txs_daily_bytes == 0
+        || cli.txs_daily_bytes < cli.txs_hourly_bytes
+    {
+        return Err(anyhow!(
+            "Transaction-list egress limits must be positive and daily bytes must be >= hourly bytes"
+        ));
+    }
     let registry = PoolRegistry {
         pools: Arc::new(RwLock::new(HashMap::new())),
         primary: Arc::new(RwLock::new(None)),
@@ -2497,6 +2546,12 @@ async fn main() -> Result<()> {
         merkle_path_budget: Arc::new(Mutex::new(EgressBudget::new(
             cli.merkle_path_hourly_bytes,
             cli.merkle_path_daily_bytes,
+        ))),
+        txs_semaphore: Arc::new(Semaphore::new(cli.txs_max_concurrency)),
+        txs_max_response_bytes: cli.txs_max_response_bytes,
+        txs_budget: Arc::new(Mutex::new(EgressBudget::new(
+            cli.txs_hourly_bytes,
+            cli.txs_daily_bytes,
         ))),
         write_semaphore: Arc::new(Semaphore::new(2)),
         history_read_semaphore: Arc::new(Semaphore::new(HISTORY_READ_CONCURRENCY)),
@@ -3962,7 +4017,7 @@ fn public_api_access(
     if internal_read && read_method {
         return ApiAccess::Allow;
     }
-    if read_method && (path == "/healthz" || path == "/merkle_path") {
+    if read_method && (path == "/healthz" || path == "/merkle_path" || path == "/txs") {
         return ApiAccess::Allow;
     }
     // Permit only these two POSTs to reach their existing, independent token
@@ -3970,12 +4025,7 @@ fn public_api_access(
     if method == Method::POST && (path == "/notify_tx" || path == "/pools") {
         return ApiAccess::Allow;
     }
-    if read_method
-        && matches!(
-            path,
-            "/batches" | "/batches/page" | "/batches/stream" | "/txs"
-        )
-    {
+    if read_method && matches!(path, "/batches" | "/batches/page" | "/batches/stream") {
         ApiAccess::Gone
     } else {
         ApiAccess::Hidden
@@ -3984,6 +4034,10 @@ fn public_api_access(
 
 fn is_public_merkle_path(path: &str, internal_read: bool) -> bool {
     path == "/merkle_path" && !internal_read
+}
+
+fn is_public_txs(path: &str, internal_read: bool) -> bool {
+    path == "/txs" && !internal_read
 }
 
 // ─── HTTP handlers ────────────────────────────────────────────────────────────
@@ -4053,6 +4107,7 @@ async fn canonical_api_gate(
     // exhausted that budget; their access is protected by the separate
     // read-only bearer token and private network boundary.
     let public_merkle_path = is_public_merkle_path(&path, internal_read);
+    let public_txs = is_public_txs(&path, internal_read);
     let _merkle_path_permit = if public_merkle_path {
         reg.egress_metrics
             .merkle_path_requests
@@ -4095,6 +4150,43 @@ async fn canonical_api_gate(
     } else {
         None
     };
+    let _txs_permit = if public_txs {
+        reg.egress_metrics
+            .txs_requests
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        let permit = match reg.txs_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                reg.egress_metrics
+                    .txs_4xx
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                reg.egress_metrics
+                    .txs_limited
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Transaction list concurrency limit",
+                )
+                    .into_response();
+            }
+        };
+        if !reg.txs_budget.lock().await.has_capacity(unix_seconds()) {
+            reg.egress_metrics
+                .txs_4xx
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            reg.egress_metrics
+                .txs_limited
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Transaction list egress budget exhausted",
+            )
+                .into_response();
+        }
+        Some(permit)
+    } else {
+        None
+    };
     if path == "/status" || path == "/healthz" {
         return next.run(request).await;
     }
@@ -4105,6 +4197,52 @@ async fn canonical_api_gate(
         }
     }
     let response = next.run(request).await;
+    if public_txs {
+        let response_status = response.status();
+        let (parts, body) = response.into_parts();
+        return match to_bytes(body, reg.txs_max_response_bytes).await {
+            Ok(bytes) => {
+                if !reg
+                    .txs_budget
+                    .lock()
+                    .await
+                    .try_consume(unix_seconds(), bytes.len() as u64)
+                {
+                    reg.egress_metrics
+                        .txs_4xx
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    reg.egress_metrics
+                        .txs_limited
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Transaction list egress budget exhausted",
+                    )
+                        .into_response();
+                }
+                match response_status.as_u16() {
+                    200..=299 => &reg.egress_metrics.txs_2xx,
+                    400..=499 => &reg.egress_metrics.txs_4xx,
+                    _ => &reg.egress_metrics.txs_5xx,
+                }
+                .fetch_add(1, AtomicOrdering::Relaxed);
+                reg.egress_metrics
+                    .txs_bytes
+                    .fetch_add(bytes.len() as u64, AtomicOrdering::Relaxed);
+                Response::from_parts(parts, Body::from(bytes))
+            }
+            Err(error) => {
+                reg.egress_metrics
+                    .txs_5xx
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("bounded /txs response exceeded limit: {error}"),
+                )
+                    .into_response()
+            }
+        };
+    }
     if !public_merkle_path {
         return response;
     }
@@ -4168,6 +4306,14 @@ async fn get_egress_metrics(State(reg): State<PoolRegistry>) -> Json<serde_json:
             "status_4xx": reg.egress_metrics.merkle_path_4xx.load(AtomicOrdering::Relaxed),
             "status_5xx": reg.egress_metrics.merkle_path_5xx.load(AtomicOrdering::Relaxed),
             "limited": reg.egress_metrics.merkle_path_limited.load(AtomicOrdering::Relaxed),
+        },
+        "txs": {
+            "requests": reg.egress_metrics.txs_requests.load(AtomicOrdering::Relaxed),
+            "bytes": reg.egress_metrics.txs_bytes.load(AtomicOrdering::Relaxed),
+            "status_2xx": reg.egress_metrics.txs_2xx.load(AtomicOrdering::Relaxed),
+            "status_4xx": reg.egress_metrics.txs_4xx.load(AtomicOrdering::Relaxed),
+            "status_5xx": reg.egress_metrics.txs_5xx.load(AtomicOrdering::Relaxed),
+            "limited": reg.egress_metrics.txs_limited.load(AtomicOrdering::Relaxed),
         },
         "public_denied": reg.egress_metrics.public_denied.load(AtomicOrdering::Relaxed),
     }))
@@ -4772,7 +4918,7 @@ struct TxLookupQuery {
 async fn get_tx(
     State(reg): State<PoolRegistry>,
     Query(q): Query<TxLookupQuery>,
-) -> Result<Json<Vec<TxNote>>, (StatusCode, String)> {
+) -> Result<Json<Vec<TxLookupNote>>, (StatusCode, String)> {
     let want = normalize_hex_0x(&q.hash).to_lowercase();
     let contexts: Vec<AppContext> = match q.pool.as_deref() {
         Some(addr) => vec![reg.resolve(Some(addr)).await?],
@@ -4781,7 +4927,7 @@ async fn get_tx(
 
     // Per-note pool attribution (address + unit): a swap settle's two legs live in
     // different pools and the explorer renders each in its own symbol/decimals.
-    let mut out: Vec<TxNote> = Vec::new();
+    let mut out: Vec<TxLookupNote> = Vec::new();
     let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     for ctx in contexts {
         let pool_lc = ctx.contract_address.to_lowercase();
@@ -4793,7 +4939,7 @@ async fn get_tx(
                     if normalize_hex_0x(&note.tx_hash).to_lowercase() == want
                         && seen.insert(note.cmx)
                     {
-                        out.push(TxNote {
+                        out.push(TxLookupNote {
                             note: note.clone(),
                             pool: pool_lc.clone(),
                             symbol: None,
@@ -4813,7 +4959,7 @@ async fn get_tx(
             .await
         {
             if seen.insert(note.cmx) {
-                out.push(TxNote {
+                out.push(TxLookupNote {
                     note,
                     pool: pool_lc.clone(),
                     symbol: None,
@@ -4982,15 +5128,34 @@ struct TxsListQuery {
     pool: Option<String>,
 }
 
-/// A note plus its POOL attribution. A swap settle's two legs land in DIFFERENT
-/// pools, so per-note pool/symbol/decimals are required for the explorer to render
-/// each leg in its own unit (the tx-level symbol only reflects the first note's
-/// pool). Additive: the note's own fields are flattened, so consumers parsing a
-/// plain `OrchardIndexedAbiNote` keep working and just ignore the extras.
+/// Compact Browser wire note. The archive stores byte arrays, but JSON number arrays
+/// inflate one 580-byte ciphertext several-fold. `/txs` needs only the decryptable
+/// public envelope, so encode bytes as 0x hex and omit duplicate/archive-only fields.
+/// A swap settle's two legs land in different pools, hence per-note attribution.
 #[derive(Clone, Serialize)]
-struct TxNote {
+struct TxLookupNote {
     #[serde(flatten)]
     note: OrchardIndexedAbiNote,
+    pool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decimals: Option<u8>,
+}
+
+#[derive(Clone, Serialize)]
+struct TxListNote {
+    cmx: String,
+    epk: String,
+    enc_ciphertext: String,
+    nf_old: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_ciphertext: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cv_net_x: Option<String>,
+    log_index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shield_amount_sats: Option<u64>,
     /// Pool address (lowercase 0x) that emitted this note's `NoteAdded`.
     pool: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5039,7 +5204,7 @@ struct TxSummary {
     /// Max `log_index` of this tx's notes — used to order txs within a block.
     #[serde(skip)]
     max_log_index: u64,
-    notes: Vec<TxNote>,
+    notes: Vec<TxListNote>,
 }
 
 #[derive(Serialize)]
@@ -5063,7 +5228,12 @@ async fn get_txs(
     Query(q): Query<TxsListQuery>,
 ) -> Result<Json<TxsListResponse>, (StatusCode, String)> {
     let _history_permit = acquire_history_read(&reg).await?;
-    let limit = q.limit.unwrap_or(25).clamp(1, 100);
+    let max_limit = if reg.public_api_mode == PublicApiMode::Minimal {
+        MINIMAL_TXS_MAX_LIMIT
+    } else {
+        100
+    };
+    let limit = q.limit.unwrap_or(25).clamp(1, max_limit);
     let before = q.before_block.unwrap_or(u64::MAX);
     let contexts: Vec<AppContext> = match q.pool.as_deref() {
         Some(addr) => vec![reg.resolve(Some(addr)).await?],
@@ -5165,8 +5335,18 @@ async fn get_txs(
                 entry.seq = entry.seq.max(batch.seq);
                 entry.block_number = entry.block_number.max(note.block_number);
                 entry.max_log_index = entry.max_log_index.max(note.log_index);
-                entry.notes.push(TxNote {
-                    note: note.clone(),
+                entry.notes.push(TxListNote {
+                    cmx: format!("0x{}", hex::encode(note.cmx)),
+                    epk: format!("0x{}", hex::encode(note.epk)),
+                    enc_ciphertext: format!("0x{}", hex::encode(&note.enc_ciphertext)),
+                    nf_old: format!("0x{}", hex::encode(note.nf_old)),
+                    out_ciphertext: (!note.out_ciphertext.is_empty())
+                        .then(|| format!("0x{}", hex::encode(&note.out_ciphertext))),
+                    cv_net_x: note
+                        .cv_net_x
+                        .map(|value| format!("0x{}", hex::encode(value))),
+                    log_index: note.log_index,
+                    shield_amount_sats: note.shield_amount_sats,
                     pool: pool_lc.clone(),
                     symbol: None,
                     decimals: None,
@@ -5179,7 +5359,7 @@ async fn get_txs(
     // index" the explorer shows to tell apart a tx's individual note details.
     let mut txs: Vec<TxSummary> = by_tx.into_values().collect();
     for tx in &mut txs {
-        tx.notes.sort_by_key(|n| n.note.log_index);
+        tx.notes.sort_by_key(|n| n.log_index);
     }
 
     // Newest first by BLOCK (the only clock comparable across pools; per-pool `seq`
@@ -13072,24 +13252,25 @@ mod tests {
         export_segment_frozen_paths, factory_log_matches, finalized_cursor_covers_block,
         freeze_confirmed_prefix, frontier_from_leaves, frozen_count_after_delta,
         frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
-        is_public_merkle_path, latest_upserted_note, next_factory_discovery_from, nonempty_trimmed,
-        normalize_hex_0x, parse_address_set, parse_bool_flag, parse_bytes32_strict, parse_tx_meta,
-        perc20_deployed_topic0, persist_request_is_current, pg_append_cmx_leaves,
-        pg_append_merkle_nodes, pg_apply_note_mutations, pg_archive_seq_bound,
-        pg_begin_canonical_rebuild, pg_bulk_upsert_notes, pg_commit_incremental_replay,
-        pg_finish_canonical_rebuild, pg_load, pg_upgrade_legacy_compact_checkpoint,
-        public_api_access, push_incremental_replay_mutation, queue_pending_pool_admission,
-        raw_tx_hash, replay_frozen_set, require_admin, require_relayer, required_witness_nodes,
-        rlp_bytes, rlp_list, rlp_uint, rpc_endpoint_label, strip_0x, unix_seconds,
-        validate_crank_journal_parent, validate_crank_journal_signed_payloads,
-        validate_log_against_canonical, witness_from_nodes, witness_root_be, ApiAccess,
-        ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, CrankTxAttempt,
-        CrankTxJournal, EgressBudget, EthLog, FrozenPathRecord, FrozenUpdate, HourlyTxBudget,
-        IndexerCheckpoint, JsonNoteArchiveUpdate, NoteArchiveMutation, PendingPoolAdmission,
-        PendingRootUpdate, PublicApiMode, RecentEventIds, RpcClient, StateBackend,
-        StreamingFrontierBuilder, TipFreezeConfig, DEFAULT_MAX_BATCHES_IN_MEMORY,
-        FACTORY_DISCOVERY_RESCAN_BLOCKS, MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS,
-        MAX_TIP_FREEZE_PAGE_SIZE, MAX_TIP_FREEZE_WORKERS,
+        is_public_merkle_path, is_public_txs, latest_upserted_note, next_factory_discovery_from,
+        nonempty_trimmed, normalize_hex_0x, parse_address_set, parse_bool_flag,
+        parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0, persist_request_is_current,
+        pg_append_cmx_leaves, pg_append_merkle_nodes, pg_apply_note_mutations,
+        pg_archive_seq_bound, pg_begin_canonical_rebuild, pg_bulk_upsert_notes,
+        pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
+        pg_upgrade_legacy_compact_checkpoint, public_api_access, push_incremental_replay_mutation,
+        queue_pending_pool_admission, raw_tx_hash, replay_frozen_set, require_admin,
+        require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint, rpc_endpoint_label,
+        strip_0x, unix_seconds, validate_crank_journal_parent,
+        validate_crank_journal_signed_payloads, validate_log_against_canonical, witness_from_nodes,
+        witness_root_be, ApiAccess, ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli,
+        CompactFrontier, CrankTxAttempt, CrankTxJournal, EgressBudget, EthLog, FrozenPathRecord,
+        FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
+        NoteArchiveMutation, PendingPoolAdmission, PendingRootUpdate, PublicApiMode,
+        RecentEventIds, RpcClient, StateBackend, StreamingFrontierBuilder, TipFreezeConfig,
+        TxListNote, DEFAULT_MAX_BATCHES_IN_MEMORY, FACTORY_DISCOVERY_RESCAN_BLOCKS,
+        MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS, MAX_TIP_FREEZE_PAGE_SIZE,
+        MAX_TIP_FREEZE_WORKERS,
     };
     use std::time::Instant;
 
@@ -15853,13 +16034,17 @@ mod tests {
     }
 
     #[test]
-    fn minimal_public_api_exposes_only_health_and_frozen_paths() {
+    fn minimal_public_api_exposes_health_frozen_paths_and_bounded_browser_list() {
         assert_eq!(
             public_api_access(PublicApiMode::Minimal, &Method::GET, "/healthz", false),
             ApiAccess::Allow
         );
         assert_eq!(
             public_api_access(PublicApiMode::Minimal, &Method::GET, "/merkle_path", false),
+            ApiAccess::Allow
+        );
+        assert_eq!(
+            public_api_access(PublicApiMode::Minimal, &Method::GET, "/txs", false),
             ApiAccess::Allow
         );
         assert_eq!(
@@ -15886,10 +16071,35 @@ mod tests {
     }
 
     #[test]
+    fn txs_wire_note_uses_compact_hex_and_omits_archive_only_fields() {
+        let note = TxListNote {
+            cmx: format!("0x{}", "11".repeat(32)),
+            epk: format!("0x{}", "22".repeat(32)),
+            enc_ciphertext: format!("0x{}", "ab".repeat(580)),
+            nf_old: format!("0x{}", "33".repeat(32)),
+            out_ciphertext: Some(format!("0x{}", "cd".repeat(80))),
+            cv_net_x: Some(format!("0x{}", "44".repeat(32))),
+            log_index: 7,
+            shield_amount_sats: None,
+            pool: format!("0x{}", "55".repeat(20)),
+            symbol: Some("sUSDC".to_string()),
+            decimals: Some(6),
+        };
+        let wire = serde_json::to_string(&note).unwrap();
+        assert!(wire.contains(&format!("0x{}", "ab".repeat(580))));
+        assert!(!wire.contains("ack_hash"));
+        assert!(!wire.contains("cmx_position"));
+        assert!(wire.len() < 2_000);
+    }
+
+    #[test]
     fn internal_merkle_path_does_not_consume_the_public_egress_fuse() {
         assert!(is_public_merkle_path("/merkle_path", false));
         assert!(!is_public_merkle_path("/merkle_path", true));
         assert!(!is_public_merkle_path("/status", false));
+        assert!(is_public_txs("/txs", false));
+        assert!(!is_public_txs("/txs", true));
+        assert!(!is_public_txs("/merkle_path", false));
     }
 
     #[test]
