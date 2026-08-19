@@ -136,6 +136,10 @@ const DEFAULT_MERKLE_PATH_CONCURRENCY: usize = 16;
 const DEFAULT_MERKLE_PATH_MAX_RESPONSE_BYTES: usize = 128 * 1024;
 const DEFAULT_MERKLE_PATH_HOURLY_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_MERKLE_PATH_DAILY_BYTES: u64 = 1024 * 1024 * 1024;
+/// Re-scan a short finalized tail so a provider that transiently returns an
+/// incomplete `eth_getLogs` result cannot permanently hide a newly-created
+/// pool. Explicit startup pools have an independent admission retry loop.
+const FACTORY_DISCOVERY_RESCAN_BLOCKS: u64 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum PublicApiMode {
@@ -1493,6 +1497,12 @@ impl PoolRegistry {
         discovered: &FactoryDiscoveredPool,
     ) -> Result<bool> {
         let address = normalize_hex_0x(&discovered.pool).to_lowercase();
+        // Tail re-scans intentionally return already-admitted pools. Avoid
+        // repeating codehash/beacon/protocol RPC checks for those entries; the
+        // crank path independently revalidates trust before every signature.
+        if self.pools.read().await.contains_key(&address) {
+            return Ok(false);
+        }
         let factory = normalize_hex_0x(&discovered.factory).to_lowercase();
         let topic0 = normalize_hex_0x(&discovered.topic0).to_lowercase();
         let start_block = effective_pool_start_block(discovered.block, self.default_start_block);
@@ -1921,6 +1931,30 @@ struct PoolRegistryEntry {
     address: String,
     #[serde(default)]
     start_block: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPoolAdmission {
+    address: String,
+    start_block: u64,
+    source: &'static str,
+}
+
+fn queue_pending_pool_admission(
+    pending: &mut Vec<PendingPoolAdmission>,
+    address: &str,
+    start_block: u64,
+    source: &'static str,
+) {
+    let address = normalize_hex_0x(address).to_lowercase();
+    if pending.iter().any(|entry| entry.address == address) {
+        return;
+    }
+    pending.push(PendingPoolAdmission {
+        address,
+        start_block,
+        source,
+    });
 }
 
 fn load_pools_registry(path: &str) -> Vec<PoolRegistryEntry> {
@@ -2470,6 +2504,8 @@ async fn main() -> Result<()> {
     };
     registry.validate_trust_roots().await?;
 
+    let mut pending_pool_admissions = Vec::new();
+
     // 1) CLI pools (the first one becomes the default query target).
     for raw_addr in &cli.contract_address {
         if let Err(e) = registry
@@ -2477,6 +2513,12 @@ async fn main() -> Result<()> {
             .await
         {
             eprintln!("[indexer] add CLI pool {raw_addr} failed: {e:#}");
+            queue_pending_pool_admission(
+                &mut pending_pool_admissions,
+                raw_addr,
+                cli.start_block,
+                "cli",
+            );
         }
     }
     // 2) Pools registered at runtime in a previous run.
@@ -2492,9 +2534,22 @@ async fn main() -> Result<()> {
                     "[indexer] re-add registry pool {} failed: {e:#}",
                     entry.address
                 );
+                queue_pending_pool_admission(
+                    &mut pending_pool_admissions,
+                    &entry.address,
+                    sb,
+                    "registry",
+                );
             }
         }
         println!("[indexer] pools registry: {path}");
+    }
+    if !pending_pool_admissions.is_empty() {
+        tokio::spawn(pool_admission_retry_task(
+            registry.clone(),
+            pending_pool_admissions,
+            cli.discover_poll_secs,
+        ));
     }
     // 3) Auto-discovery: continuously scan `Perc20Created` chain-wide and register
     //    matching pools automatically (primary path; POST /pools stays as a manual
@@ -2665,10 +2720,56 @@ fn beacon_words_match(factory_beacon: &[u8; 32], pool_slot: &[u8; 32]) -> bool {
     factory_beacon[12..] == pool_slot[12..] && factory_beacon[12..].iter().any(|byte| *byte != 0)
 }
 
+async fn pool_admission_retry_task(
+    registry: PoolRegistry,
+    mut pending: Vec<PendingPoolAdmission>,
+    poll_secs: u64,
+) {
+    let mut attempt = 0_u64;
+    while !pending.is_empty() {
+        tokio::time::sleep(Duration::from_secs(poll_secs.max(1))).await;
+        attempt = attempt.saturating_add(1);
+        let mut remaining = Vec::new();
+        for request in pending {
+            match registry
+                .add_admitted_pool(&request.address, request.start_block, false)
+                .await
+            {
+                Ok(_) => println!(
+                    "[indexer] recovered {} pool admission {} after {} retries",
+                    request.source, request.address, attempt
+                ),
+                Err(_) => {
+                    // Keep retry logs bounded and never include provider URLs or
+                    // nested RPC errors. The original startup error is logged
+                    // once with the RPC client's credential-safe endpoint label.
+                    if attempt == 1 || attempt % 10 == 0 {
+                        eprintln!(
+                            "[indexer] {} pool admission {} still pending (retry {})",
+                            request.source, request.address, attempt
+                        );
+                    }
+                    remaining.push(request);
+                }
+            }
+        }
+        pending = remaining;
+    }
+}
+
+fn next_factory_discovery_from(start_block: u64, head: u64, scan_cursor: u64) -> u64 {
+    if scan_cursor <= head {
+        return scan_cursor;
+    }
+    head.saturating_sub(FACTORY_DISCOVERY_RESCAN_BLOCKS.saturating_sub(1))
+        .max(start_block)
+}
+
 /// Background task: poll deployment events emitted by explicitly trusted factories.
 /// Re-scans from `start_block` on boot; `add_pool` is idempotent so already-known
-/// pools are skipped. The cursor only advances past fully-scanned ranges, so a
-/// transient RPC error is retried on the next tick.
+/// pools are skipped. The cursor only advances past fully-scanned and admitted
+/// ranges, while a short tail is re-scanned to tolerate incomplete successful
+/// `eth_getLogs` responses from an upstream provider.
 async fn pool_discovery_task(
     reg: PoolRegistry,
     rpc: RpcClient,
@@ -2700,6 +2801,7 @@ async fn pool_discovery_task(
                 }
                 match failed {
                     None => {
+                        let mut admission_failed = false;
                         for discovered in found {
                             match reg.add_factory_discovered_pool(&discovered).await {
                                 Ok(true) => {
@@ -2713,9 +2815,16 @@ async fn pool_discovery_task(
                                     eprintln!(
                                         "[indexer] auto-discover add_pool {} failed: {e:#}",
                                         discovered.pool
-                                    )
+                                    );
+                                    admission_failed = true;
+                                    break;
                                 }
                             }
+                        }
+                        if admission_failed {
+                            // Do not lose a canonical factory event merely
+                            // because one of the follow-up RPC checks failed.
+                            break;
                         }
                         lo = hi + 1;
                     }
@@ -2730,7 +2839,7 @@ async fn pool_discovery_task(
                     }
                 }
             }
-            from = lo;
+            from = next_factory_discovery_from(start_block, head, lo);
         }
         tokio::time::sleep(std::time::Duration::from_secs(poll_secs.max(1))).await;
     }
@@ -12963,23 +13072,24 @@ mod tests {
         export_segment_frozen_paths, factory_log_matches, finalized_cursor_covers_block,
         freeze_confirmed_prefix, frontier_from_leaves, frozen_count_after_delta,
         frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
-        is_public_merkle_path, latest_upserted_note, nonempty_trimmed, normalize_hex_0x,
-        parse_address_set, parse_bool_flag, parse_bytes32_strict, parse_tx_meta,
+        is_public_merkle_path, latest_upserted_note, next_factory_discovery_from, nonempty_trimmed,
+        normalize_hex_0x, parse_address_set, parse_bool_flag, parse_bytes32_strict, parse_tx_meta,
         perc20_deployed_topic0, persist_request_is_current, pg_append_cmx_leaves,
         pg_append_merkle_nodes, pg_apply_note_mutations, pg_archive_seq_bound,
         pg_begin_canonical_rebuild, pg_bulk_upsert_notes, pg_commit_incremental_replay,
         pg_finish_canonical_rebuild, pg_load, pg_upgrade_legacy_compact_checkpoint,
-        public_api_access, push_incremental_replay_mutation, raw_tx_hash, replay_frozen_set,
-        require_admin, require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint,
-        rpc_endpoint_label, strip_0x, unix_seconds, validate_crank_journal_parent,
-        validate_crank_journal_signed_payloads, validate_log_against_canonical, witness_from_nodes,
-        witness_root_be, ApiAccess, ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli,
-        CompactFrontier, CrankTxAttempt, CrankTxJournal, EgressBudget, EthLog, FrozenPathRecord,
-        FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
-        NoteArchiveMutation, PendingRootUpdate, PublicApiMode, RecentEventIds, RpcClient,
-        StateBackend, StreamingFrontierBuilder, TipFreezeConfig, DEFAULT_MAX_BATCHES_IN_MEMORY,
-        MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS, MAX_TIP_FREEZE_PAGE_SIZE,
-        MAX_TIP_FREEZE_WORKERS,
+        public_api_access, push_incremental_replay_mutation, queue_pending_pool_admission,
+        raw_tx_hash, replay_frozen_set, require_admin, require_relayer, required_witness_nodes,
+        rlp_bytes, rlp_list, rlp_uint, rpc_endpoint_label, strip_0x, unix_seconds,
+        validate_crank_journal_parent, validate_crank_journal_signed_payloads,
+        validate_log_against_canonical, witness_from_nodes, witness_root_be, ApiAccess,
+        ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, CrankTxAttempt,
+        CrankTxJournal, EgressBudget, EthLog, FrozenPathRecord, FrozenUpdate, HourlyTxBudget,
+        IndexerCheckpoint, JsonNoteArchiveUpdate, NoteArchiveMutation, PendingPoolAdmission,
+        PendingRootUpdate, PublicApiMode, RecentEventIds, RpcClient, StateBackend,
+        StreamingFrontierBuilder, TipFreezeConfig, DEFAULT_MAX_BATCHES_IN_MEMORY,
+        FACTORY_DISCOVERY_RESCAN_BLOCKS, MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS,
+        MAX_TIP_FREEZE_PAGE_SIZE, MAX_TIP_FREEZE_WORKERS,
     };
     use std::time::Instant;
 
@@ -13909,6 +14019,33 @@ mod tests {
             .all(|item| item.factory == shield_factory && item.topic0 == shield_topic));
         assert_eq!(discovered[0].block, 101);
         assert_eq!(discovered[1].block, 202);
+    }
+
+    #[test]
+    fn failed_startup_pool_admissions_are_queued_once_for_retry() {
+        let mut pending = Vec::new();
+        queue_pending_pool_admission(&mut pending, "abcd", 101, "cli");
+        queue_pending_pool_admission(&mut pending, "0xabcd", 202, "registry");
+        assert_eq!(
+            pending,
+            vec![PendingPoolAdmission {
+                address: "0xabcd".to_owned(),
+                start_block: 101,
+                source: "cli",
+            }]
+        );
+    }
+
+    #[test]
+    fn factory_discovery_retries_failed_ranges_and_rescans_a_bounded_tail() {
+        let start = 500;
+        let head = 1_000;
+        assert_eq!(next_factory_discovery_from(start, head, 900), 900);
+        assert_eq!(
+            next_factory_discovery_from(start, head, head + 1),
+            head - (FACTORY_DISCOVERY_RESCAN_BLOCKS - 1)
+        );
+        assert_eq!(next_factory_discovery_from(900, head, head + 1), 900);
     }
 
     #[test]
