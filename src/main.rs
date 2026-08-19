@@ -1232,6 +1232,30 @@ enum PoolProvenance {
     Factory(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FactoryDiscoveredPool {
+    pool: String,
+    block: u64,
+    factory: String,
+    topic0: String,
+}
+
+fn bind_factory_discovery_source(
+    factory: &str,
+    topic0: &str,
+    pools: Vec<(String, u64)>,
+) -> Vec<FactoryDiscoveredPool> {
+    pools
+        .into_iter()
+        .map(|(pool, block)| FactoryDiscoveredPool {
+            pool,
+            block,
+            factory: normalize_hex_0x(factory).to_lowercase(),
+            topic0: normalize_hex_0x(topic0).to_lowercase(),
+        })
+        .collect()
+}
+
 impl PoolAdmissionPolicy {
     fn from_cli(cli: &Cli) -> Result<Self> {
         if !cli.discover_issuer.is_empty() {
@@ -1459,6 +1483,67 @@ impl PoolRegistry {
             ));
         }
         self.add_pool(&address, start_block, persist).await
+    }
+
+    /// Admit a pool using the exact trusted factory event that discovery just
+    /// fetched. Keeping that provenance prevents a Shield pool from first
+    /// scanning an unrelated PERC20 factory all the way to the chain tip.
+    async fn add_factory_discovered_pool(
+        &self,
+        discovered: &FactoryDiscoveredPool,
+    ) -> Result<bool> {
+        let address = normalize_hex_0x(&discovered.pool).to_lowercase();
+        let factory = normalize_hex_0x(&discovered.factory).to_lowercase();
+        let topic0 = normalize_hex_0x(&discovered.topic0).to_lowercase();
+        let start_block = effective_pool_start_block(discovered.block, self.default_start_block);
+        let trusted_source = self.admission.discovery_sources().into_iter().any(
+            |(candidate_factory, candidate_topic)| {
+                candidate_factory.eq_ignore_ascii_case(&factory)
+                    && candidate_topic.eq_ignore_ascii_case(&topic0)
+            },
+        );
+        if !trusted_source {
+            return Err(anyhow!(
+                "pool {address} discovery source is not an explicitly trusted factory"
+            ));
+        }
+        let codehash = self.builder.rpc.runtime_codehash(&address).await?;
+        if !self.admission.pool_codehashes.contains(&codehash) {
+            return Err(anyhow!(
+                "pool {address} has unapproved runtime codehash {codehash}"
+            ));
+        }
+        if !self
+            .builder
+            .rpc
+            .was_pool_deployed_by(&factory, &address, &topic0, start_block)
+            .await?
+        {
+            return Err(anyhow!(
+                "pool {address} no longer has its canonical trusted-factory deployment proof"
+            ));
+        }
+        if !self
+            .builder
+            .rpc
+            .pool_uses_factory_beacon(
+                &factory,
+                &address,
+                &self.admission.implementation_codehashes,
+            )
+            .await?
+        {
+            return Err(anyhow!(
+                "pool {address} is not bound to the trusted factory beacon/current implementation"
+            ));
+        }
+        self.ensure_pool_protocol(&address).await?;
+        self.verified_pools.write().await.insert(address.clone());
+        self.verified_pool_provenance
+            .write()
+            .await
+            .insert(address.clone(), PoolProvenance::Factory(factory));
+        self.add_pool(&address, start_block, false).await
     }
 
     /// Add a pool if not already present. Returns `Ok(true)` when newly added and
@@ -2604,7 +2689,9 @@ async fn pool_discovery_task(
                         .fetch_factory_deployed_pools(lo, hi, factory, topic0)
                         .await
                     {
-                        Ok(mut pools) => found.append(&mut pools),
+                        Ok(pools) => {
+                            found.extend(bind_factory_discovery_source(factory, topic0, pools))
+                        }
                         Err(e) => {
                             failed = Some(e);
                             break;
@@ -2613,17 +2700,19 @@ async fn pool_discovery_task(
                 }
                 match failed {
                     None => {
-                        for (pool, block) in found {
-                            match reg.add_admitted_pool(&pool, block, false).await {
+                        for discovered in found {
+                            match reg.add_factory_discovered_pool(&discovered).await {
                                 Ok(true) => {
                                     println!(
-                                        "[indexer] auto-discovered pool {pool} (block {block})"
+                                        "[indexer] auto-discovered pool {} (block {})",
+                                        discovered.pool, discovered.block
                                     )
                                 }
                                 Ok(false) => {}
                                 Err(e) => {
                                     eprintln!(
-                                        "[indexer] auto-discover add_pool {pool} failed: {e:#}"
+                                        "[indexer] auto-discover add_pool {} failed: {e:#}",
+                                        discovered.pool
                                     )
                                 }
                             }
@@ -11075,13 +11164,14 @@ async fn recover_pending_txs(ctx: &PollContext) {
 async fn run_ws_subscription(ctx: &PollContext) -> Result<()> {
     use tokio_tungstenite::connect_async;
 
+    let endpoint = rpc_endpoint_label(&ctx.wss_url);
     let (mut ws, _) = connect_async(&ctx.wss_url)
         .await
-        .with_context(|| format!("WebSocket connect failed: {}", ctx.wss_url))?;
+        .with_context(|| format!("WebSocket connect failed: {endpoint}"))?;
     println!(
         "[indexer][{}] WebSocket connected: {}",
         &ctx.contract_address[..10],
-        ctx.wss_url
+        endpoint
     );
 
     // Build topic0 OR list for subscription filter.
@@ -12448,6 +12538,7 @@ impl RpcClient {
         });
         let mut last_err = anyhow::anyhow!("no rpc urls");
         for url in &self.urls {
+            let endpoint = rpc_endpoint_label(url);
             // Try up to 2 times per URL: the first attempt may fail with
             // "error sending request" if the proxy recycled a keep-alive
             // connection.  A single immediate retry with a fresh connection
@@ -12459,7 +12550,7 @@ impl RpcClient {
                             (Some(v), None) => return Ok(v),
                             (None, Some(e)) => {
                                 last_err = anyhow!(
-                                    "eth_{} failed for {url}: rpc error {}: {}",
+                                    "eth_{} failed for {endpoint}: rpc error {}: {}",
                                     method,
                                     e.code,
                                     e.message
@@ -12468,7 +12559,7 @@ impl RpcClient {
                             }
                             _ => {
                                 last_err = anyhow!(
-                                    "malformed rpc response for method {method} from {url}"
+                                    "malformed rpc response for method {method} from {endpoint}"
                                 );
                                 break 'attempts;
                             }
@@ -12479,13 +12570,13 @@ impl RpcClient {
                         }
                     },
                     Err(e) => {
-                        last_err = anyhow!("eth_{} send failed from {url}: {}", method, e);
+                        last_err = anyhow!("eth_{} send failed from {endpoint}: {}", method, e);
                         if attempt == 0 {
                             // First failure — may be a stale connection; retry once silently.
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                             continue 'attempts;
                         }
-                        eprintln!("[indexer] rpc {url} failed ({e}), trying fallback…");
+                        eprintln!("[indexer] rpc {endpoint} failed ({e}), trying fallback…");
                     }
                 }
             }
@@ -12753,6 +12844,21 @@ fn parse_hex_u64(hex_str: &str) -> Result<u64> {
     u64::from_str_radix(strip_0x(hex_str), 16).map_err(|e| anyhow!(e))
 }
 
+fn rpc_endpoint_label(value: &str) -> String {
+    let Some((scheme, remainder)) = value.split_once("://") else {
+        return "<redacted-rpc-endpoint>".to_string();
+    };
+    if !matches!(scheme, "http" | "https" | "ws" | "wss") {
+        return "<redacted-rpc-endpoint>".to_string();
+    }
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    if host.is_empty() {
+        return "<redacted-rpc-endpoint>".to_string();
+    }
+    format!("{scheme}://{host}")
+}
+
 fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     let bytes = hex::decode(strip_0x(s)).ok()?;
     bytes.try_into().ok()
@@ -12848,10 +12954,10 @@ mod tests {
     use k256::ecdsa::SigningKey;
 
     use super::{
-        advance_cursor, batch_page_end, beacon_words_match, broadcasted_crank_attempts,
-        build_and_sign_eip1559_tx, build_tip_frozen_paths, canonical_guard,
-        checkpoint_is_complete_finalized_boundary, classify_selector, compact_note_mutations,
-        confirmation_head_number, crank_gas_limit, crank_next_delay_secs,
+        advance_cursor, batch_page_end, beacon_words_match, bind_factory_discovery_source,
+        broadcasted_crank_attempts, build_and_sign_eip1559_tx, build_tip_frozen_paths,
+        canonical_guard, checkpoint_is_complete_finalized_boundary, classify_selector,
+        compact_note_mutations, confirmation_head_number, crank_gas_limit, crank_next_delay_secs,
         decode_frozen_root_updated_log, decode_json_note_archive, effective_pool_start_block,
         eip1559_crank_fees, eip1967_beacon_slot, encode_crank_root_calldata,
         export_segment_frozen_paths, factory_log_matches, finalized_cursor_covers_block,
@@ -12865,7 +12971,7 @@ mod tests {
         pg_finish_canonical_rebuild, pg_load, pg_upgrade_legacy_compact_checkpoint,
         public_api_access, push_incremental_replay_mutation, raw_tx_hash, replay_frozen_set,
         require_admin, require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint,
-        strip_0x, unix_seconds, validate_crank_journal_parent,
+        rpc_endpoint_label, strip_0x, unix_seconds, validate_crank_journal_parent,
         validate_crank_journal_signed_payloads, validate_log_against_canonical, witness_from_nodes,
         witness_root_be, ApiAccess, ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli,
         CompactFrontier, CrankTxAttempt, CrankTxJournal, EgressBudget, EthLog, FrozenPathRecord,
@@ -13738,6 +13844,22 @@ mod tests {
     }
 
     #[test]
+    fn rpc_endpoint_logs_never_include_credentials_or_paths() {
+        assert_eq!(
+            rpc_endpoint_label("https://monad.example/v2/private-key?debug=1"),
+            "https://monad.example"
+        );
+        assert_eq!(
+            rpc_endpoint_label("wss://user:secret@rpc.example/ws/private"),
+            "wss://rpc.example"
+        );
+        assert_eq!(
+            rpc_endpoint_label("not-a-url/private-key"),
+            "<redacted-rpc-endpoint>"
+        );
+    }
+
+    #[test]
     fn factory_admission_rejects_self_emitted_or_wrong_factory_logs() {
         let factory = format!("0x{}", "11".repeat(20));
         let pool = format!("0x{}", "22".repeat(20));
@@ -13770,6 +13892,23 @@ mod tests {
             &topic0,
             &pool
         ));
+    }
+
+    #[test]
+    fn factory_discovery_retains_the_exact_source_for_admission() {
+        let shield_factory = format!("0x{}", "11".repeat(20));
+        let shield_topic = format!("0x{}", "22".repeat(32));
+        let pools = vec![
+            (format!("0x{}", "33".repeat(20)), 101),
+            (format!("0x{}", "44".repeat(20)), 202),
+        ];
+        let discovered = bind_factory_discovery_source(&shield_factory, &shield_topic, pools);
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered
+            .iter()
+            .all(|item| item.factory == shield_factory && item.topic0 == shield_topic));
+        assert_eq!(discovered[0].block, 101);
+        assert_eq!(discovered[1].block, 202);
     }
 
     #[test]
