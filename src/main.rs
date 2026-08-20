@@ -190,8 +190,9 @@ struct Cli {
         default_value = "127.0.0.1:8787"
     )]
     bind: String,
-    /// Public HTTP surface. `minimal` removes historical/browser APIs while an
-    /// independent internal bearer token retains them for reviewed services.
+    /// Public HTTP surface. `minimal` keeps only bounded wallet/browser reads;
+    /// an independent internal bearer token retains the other read APIs for
+    /// reviewed services.
     #[arg(
         long,
         env = "PRIVACYBTC_INDEXER_PUBLIC_API_MODE",
@@ -4017,7 +4018,12 @@ fn public_api_access(
     if internal_read && read_method {
         return ApiAccess::Allow;
     }
-    if read_method && (path == "/healthz" || path == "/merkle_path" || path == "/txs") {
+    if read_method
+        && matches!(
+            path,
+            "/healthz" | "/merkle_path" | "/txs" | "/stats" | "/shield/stats"
+        )
+    {
         return ApiAccess::Allow;
     }
     // Permit only these two POSTs to reach their existing, independent token
@@ -16034,7 +16040,7 @@ mod tests {
     }
 
     #[test]
-    fn minimal_public_api_exposes_health_frozen_paths_and_bounded_browser_list() {
+    fn minimal_public_api_exposes_health_and_bounded_browser_reads() {
         assert_eq!(
             public_api_access(PublicApiMode::Minimal, &Method::GET, "/healthz", false),
             ApiAccess::Allow
@@ -16045,6 +16051,14 @@ mod tests {
         );
         assert_eq!(
             public_api_access(PublicApiMode::Minimal, &Method::GET, "/txs", false),
+            ApiAccess::Allow
+        );
+        assert_eq!(
+            public_api_access(PublicApiMode::Minimal, &Method::GET, "/stats", false),
+            ApiAccess::Allow
+        );
+        assert_eq!(
+            public_api_access(PublicApiMode::Minimal, &Method::GET, "/shield/stats", false),
             ApiAccess::Allow
         );
         assert_eq!(
