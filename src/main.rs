@@ -4021,7 +4021,7 @@ fn public_api_access(
     if read_method
         && matches!(
             path,
-            "/healthz" | "/merkle_path" | "/txs" | "/stats" | "/shield/stats"
+            "/healthz" | "/merkle_path" | "/tx" | "/txs" | "/stats" | "/shield/stats"
         )
     {
         return ApiAccess::Allow;
