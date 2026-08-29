@@ -24,6 +24,7 @@ use axum::{
     Json, Router,
 };
 use clap::{Parser, ValueEnum};
+use ethabi::{decode as abi_decode, encode as abi_encode, ParamType, Token};
 use futures_util::stream::{self, StreamExt};
 use futures_util::SinkExt;
 use k256::ecdsa::{RecoveryId, SigningKey};
@@ -66,6 +67,7 @@ use privacy_core::ethereum::{
     DecodedShieldPoolCreated,
     PrivacyCallArgs,
     RootUpdateArgs,
+    SwapInitiateCalldata,
 };
 use privacy_core::types::{OrchardIndexBatch, OrchardIndexedAbiNote};
 use rayon::prelude::*;
@@ -516,6 +518,10 @@ struct Cli {
         value_delimiter = ','
     )]
     trusted_static_pool: Vec<String>,
+    /// Pools whose presence and serving readiness are required by `/healthz`.
+    /// This is an availability assertion only and never grants admission.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_REQUIRED_POOLS", value_delimiter = ',')]
+    required_pool: Vec<String>,
     /// Allowed keccak256 runtime code hashes for trusted factories.
     #[arg(
         long,
@@ -1139,6 +1145,9 @@ struct PoolRegistry {
     allow_runtime_pool_registration: bool,
     /// Fail health until at least one configured/discovered pool is ready.
     require_pool: bool,
+    /// Explicit health-only membership assertion. These addresses do not grant
+    /// admission and must still pass the normal static/factory trust checks.
+    required_pools: HashSet<String>,
     registry_file: Option<String>,
     /// Global reviewed deployment floor used when a runtime registration omits
     /// its pool-specific start block.
@@ -1284,6 +1293,12 @@ struct FactoryDiscoveredPool {
     topic0: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingFactoryAdmission {
+    discovered: FactoryDiscoveredPool,
+    attempts: u64,
+}
+
 fn bind_factory_discovery_source(
     factory: &str,
     topic0: &str,
@@ -1298,6 +1313,50 @@ fn bind_factory_discovery_source(
             topic0: normalize_hex_0x(topic0).to_lowercase(),
         })
         .collect()
+}
+
+fn factory_discovery_source_is_trusted(
+    discovered: &FactoryDiscoveredPool,
+    trusted_sources: &[(String, String)],
+) -> bool {
+    trusted_sources
+        .iter()
+        .any(|(candidate_factory, candidate_topic)| {
+            candidate_factory.eq_ignore_ascii_case(&discovered.factory)
+                && candidate_topic.eq_ignore_ascii_case(&discovered.topic0)
+        })
+}
+
+fn queue_factory_discovery_range(
+    pending: &mut Vec<PendingFactoryAdmission>,
+    factory: &str,
+    topic0: &str,
+    pools: Vec<(String, u64)>,
+    next_from: &mut u64,
+    range_end: u64,
+) {
+    for discovered in bind_factory_discovery_source(factory, topic0, pools) {
+        if pending.iter().any(|entry| {
+            entry.discovered.pool.eq_ignore_ascii_case(&discovered.pool)
+                && entry
+                    .discovered
+                    .factory
+                    .eq_ignore_ascii_case(&discovered.factory)
+                && entry
+                    .discovered
+                    .topic0
+                    .eq_ignore_ascii_case(&discovered.topic0)
+        }) {
+            continue;
+        }
+        pending.push(PendingFactoryAdmission {
+            discovered,
+            attempts: 0,
+        });
+    }
+    // Factory log retrieval, not admission, defines discovery progress. Every
+    // canonical event above remains queued for retry after this cursor advances.
+    *next_from = range_end.saturating_add(1);
 }
 
 impl PoolAdmissionPolicy {
@@ -1521,6 +1580,14 @@ impl PoolRegistry {
     ) -> Result<bool> {
         let address = normalize_hex_0x(raw_addr).to_lowercase();
         let start_block = effective_pool_start_block(start_block, self.default_start_block);
+        let active = self.pools.read().await.contains_key(&address);
+        let verified = self.verified_pools.read().await.contains(&address);
+        if !persist && completed_admission_can_short_circuit(active, verified) {
+            // This is only reachable after a trust-checked admission in this
+            // process. Both maps are empty on startup, so restart still replays
+            // provenance and runtime pins fail closed.
+            return Ok(false);
+        }
         if !self.verify_pool_admitted(&address, start_block).await? {
             return Err(anyhow!(
                 "pool {address} is not from a trusted factory or explicit static allowlist"
@@ -1535,28 +1602,28 @@ impl PoolRegistry {
     async fn add_factory_discovered_pool(
         &self,
         discovered: &FactoryDiscoveredPool,
+        persist: bool,
     ) -> Result<bool> {
         let address = normalize_hex_0x(&discovered.pool).to_lowercase();
-        // Tail re-scans intentionally return already-admitted pools. Avoid
-        // repeating codehash/beacon/protocol RPC checks for those entries; the
-        // crank path independently revalidates trust before every signature.
-        if self.pools.read().await.contains_key(&address) {
-            return Ok(false);
-        }
         let factory = normalize_hex_0x(&discovered.factory).to_lowercase();
         let topic0 = normalize_hex_0x(&discovered.topic0).to_lowercase();
-        let start_block = effective_pool_start_block(discovered.block, self.default_start_block);
-        let trusted_source = self.admission.discovery_sources().into_iter().any(
-            |(candidate_factory, candidate_topic)| {
-                candidate_factory.eq_ignore_ascii_case(&factory)
-                    && candidate_topic.eq_ignore_ascii_case(&topic0)
-            },
-        );
+        let trusted_source =
+            factory_discovery_source_is_trusted(discovered, &self.admission.discovery_sources());
         if !trusted_source {
             return Err(anyhow!(
                 "pool {address} discovery source is not an explicitly trusted factory"
             ));
         }
+        // Tail re-scans intentionally return already-admitted pools. Avoid
+        // repeating codehash/beacon/protocol RPC checks for those entries; the
+        // crank path independently revalidates trust before every signature.
+        if self.pools.read().await.contains_key(&address) {
+            if persist {
+                self.persist_factory_discovery(discovered);
+            }
+            return Ok(false);
+        }
+        let start_block = effective_pool_start_block(discovered.block, self.default_start_block);
         let codehash = self.builder.rpc.runtime_codehash(&address).await?;
         if !self.admission.pool_codehashes.contains(&codehash) {
             return Err(anyhow!(
@@ -1593,7 +1660,19 @@ impl PoolRegistry {
             .write()
             .await
             .insert(address.clone(), PoolProvenance::Factory(factory));
-        self.add_pool(&address, start_block, false).await
+        let added = self.add_pool(&address, start_block, false).await?;
+        if persist {
+            self.persist_factory_discovery(discovered);
+        }
+        Ok(added)
+    }
+
+    fn persist_factory_discovery(&self, discovered: &FactoryDiscoveredPool) {
+        if let Some(path) = &self.registry_file {
+            if let Err(e) = append_factory_pools_registry(path, discovered) {
+                eprintln!("[indexer] failed to persist factory pool registry {path}: {e:#}");
+            }
+        }
     }
 
     /// Add a pool if not already present. Returns `Ok(true)` when newly added and
@@ -1961,6 +2040,10 @@ impl PoolRegistry {
     }
 }
 
+fn completed_admission_can_short_circuit(active: bool, verified: bool) -> bool {
+    active && verified
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct PoolsRegistryFile {
     pools: Vec<PoolRegistryEntry>,
@@ -1971,6 +2054,41 @@ struct PoolRegistryEntry {
     address: String,
     #[serde(default)]
     start_block: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    factory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topic0: Option<String>,
+}
+
+fn factory_discovery_from_registry_entry(
+    entry: &PoolRegistryEntry,
+    start_block: u64,
+) -> Result<Option<FactoryDiscoveredPool>> {
+    match (&entry.factory, &entry.topic0) {
+        (None, None) => Ok(None),
+        (Some(factory), Some(topic0)) => {
+            if parse_address20(&entry.address).is_none() || parse_address20(factory).is_none() {
+                return Err(anyhow!(
+                    "factory-provenance registry entry has an invalid address"
+                ));
+            }
+            let topic = strip_0x(topic0);
+            if topic.len() != 64 || !topic.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(anyhow!(
+                    "factory-provenance registry entry has an invalid topic0"
+                ));
+            }
+            Ok(Some(FactoryDiscoveredPool {
+                pool: normalize_hex_0x(&entry.address).to_lowercase(),
+                block: start_block,
+                factory: normalize_hex_0x(factory).to_lowercase(),
+                topic0: normalize_hex_0x(topic0).to_lowercase(),
+            }))
+        }
+        _ => Err(anyhow!(
+            "factory-provenance registry entry requires both factory and topic0"
+        )),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2007,15 +2125,39 @@ fn load_pools_registry(path: &str) -> Vec<PoolRegistryEntry> {
 }
 
 fn append_pools_registry(path: &str, address: &str, start_block: u64) -> Result<()> {
+    append_pools_registry_entry(path, address, start_block, None)
+}
+
+fn append_factory_pools_registry(path: &str, discovered: &FactoryDiscoveredPool) -> Result<()> {
+    append_pools_registry_entry(
+        path,
+        &discovered.pool,
+        discovered.block,
+        Some((&discovered.factory, &discovered.topic0)),
+    )
+}
+
+fn append_pools_registry_entry(
+    path: &str,
+    address: &str,
+    start_block: u64,
+    provenance: Option<(&str, &str)>,
+) -> Result<()> {
     let mut reg = PoolsRegistryFile {
         pools: load_pools_registry(path),
     };
-    let norm = normalize_hex_0x(address);
+    let norm = normalize_hex_0x(address).to_lowercase();
+    let provenance = provenance.map(|(factory, topic0)| {
+        (
+            normalize_hex_0x(factory).to_lowercase(),
+            normalize_hex_0x(topic0).to_lowercase(),
+        )
+    });
     let mut changed = false;
     if let Some(entry) = reg
         .pools
         .iter_mut()
-        .find(|e| normalize_hex_0x(&e.address) == norm)
+        .find(|e| normalize_hex_0x(&e.address).eq_ignore_ascii_case(&norm))
     {
         if entry.address != norm {
             entry.address = norm.clone();
@@ -2025,10 +2167,25 @@ fn append_pools_registry(path: &str, address: &str, start_block: u64) -> Result<
             entry.start_block = start_block;
             changed = true;
         }
+        if let Some((factory, topic0)) = &provenance {
+            if entry.factory.as_ref() != Some(factory) {
+                entry.factory = Some(factory.clone());
+                changed = true;
+            }
+            if entry.topic0.as_ref() != Some(topic0) {
+                entry.topic0 = Some(topic0.clone());
+                changed = true;
+            }
+        }
     } else {
+        let (factory, topic0) = provenance
+            .map(|(factory, topic0)| (Some(factory), Some(topic0)))
+            .unwrap_or((None, None));
         reg.pools.push(PoolRegistryEntry {
             address: norm,
             start_block,
+            factory,
+            topic0,
         });
         changed = true;
     }
@@ -2521,7 +2678,11 @@ async fn main() -> Result<()> {
         add_lock: Arc::new(tokio::sync::Mutex::new(())),
         max_pools: cli.max_pools,
         allow_runtime_pool_registration: cli.allow_runtime_pool_registration,
-        require_pool: cli.shadow_mode || cli.discover_pools || !cli.contract_address.is_empty(),
+        require_pool: cli.shadow_mode
+            || cli.discover_pools
+            || !cli.contract_address.is_empty()
+            || !cli.required_pool.is_empty(),
+        required_pools: parse_address_set("PRIVACYBTC_INDEXER_REQUIRED_POOLS", &cli.required_pool)?,
         registry_file: cli.pools_registry.clone(),
         default_start_block: cli.start_block,
         verified_pools: Arc::new(RwLock::new(HashSet::new())),
@@ -2561,6 +2722,7 @@ async fn main() -> Result<()> {
     registry.validate_trust_roots().await?;
 
     let mut pending_pool_admissions = Vec::new();
+    let mut pending_factory_admissions = Vec::new();
 
     // 1) CLI pools (the first one becomes the default query target).
     for raw_addr in &cli.contract_address {
@@ -2585,17 +2747,40 @@ async fn main() -> Result<()> {
             } else {
                 entry.start_block
             };
-            if let Err(e) = registry.add_admitted_pool(&entry.address, sb, false).await {
-                eprintln!(
-                    "[indexer] re-add registry pool {} failed: {e:#}",
+            match factory_discovery_from_registry_entry(&entry, sb) {
+                Ok(Some(discovered)) => {
+                    if let Err(e) = registry
+                        .add_factory_discovered_pool(&discovered, false)
+                        .await
+                    {
+                        eprintln!(
+                            "[indexer] re-add factory registry pool {} failed: {e:#}",
+                            entry.address
+                        );
+                        pending_factory_admissions.push(PendingFactoryAdmission {
+                            discovered,
+                            attempts: 0,
+                        });
+                    }
+                }
+                Ok(None) => {
+                    if let Err(e) = registry.add_admitted_pool(&entry.address, sb, false).await {
+                        eprintln!(
+                            "[indexer] re-add registry pool {} failed: {e:#}",
+                            entry.address
+                        );
+                        queue_pending_pool_admission(
+                            &mut pending_pool_admissions,
+                            &entry.address,
+                            sb,
+                            "registry",
+                        );
+                    }
+                }
+                Err(e) => eprintln!(
+                    "[indexer] reject malformed registry pool {} provenance: {e:#}",
                     entry.address
-                );
-                queue_pending_pool_admission(
-                    &mut pending_pool_admissions,
-                    &entry.address,
-                    sb,
-                    "registry",
-                );
+                ),
             }
         }
         println!("[indexer] pools registry: {path}");
@@ -2604,6 +2789,13 @@ async fn main() -> Result<()> {
         tokio::spawn(pool_admission_retry_task(
             registry.clone(),
             pending_pool_admissions,
+            cli.discover_poll_secs,
+        ));
+    }
+    if !pending_factory_admissions.is_empty() {
+        tokio::spawn(factory_admission_retry_task(
+            registry.clone(),
+            pending_factory_admissions,
             cli.discover_poll_secs,
         ));
     }
@@ -2823,81 +3015,137 @@ fn next_factory_discovery_from(start_block: u64, head: u64, scan_cursor: u64) ->
 
 /// Background task: poll deployment events emitted by explicitly trusted factories.
 /// Re-scans from `start_block` on boot; `add_pool` is idempotent so already-known
-/// pools are skipped. The cursor only advances past fully-scanned and admitted
-/// ranges, while a short tail is re-scanned to tolerate incomplete successful
-/// `eth_getLogs` responses from an upstream provider.
+/// pools are skipped. Each trusted factory has an independent cursor. Canonical
+/// events are retained in a retry queue before that source advances, so one bad
+/// pool or one failing factory cannot starve later pools or unrelated sources.
 async fn pool_discovery_task(
     reg: PoolRegistry,
     rpc: RpcClient,
-    sources: Vec<(String, String)>,
+    mut sources: Vec<(String, String)>,
     start_block: u64,
     poll_secs: u64,
 ) {
-    let mut from = start_block;
+    // HashSet-derived trust roots otherwise make catch-up order nondeterministic.
+    // Sorting plus one range per source per round prevents a long issuer-factory
+    // history from starving a later-deployed Shield factory.
+    sources.sort();
+    let mut cursors = vec![start_block; sources.len()];
+    let mut pending_admissions = Vec::<PendingFactoryAdmission>::new();
+    let retry_interval = Duration::from_secs(poll_secs.max(1));
+    let mut last_pending_retry = Instant::now();
     loop {
+        if !pending_admissions.is_empty() {
+            pending_admissions =
+                attempt_factory_admissions(&reg, std::mem::take(&mut pending_admissions)).await;
+            last_pending_retry = Instant::now();
+        }
         if let Ok((head, _)) = rpc.confirmation_head().await {
-            let mut lo = from;
-            while lo <= head {
-                let hi = getlogs_window_end(lo, head, rpc.getlogs_span());
-                let mut found = Vec::new();
-                let mut failed = None;
-                for (factory, topic0) in &sources {
+            for cursor in &mut cursors {
+                *cursor = next_factory_discovery_from(start_block, head, *cursor);
+            }
+            let mut blocked_sources = vec![false; sources.len()];
+            loop {
+                let mut scanned_any = false;
+                for (source_index, (factory, topic0)) in sources.iter().enumerate() {
+                    let lo = cursors[source_index];
+                    if blocked_sources[source_index] || lo > head {
+                        continue;
+                    }
+                    scanned_any = true;
+                    let hi = getlogs_window_end(lo, head, rpc.getlogs_span());
                     match rpc
                         .fetch_factory_deployed_pools(lo, hi, factory, topic0)
                         .await
                     {
                         Ok(pools) => {
-                            found.extend(bind_factory_discovery_source(factory, topic0, pools))
+                            let prior_pending = pending_admissions.len();
+                            queue_factory_discovery_range(
+                                &mut pending_admissions,
+                                factory,
+                                topic0,
+                                pools,
+                                &mut cursors[source_index],
+                                hi,
+                            );
+                            // Admit only this range's new events immediately. An
+                            // invalid event remains queued, but later valid events
+                            // in the same range are still attempted in this pass.
+                            let newly_discovered = pending_admissions.split_off(prior_pending);
+                            let failed = attempt_factory_admissions(&reg, newly_discovered).await;
+                            pending_admissions.extend(failed);
+                        }
+                        Err(e) if hi > lo && is_getlogs_range_error(&e) => {
+                            // Window too large for this provider: shrink and retry
+                            // the same source offset in the next round.
+                            rpc.shrink_getlogs_span(hi - lo + 1);
                         }
                         Err(e) => {
-                            failed = Some(e);
-                            break;
+                            eprintln!(
+                                "[indexer] discovery getLogs factory {factory} [{lo},{hi}] failed: {e:#}"
+                            );
+                            blocked_sources[source_index] = true;
                         }
                     }
                 }
-                match failed {
-                    None => {
-                        let mut admission_failed = false;
-                        for discovered in found {
-                            match reg.add_factory_discovered_pool(&discovered).await {
-                                Ok(true) => {
-                                    println!(
-                                        "[indexer] auto-discovered pool {} (block {})",
-                                        discovered.pool, discovered.block
-                                    )
-                                }
-                                Ok(false) => {}
-                                Err(e) => {
-                                    eprintln!(
-                                        "[indexer] auto-discover add_pool {} failed: {e:#}",
-                                        discovered.pool
-                                    );
-                                    admission_failed = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if admission_failed {
-                            // Do not lose a canonical factory event merely
-                            // because one of the follow-up RPC checks failed.
-                            break;
-                        }
-                        lo = hi + 1;
-                    }
-                    Some(e) if hi > lo && is_getlogs_range_error(&e) => {
-                        // Window too large for this provider: shrink and retry
-                        // the same offset within this tick.
-                        rpc.shrink_getlogs_span(hi - lo + 1);
-                    }
-                    Some(e) => {
-                        eprintln!("[indexer] discovery getLogs [{lo},{hi}] failed: {e:#}");
-                        break; // leave `lo` here so we retry this range next tick
-                    }
+                if last_pending_retry.elapsed() >= retry_interval && !pending_admissions.is_empty()
+                {
+                    pending_admissions =
+                        attempt_factory_admissions(&reg, std::mem::take(&mut pending_admissions))
+                            .await;
+                    last_pending_retry = Instant::now();
+                }
+                if !scanned_any {
+                    break;
                 }
             }
-            from = next_factory_discovery_from(start_block, head, lo);
         }
         tokio::time::sleep(std::time::Duration::from_secs(poll_secs.max(1))).await;
+    }
+}
+
+async fn attempt_factory_admissions(
+    reg: &PoolRegistry,
+    requests: Vec<PendingFactoryAdmission>,
+) -> Vec<PendingFactoryAdmission> {
+    let mut remaining = Vec::new();
+    for mut request in requests {
+        match reg
+            .add_factory_discovered_pool(&request.discovered, true)
+            .await
+        {
+            Ok(true) => println!(
+                "[indexer] auto-discovered pool {} (block {})",
+                request.discovered.pool, request.discovered.block
+            ),
+            Ok(false) => {}
+            Err(e) => {
+                request.attempts = request.attempts.saturating_add(1);
+                if request.attempts == 1 {
+                    eprintln!(
+                        "[indexer] auto-discover admission {} failed; retained for retry: {e:#}",
+                        request.discovered.pool
+                    );
+                } else if request.attempts % 10 == 0 {
+                    eprintln!(
+                        "[indexer] auto-discover admission {} still pending (retry {})",
+                        request.discovered.pool, request.attempts
+                    );
+                }
+                remaining.push(request);
+            }
+        }
+    }
+    remaining
+}
+
+async fn factory_admission_retry_task(
+    reg: PoolRegistry,
+    mut pending: Vec<PendingFactoryAdmission>,
+    poll_secs: u64,
+) {
+    while !pending.is_empty() {
+        tokio::time::sleep(Duration::from_secs(poll_secs.max(1))).await;
+        pending = attempt_factory_admissions(&reg, pending).await;
     }
 }
 
@@ -4326,13 +4574,24 @@ async fn get_egress_metrics(State(reg): State<PoolRegistry>) -> Json<serde_json:
 }
 
 async fn healthz(State(reg): State<PoolRegistry>) -> Result<&'static str, (StatusCode, String)> {
-    let contexts: Vec<AppContext> = reg.pools.read().await.values().cloned().collect();
+    let pools = reg.pools.read().await;
+    let active: HashSet<String> = pools.keys().cloned().collect();
+    let missing = missing_required_pools(&reg.required_pools, &active);
+    if !missing.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("required pools missing: {}", missing.join(",")),
+        ));
+    }
+    let mut contexts: Vec<AppContext> = pools.values().cloned().collect();
+    drop(pools);
     if contexts.is_empty() && reg.require_pool {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "no required pool has been configured or discovered".to_owned(),
         ));
     }
+    contexts.sort_by(|a, b| a.contract_address.cmp(&b.contract_address));
     for ctx in contexts {
         require_serving_context(&ctx).await.map_err(|error| {
             (
@@ -4342,6 +4601,12 @@ async fn healthz(State(reg): State<PoolRegistry>) -> Result<&'static str, (Statu
         })?;
     }
     Ok("ok")
+}
+
+fn missing_required_pools(required: &HashSet<String>, active: &HashSet<String>) -> Vec<String> {
+    let mut missing: Vec<String> = required.difference(active).cloned().collect();
+    missing.sort();
+    missing
 }
 
 /// `GET /pools` — list the pools currently being watched, the primary pool, and any known
@@ -5063,6 +5328,8 @@ fn classify_selector(input: &[u8]) -> Option<&'static str> {
         [0x6d, 0xb7, 0x97, 0x4d] => Some("swap"), // initiateSwap (legacy commit-only)
         [0x8b, 0xbe, 0x82, 0x1a] => Some("swap"), // joinSwap (legacy commit-only)
         [0xc7, 0xec, 0xe1, 0x5f] => Some("swap"), // settle
+        [0xf0, 0xae, 0xbc, 0x43] => Some("swap"), // permit-gated initiateSwap v2
+        [0xd1, 0x12, 0x9e, 0x37] => Some("swap"), // per-order-fee settle v2
         _ => None,
     }
 }
@@ -5536,6 +5803,85 @@ struct SwapLegQuery {
     tx_hash: String,
 }
 
+const DEX_INITIATE_V2_SELECTOR: [u8; 4] = [0xf0, 0xae, 0xbc, 0x43];
+
+fn privacy_call_param_for_dex() -> ParamType {
+    ParamType::Tuple(vec![
+        ParamType::Bytes,
+        ParamType::FixedArray(Box::new(ParamType::Uint(256)), 8),
+    ])
+}
+
+fn order_ref_param_for_dex() -> ParamType {
+    ParamType::Tuple(vec![
+        ParamType::FixedBytes(32),
+        ParamType::Uint(256),
+        ParamType::Uint(256),
+    ])
+}
+
+/// Decode the new permit-gated initiate without duplicating PrivacyCall parsing. The first three
+/// arguments are unchanged; HTLC/rk/deadline/salt moved into the permit tuple. Repack those eight
+/// fields into the already-audited plan-A decoder after validating the full new ABI shape.
+fn decode_dex_initiate_calldata(calldata: &[u8]) -> Result<SwapInitiateCalldata, String> {
+    if calldata.len() < 4 || calldata[..4] != DEX_INITIATE_V2_SELECTOR {
+        return Err("bad permit-gated initiate selector".into());
+    }
+    let permit = ParamType::Tuple(vec![
+        ParamType::FixedBytes(32),
+        ParamType::Address,
+        ParamType::FixedBytes(32),
+        ParamType::FixedBytes(32),
+        ParamType::Uint(256),
+        ParamType::Uint(256),
+        ParamType::Uint(64),
+        ParamType::FixedBytes(32),
+        order_ref_param_for_dex(),
+        order_ref_param_for_dex(),
+        ParamType::Address,
+        ParamType::Uint(256),
+    ]);
+    let tokens = abi_decode(
+        &[
+            ParamType::Address,
+            ParamType::Address,
+            privacy_call_param_for_dex(),
+            permit,
+            ParamType::Bytes,
+        ],
+        &calldata[4..],
+    )
+    .map_err(|error| error.to_string())?;
+    let Token::Tuple(fields) = &tokens[3] else {
+        return Err("match permit is not a tuple".into());
+    };
+    if fields.len() != 12 {
+        return Err("match permit has the wrong field count".into());
+    }
+    let legacy_body = abi_encode(&[
+        tokens[0].clone(),
+        tokens[1].clone(),
+        tokens[2].clone(),
+        fields[3].clone(),
+        fields[4].clone(),
+        fields[5].clone(),
+        fields[6].clone(),
+        fields[7].clone(),
+    ]);
+    let mut legacy = Vec::with_capacity(4 + legacy_body.len());
+    legacy.extend_from_slice(&swap_initiate_selector());
+    legacy.extend_from_slice(&legacy_body);
+    decode_swap_initiate_calldata(&legacy).map_err(|error| error.to_string())
+}
+
+fn decode_any_swap_initiate(calldata: &[u8]) -> Result<SwapInitiateCalldata, String> {
+    if calldata.len() >= 4 && calldata[..4] == DEX_INITIATE_V2_SELECTOR {
+        decode_dex_initiate_calldata(calldata)
+    } else {
+        decode_swap_initiate_calldata(calldata).map_err(|error| error.to_string())
+    }
+}
+
 /// Decode a SwapCoordinator initiate/join tx: full leg from calldata + swap id / mining
 /// status from the receipt. The wallet MUST check `mined && tx_success` and that `swap_id`
 /// matches the swap it intends to join before trusting the decoded leg.
@@ -5560,8 +5906,8 @@ async fn get_swap_leg(
     }
 
     let mut out = serde_json::json!({ "tx_hash": tx_hash });
-    if input[..4] == swap_initiate_selector() {
-        let d = decode_swap_initiate_calldata(&input).map_err(|e| {
+    if input[..4] == swap_initiate_selector() || input[..4] == DEX_INITIATE_V2_SELECTOR {
+        let d = decode_any_swap_initiate(&input).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("initiate calldata decode: {e}"),
@@ -5756,7 +6102,7 @@ async fn get_swap(
     if q.include_calls.unwrap_or(true) {
         if let Some(tx) = initiate_tx {
             if let Ok(Some(input)) = rpc.get_transaction_input(&tx).await {
-                if let Ok(d) = decode_swap_initiate_calldata(&input) {
+                if let Ok(d) = decode_any_swap_initiate(&input) {
                     out["call_a"] =
                         serde_json::to_value(swap_call_json(&d.call_a)).unwrap_or_default();
                     out["commit_a_from_calldata"] = hex32_0x(&d.commit_a()).into();
@@ -13249,34 +13595,37 @@ mod tests {
     use k256::ecdsa::SigningKey;
 
     use super::{
-        advance_cursor, batch_page_end, beacon_words_match, bind_factory_discovery_source,
-        broadcasted_crank_attempts, build_and_sign_eip1559_tx, build_tip_frozen_paths,
-        canonical_guard, checkpoint_is_complete_finalized_boundary, classify_selector,
-        compact_note_mutations, confirmation_head_number, crank_gas_limit, crank_next_delay_secs,
+        advance_cursor, append_factory_pools_registry, batch_page_end, beacon_words_match,
+        bind_factory_discovery_source, broadcasted_crank_attempts, build_and_sign_eip1559_tx,
+        build_tip_frozen_paths, canonical_guard, checkpoint_is_complete_finalized_boundary,
+        classify_selector, compact_note_mutations, completed_admission_can_short_circuit,
+        confirmation_head_number, crank_gas_limit, crank_next_delay_secs,
         decode_frozen_root_updated_log, decode_json_note_archive, effective_pool_start_block,
         eip1559_crank_fees, eip1967_beacon_slot, encode_crank_root_calldata,
-        export_segment_frozen_paths, factory_log_matches, finalized_cursor_covers_block,
+        export_segment_frozen_paths, factory_discovery_from_registry_entry,
+        factory_discovery_source_is_trusted, factory_log_matches, finalized_cursor_covers_block,
         freeze_confirmed_prefix, frontier_from_leaves, frozen_count_after_delta,
         frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
-        is_public_merkle_path, is_public_txs, latest_upserted_note, next_factory_discovery_from,
-        nonempty_trimmed, normalize_hex_0x, parse_address_set, parse_bool_flag,
-        parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0, persist_request_is_current,
-        pg_append_cmx_leaves, pg_append_merkle_nodes, pg_apply_note_mutations,
-        pg_archive_seq_bound, pg_begin_canonical_rebuild, pg_bulk_upsert_notes,
-        pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
+        is_public_merkle_path, is_public_txs, latest_upserted_note, missing_required_pools,
+        next_factory_discovery_from, nonempty_trimmed, normalize_hex_0x, parse_address_set,
+        parse_bool_flag, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
+        persist_request_is_current, pg_append_cmx_leaves, pg_append_merkle_nodes,
+        pg_apply_note_mutations, pg_archive_seq_bound, pg_begin_canonical_rebuild,
+        pg_bulk_upsert_notes, pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
         pg_upgrade_legacy_compact_checkpoint, public_api_access, push_incremental_replay_mutation,
-        queue_pending_pool_admission, raw_tx_hash, replay_frozen_set, require_admin,
-        require_relayer, required_witness_nodes, rlp_bytes, rlp_list, rlp_uint, rpc_endpoint_label,
-        strip_0x, unix_seconds, validate_crank_journal_parent,
-        validate_crank_journal_signed_payloads, validate_log_against_canonical, witness_from_nodes,
-        witness_root_be, ApiAccess, ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli,
-        CompactFrontier, CrankTxAttempt, CrankTxJournal, EgressBudget, EthLog, FrozenPathRecord,
-        FrozenUpdate, HourlyTxBudget, IndexerCheckpoint, JsonNoteArchiveUpdate,
-        NoteArchiveMutation, PendingPoolAdmission, PendingRootUpdate, PublicApiMode,
-        RecentEventIds, RpcClient, StateBackend, StreamingFrontierBuilder, TipFreezeConfig,
-        TxListNote, DEFAULT_MAX_BATCHES_IN_MEMORY, FACTORY_DISCOVERY_RESCAN_BLOCKS,
-        MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS, MAX_TIP_FREEZE_PAGE_SIZE,
-        MAX_TIP_FREEZE_WORKERS,
+        queue_factory_discovery_range, queue_pending_pool_admission, raw_tx_hash,
+        replay_frozen_set, require_admin, require_relayer, required_witness_nodes, rlp_bytes,
+        rlp_list, rlp_uint, rpc_endpoint_label, strip_0x, unix_seconds,
+        validate_crank_journal_parent, validate_crank_journal_signed_payloads,
+        validate_log_against_canonical, witness_from_nodes, witness_root_be, ApiAccess,
+        ArchivedNoteRow, BatchEnvelope, CheckpointSnapshot, Cli, CompactFrontier, CrankTxAttempt,
+        CrankTxJournal, EgressBudget, EthLog, FrozenPathRecord, FrozenUpdate, HourlyTxBudget,
+        IndexerCheckpoint, JsonNoteArchiveUpdate, NoteArchiveMutation, PendingFactoryAdmission,
+        PendingPoolAdmission, PendingRootUpdate, PoolRegistryEntry, PoolsRegistryFile,
+        PublicApiMode, RecentEventIds, RpcClient, StateBackend, StreamingFrontierBuilder,
+        TipFreezeConfig, TxListNote, DEFAULT_MAX_BATCHES_IN_MEMORY,
+        FACTORY_DISCOVERY_RESCAN_BLOCKS, MAX_CRANK_GAS_MARGIN_BPS, MAX_RECENT_EVENT_IDS,
+        MAX_TIP_FREEZE_PAGE_SIZE, MAX_TIP_FREEZE_WORKERS,
     };
     use std::time::Instant;
 
@@ -14209,6 +14558,92 @@ mod tests {
     }
 
     #[test]
+    fn pool_registry_legacy_schema_remains_address_only() {
+        let raw = format!(
+            r#"{{"pools":[{{"address":"0x{}","start_block":77}}]}}"#,
+            "11".repeat(20)
+        );
+        let registry: PoolsRegistryFile = serde_json::from_str(&raw).unwrap();
+        let entry = &registry.pools[0];
+        assert_eq!(entry.start_block, 77);
+        assert_eq!(entry.factory, None);
+        assert_eq!(entry.topic0, None);
+        assert!(factory_discovery_from_registry_entry(entry, 77)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn factory_registry_provenance_requires_an_exact_trusted_source() {
+        let factory = format!("0x{}", "11".repeat(20));
+        let topic0 = format!("0x{}", "22".repeat(32));
+        let entry = PoolRegistryEntry {
+            address: format!("0x{}", "33".repeat(20)),
+            start_block: 88,
+            factory: Some(factory.clone()),
+            topic0: Some(topic0.clone()),
+        };
+        let discovered = factory_discovery_from_registry_entry(&entry, 88)
+            .unwrap()
+            .unwrap();
+        assert!(factory_discovery_source_is_trusted(
+            &discovered,
+            &[(factory.clone(), topic0.clone())]
+        ));
+        assert!(!factory_discovery_source_is_trusted(
+            &discovered,
+            &[(format!("0x{}", "44".repeat(20)), topic0)]
+        ));
+
+        let partial = PoolRegistryEntry {
+            topic0: None,
+            ..entry
+        };
+        assert!(factory_discovery_from_registry_entry(&partial, 88).is_err());
+    }
+
+    #[test]
+    fn factory_registry_persistence_is_idempotent_and_upgrades_legacy_entry() {
+        let path = std::env::temp_dir().join(format!(
+            "privacy-indexer-factory-registry-{}-{}.json",
+            std::process::id(),
+            unix_seconds()
+        ));
+        let path_string = path.to_string_lossy().to_string();
+        let pool = format!("0x{}", "Aa".repeat(20));
+        std::fs::write(
+            &path,
+            format!(r#"{{"pools":[{{"address":"{pool}","start_block":1}}]}}"#),
+        )
+        .unwrap();
+        let discovered = super::FactoryDiscoveredPool {
+            pool: pool.to_lowercase(),
+            block: 88,
+            factory: format!("0x{}", "11".repeat(20)),
+            topic0: format!("0x{}", "22".repeat(32)),
+        };
+
+        append_factory_pools_registry(&path_string, &discovered).unwrap();
+        let once = std::fs::read_to_string(&path).unwrap();
+        append_factory_pools_registry(&path_string, &discovered).unwrap();
+        let twice = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(once, twice);
+
+        let registry: PoolsRegistryFile = serde_json::from_str(&once).unwrap();
+        assert_eq!(registry.pools.len(), 1);
+        assert_eq!(registry.pools[0].start_block, 88);
+        assert_eq!(
+            registry.pools[0].factory.as_deref(),
+            Some(discovered.factory.as_str())
+        );
+        assert_eq!(
+            registry.pools[0].topic0.as_deref(),
+            Some(discovered.topic0.as_str())
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn failed_startup_pool_admissions_are_queued_once_for_retry() {
         let mut pending = Vec::new();
         queue_pending_pool_admission(&mut pending, "abcd", 101, "cli");
@@ -14224,6 +14659,14 @@ mod tests {
     }
 
     #[test]
+    fn generic_admission_short_circuits_only_after_active_verified_admission() {
+        assert!(completed_admission_can_short_circuit(true, true));
+        assert!(!completed_admission_can_short_circuit(true, false));
+        assert!(!completed_admission_can_short_circuit(false, true));
+        assert!(!completed_admission_can_short_circuit(false, false));
+    }
+
+    #[test]
     fn factory_discovery_retries_failed_ranges_and_rescans_a_bounded_tail() {
         let start = 500;
         let head = 1_000;
@@ -14233,6 +14676,68 @@ mod tests {
             head - (FACTORY_DISCOVERY_RESCAN_BLOCKS - 1)
         );
         assert_eq!(next_factory_discovery_from(900, head, head + 1), 900);
+    }
+
+    #[test]
+    fn factory_discovery_queues_every_event_before_advancing_the_source() {
+        let factory = format!("0x{}", "11".repeat(20));
+        let topic = format!("0x{}", "22".repeat(32));
+        let invalid = format!("0x{}", "33".repeat(20));
+        let later_valid = format!("0x{}", "44".repeat(20));
+        let mut pending = Vec::<PendingFactoryAdmission>::new();
+        let mut next_from = 100;
+
+        queue_factory_discovery_range(
+            &mut pending,
+            &factory,
+            &topic,
+            vec![(invalid.clone(), 101), (later_valid.clone(), 109)],
+            &mut next_from,
+            120,
+        );
+
+        assert_eq!(next_from, 121);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].discovered.pool, invalid);
+        assert_eq!(pending[1].discovered.pool, later_valid);
+
+        // A bounded-tail rescan must not duplicate retry work or discard the
+        // exact factory provenance captured by the first canonical event.
+        let duplicate = pending[0].discovered.pool.clone();
+        queue_factory_discovery_range(
+            &mut pending,
+            &factory,
+            &topic,
+            vec![(duplicate, 101)],
+            &mut next_from,
+            125,
+        );
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].attempts, 0);
+        assert_eq!(pending[0].discovered.factory, factory);
+        assert_eq!(next_from, 126);
+    }
+
+    #[test]
+    fn required_pool_health_reports_normalized_missing_addresses_deterministically() {
+        let required = parse_address_set(
+            "test",
+            &[
+                format!("0x{}", "bb".repeat(20)),
+                format!("0x{}", "aa".repeat(20)),
+                format!("0x{}", "cc".repeat(20)),
+            ],
+        )
+        .unwrap();
+        let active = parse_address_set("test", &[format!("0x{}", "cc".repeat(20))]).unwrap();
+        assert_eq!(
+            missing_required_pools(&required, &active),
+            vec![
+                format!("0x{}", "aa".repeat(20)),
+                format!("0x{}", "bb".repeat(20)),
+            ]
+        );
+        assert!(missing_required_pools(&Default::default(), &active).is_empty());
     }
 
     #[test]
