@@ -5329,6 +5329,7 @@ fn classify_selector(input: &[u8]) -> Option<&'static str> {
         [0x8b, 0xbe, 0x82, 0x1a] => Some("swap"), // joinSwap (legacy commit-only)
         [0xc7, 0xec, 0xe1, 0x5f] => Some("swap"), // settle
         [0xf0, 0xae, 0xbc, 0x43] => Some("swap"), // permit-gated initiateSwap v2
+        [0x06, 0xb3, 0x7d, 0x49] => Some("swap"), // permit-gated initiateSwap + initiator sig
         [0xd1, 0x12, 0x9e, 0x37] => Some("swap"), // per-order-fee settle v2
         _ => None,
     }
@@ -5805,6 +5806,15 @@ struct SwapLegQuery {
 
 const DEX_INITIATE_V2_SELECTOR: [u8; 4] = [0xf0, 0xae, 0xbc, 0x43];
 
+/// `initiateSwap` once CON-01b appended the initiator's Baby JubJub Schnorr signature
+/// (`uint256[3]`) to the permit-gated shape above.
+///
+/// A missed selector here is not a cosmetic gap: the taker's plan-A data-availability gate reads
+/// the maker's leg back out of this transaction's calldata and REFUSES to join without it, so an
+/// unrecognised initiate strands a live swap until its deadline — with a `/swap/leg` 400 as the
+/// only clue, on a transaction that is sitting mined and successful on chain.
+const DEX_INITIATE_V3_SELECTOR: [u8; 4] = [0x06, 0xb3, 0x7d, 0x49];
+
 fn privacy_call_param_for_dex() -> ParamType {
     ParamType::Tuple(vec![
         ParamType::Bytes,
@@ -5824,9 +5834,16 @@ fn order_ref_param_for_dex() -> ParamType {
 /// arguments are unchanged; HTLC/rk/deadline/salt moved into the permit tuple. Repack those eight
 /// fields into the already-audited plan-A decoder after validating the full new ABI shape.
 fn decode_dex_initiate_calldata(calldata: &[u8]) -> Result<SwapInitiateCalldata, String> {
-    if calldata.len() < 4 || calldata[..4] != DEX_INITIATE_V2_SELECTOR {
+    if calldata.len() < 4 {
         return Err("bad permit-gated initiate selector".into());
     }
+    let with_initiator_sig = if calldata[..4] == DEX_INITIATE_V3_SELECTOR {
+        true
+    } else if calldata[..4] == DEX_INITIATE_V2_SELECTOR {
+        false
+    } else {
+        return Err("bad permit-gated initiate selector".into());
+    };
     let permit = ParamType::Tuple(vec![
         ParamType::FixedBytes(32),
         ParamType::Address,
@@ -5841,17 +5858,20 @@ fn decode_dex_initiate_calldata(calldata: &[u8]) -> Result<SwapInitiateCalldata,
         ParamType::Address,
         ParamType::Uint(256),
     ]);
-    let tokens = abi_decode(
-        &[
-            ParamType::Address,
-            ParamType::Address,
-            privacy_call_param_for_dex(),
-            permit,
-            ParamType::Bytes,
-        ],
-        &calldata[4..],
-    )
-    .map_err(|error| error.to_string())?;
+    let mut params = vec![
+        ParamType::Address,
+        ParamType::Address,
+        privacy_call_param_for_dex(),
+        permit,
+        ParamType::Bytes,
+    ];
+    if with_initiator_sig {
+        // Decoded but unused: the leg this endpoint serves comes from `callA`, and the signature
+        // is verified on-chain. It has to be named all the same, or the head is one word short of
+        // the real ABI shape and the whole decode is rejected.
+        params.push(ParamType::FixedArray(Box::new(ParamType::Uint(256)), 3));
+    }
+    let tokens = abi_decode(&params, &calldata[4..]).map_err(|error| error.to_string())?;
     let Token::Tuple(fields) = &tokens[3] else {
         return Err("match permit is not a tuple".into());
     };
@@ -5875,7 +5895,9 @@ fn decode_dex_initiate_calldata(calldata: &[u8]) -> Result<SwapInitiateCalldata,
 }
 
 fn decode_any_swap_initiate(calldata: &[u8]) -> Result<SwapInitiateCalldata, String> {
-    if calldata.len() >= 4 && calldata[..4] == DEX_INITIATE_V2_SELECTOR {
+    if calldata.len() >= 4
+        && (calldata[..4] == DEX_INITIATE_V2_SELECTOR || calldata[..4] == DEX_INITIATE_V3_SELECTOR)
+    {
         decode_dex_initiate_calldata(calldata)
     } else {
         decode_swap_initiate_calldata(calldata).map_err(|error| error.to_string())
@@ -5906,7 +5928,10 @@ async fn get_swap_leg(
     }
 
     let mut out = serde_json::json!({ "tx_hash": tx_hash });
-    if input[..4] == swap_initiate_selector() || input[..4] == DEX_INITIATE_V2_SELECTOR {
+    if input[..4] == swap_initiate_selector()
+        || input[..4] == DEX_INITIATE_V2_SELECTOR
+        || input[..4] == DEX_INITIATE_V3_SELECTOR
+    {
         let d = decode_any_swap_initiate(&input).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
