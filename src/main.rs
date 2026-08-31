@@ -3165,12 +3165,17 @@ fn word_to_u64(w: &[u8; 32]) -> u64 {
 const GAS_BPS_DENOMINATOR: u64 = 10_000;
 const MAX_CRANK_GAS_MARGIN_BPS: u64 = 1_000;
 
-fn crank_gas_limit(estimate: u64, margin_bps: u64, cap: u64) -> Result<u64> {
+/// The gas a crank tx needs once the margin is applied, BEFORE the cap.
+///
+/// Split out of [`crank_gas_limit`] so the caller can log what the crank actually requires even
+/// when that is over the cap. The over-cap refusal used to happen before the "[crank] … gas:"
+/// line was printed, so a cap merely sized too small stalled the crank with nothing in the log
+/// and no transaction on chain — the same failure shape that hid an undersized relayer settle
+/// cap. `PRIVACYBTC_INDEXER_CRANK_MAX_PROOFS_PER_TX` folds up to 4 RLC proofs into one
+/// `updateRoot`, so this cap is easy to outgrow without touching it.
+fn padded_crank_gas(estimate: u64, margin_bps: u64) -> Result<u64> {
     if estimate == 0 {
         return Err(anyhow!("crank gas estimate must be greater than zero"));
-    }
-    if cap == 0 {
-        return Err(anyhow!("crank gas cap must be greater than zero"));
     }
     if margin_bps > MAX_CRANK_GAS_MARGIN_BPS {
         return Err(anyhow!(
@@ -3184,10 +3189,20 @@ fn crank_gas_limit(estimate: u64, margin_bps: u64, cap: u64) -> Result<u64> {
         .checked_add(u128::from(GAS_BPS_DENOMINATOR - 1))
         .ok_or_else(|| anyhow!("crank gas margin calculation overflow"))?
         / u128::from(GAS_BPS_DENOMINATOR);
-    let padded = u64::try_from(padded).context("padded crank gas does not fit u64")?;
+    u64::try_from(padded).context("padded crank gas does not fit u64")
+}
+
+fn crank_gas_limit(estimate: u64, margin_bps: u64, cap: u64) -> Result<u64> {
+    if cap == 0 {
+        return Err(anyhow!("crank gas cap must be greater than zero"));
+    }
+    let padded = padded_crank_gas(estimate, margin_bps)?;
     if padded > cap {
         return Err(anyhow!(
-            "crank estimate {estimate} with {margin_bps}bps margin requires {padded} gas, above cap {cap}"
+            "crank estimate {estimate} with {margin_bps}bps margin requires {padded} gas, \
+             above cap {cap} (short by {shortfall}) — raise PRIVACYBTC_INDEXER_CRANK_GAS_LIMIT \
+             or lower PRIVACYBTC_INDEXER_CRANK_MAX_PROOFS_PER_TX",
+            shortfall = padded - cap
         ));
     }
     Ok(padded)
@@ -3887,11 +3902,15 @@ async fn submit_crank_tx(
         .estimate_gas(pool, calldata, Some(&from_hex))
         .await
         .with_context(|| format!("{what} gas estimation failed; refusing fixed-limit fallback"))?;
-    let gas_limit = crank_gas_limit(estimated_gas, cfg.gas_margin_bps, cfg.gas_limit_cap)?;
+    // Print BEFORE enforcing the cap: `crank_gas_limit` returns an error on an over-cap
+    // estimate, so with the println after it an undersized cap stalled the crank silently.
+    // `required` is the number to size PRIVACYBTC_INDEXER_CRANK_GAS_LIMIT against.
+    let required = padded_crank_gas(estimated_gas, cfg.gas_margin_bps)?;
     println!(
-        "[crank] {what} gas: estimate={estimated_gas} margin_bps={} signed_limit={gas_limit} cap={}",
+        "[crank] {what} gas: estimate={estimated_gas} margin_bps={} required={required} cap={}",
         cfg.gas_margin_bps, cfg.gas_limit_cap
     );
+    let gas_limit = crank_gas_limit(estimated_gas, cfg.gas_margin_bps, cfg.gas_limit_cap)?;
     let nonce = match cfg.tx_type {
         CrankTxType::Legacy => rpc.get_transaction_count(&from_hex).await?,
         CrankTxType::Eip1559 => rpc.get_pending_transaction_count(&from_hex).await?,
@@ -13633,7 +13652,8 @@ mod tests {
         frozen_root_updated_topic0, getlogs_window_end, is_getlogs_range_error,
         is_public_merkle_path, is_public_txs, latest_upserted_note, missing_required_pools,
         next_factory_discovery_from, nonempty_trimmed, normalize_hex_0x, parse_address_set,
-        parse_bool_flag, parse_bytes32_strict, parse_tx_meta, perc20_deployed_topic0,
+        padded_crank_gas, parse_bool_flag, parse_bytes32_strict, parse_tx_meta,
+        perc20_deployed_topic0,
         persist_request_is_current, pg_append_cmx_leaves, pg_append_merkle_nodes,
         pg_apply_note_mutations, pg_archive_seq_bound, pg_begin_canonical_rebuild,
         pg_bulk_upsert_notes, pg_commit_incremental_replay, pg_finish_canonical_rebuild, pg_load,
@@ -14292,6 +14312,30 @@ mod tests {
             .contains("above cap"));
         assert!(crank_gas_limit(1_000_000, MAX_CRANK_GAS_MARGIN_BPS + 1, 2_000_000).is_err());
         assert!(crank_gas_limit(u64::MAX, 200, u64::MAX).is_err());
+    }
+
+    /// An over-cap crank must name the settings to change and the exact shortfall. Without
+    /// that the crank simply stops folding pending commitments and says nothing useful.
+    #[test]
+    fn crank_over_cap_refusal_names_the_settings_and_the_shortfall() {
+        let error = crank_gas_limit(4_000_000, 200, 4_000_000).unwrap_err().to_string();
+        assert!(error.contains("PRIVACYBTC_INDEXER_CRANK_GAS_LIMIT"), "{error}");
+        assert!(error.contains("PRIVACYBTC_INDEXER_CRANK_MAX_PROOFS_PER_TX"), "{error}");
+        assert!(error.contains("short by 80000"), "{error}");
+    }
+
+    /// `padded_crank_gas` is what the pre-cap log line prints, so it must agree with
+    /// `crank_gas_limit` whenever the cap is not the binding constraint.
+    #[test]
+    fn padded_crank_gas_matches_the_capped_result_under_the_cap() {
+        assert_eq!(padded_crank_gas(1_665_014, 200).unwrap(), 1_698_315);
+        assert_eq!(
+            padded_crank_gas(1_665_014, 200).unwrap(),
+            crank_gas_limit(1_665_014, 200, 2_000_000).unwrap()
+        );
+        // Over the cap the log still has a number to show; only the enforcing call errors.
+        assert_eq!(padded_crank_gas(4_000_000, 200).unwrap(), 4_080_000);
+        assert!(crank_gas_limit(4_000_000, 200, 4_000_000).is_err());
     }
 
     #[test]
