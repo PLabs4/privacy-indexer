@@ -1167,6 +1167,12 @@ struct PoolRegistry {
     /// amount + unshield recipient), derived from immutable calldata. Cached forever;
     /// populated lazily when `/txs` classifies a page.
     tx_meta: Arc<RwLock<HashMap<String, TxMeta>>>,
+    /// SettlementExecuted blinds keyed by tx hash (lowercase 0x). Used by `/note/by_nf`
+    /// for §4.2 deterministic recovery (docs/dex-stateful-offer-note-design.md).
+    /// Values include pool roles so local action_index can map to global settle slot j∈0..5 (audit B2).
+    settlement_blinds: Arc<RwLock<HashMap<String, SettlementBlindsRecord>>>,
+    /// Optional JSON sidecar for durable blinds across restarts (`STATE_FILE.settlement_blinds.json`).
+    settlement_blinds_path: Option<String>,
     /// Bearer token required by admin-only write endpoints such as POST /frozen.
     admin_token: Option<Arc<str>>,
     /// Separate token used only by the relayer to wake receipt recovery.
@@ -2308,6 +2314,72 @@ fn fee_charged_topic0_hex() -> String {
     )
 }
 
+/// `DexSettlement.SettlementExecuted(address indexed poolX, address indexed poolY, address feePool, uint256 feeUnshieldTotal, uint256[6] blinds)`
+fn settlement_executed_topic0_hex() -> String {
+    format!(
+        "0x{}",
+        hex::encode(Keccak256::digest(
+            b"SettlementExecuted(address,address,address,uint256,uint256[6])"
+        ))
+    )
+}
+
+struct DecodedSettlementExecutedBlinds {
+    blinds: Vec<String>,
+    pool_x: String,
+    pool_y: String,
+    fee_pool: String,
+    fee_unshield_total: String,
+}
+
+fn decode_settlement_executed_blinds(
+    topics: &[String],
+    data: &str,
+) -> Result<DecodedSettlementExecutedBlinds> {
+    if topics.len() < 3 {
+        return Err(anyhow!("SettlementExecuted needs 3 topics"));
+    }
+    let raw = hex::decode(strip_0x(data)).context("SettlementExecuted data hex")?;
+    // feePool(32) + feeUnshieldTotal(32) + blinds(6*32) = 256
+    if raw.len() < 256 {
+        return Err(anyhow!(
+            "SettlementExecuted data too short: {} bytes",
+            raw.len()
+        ));
+    }
+    let addr_word = |w: &[u8]| -> String {
+        format!("0x{}", hex::encode(&w[12..32]))
+    };
+    let fee_pool = addr_word(&raw[0..32]);
+    let fee_unshield_total = {
+        let mut n = 0u128;
+        for b in &raw[48..64] {
+            n = (n << 8) | u128::from(*b);
+        }
+        n.to_string()
+    };
+    let mut blinds = Vec::with_capacity(6);
+    for i in 0..6 {
+        let start = 64 + i * 32;
+        blinds.push(format!("0x{}", hex::encode(&raw[start..start + 32])));
+    }
+    let topic_addr = |t: &str| -> String {
+        let h = strip_0x(t);
+        if h.len() >= 40 {
+            format!("0x{}", &h[h.len() - 40..].to_ascii_lowercase())
+        } else {
+            format!("0x{}", h.to_ascii_lowercase())
+        }
+    };
+    Ok(DecodedSettlementExecutedBlinds {
+        blinds,
+        pool_x: topic_addr(&topics[1]),
+        pool_y: topic_addr(&topics[2]),
+        fee_pool,
+        fee_unshield_total,
+    })
+}
+
 struct DecodedFeeCharged {
     fee_units: u128,
     fee_wei: u128,
@@ -2690,6 +2762,8 @@ async fn main() -> Result<()> {
         metadata: Arc::new(RwLock::new(HashMap::new())),
         block_time: Arc::new(RwLock::new(HashMap::new())),
         tx_meta: Arc::new(RwLock::new(HashMap::new())),
+        settlement_blinds: Arc::new(RwLock::new(HashMap::new())),
+        settlement_blinds_path: cli.state_file.as_ref().map(|p| format!("{p}.settlement_blinds.json")),
         admin_token: std::env::var("PRIVACYBTC_INDEXER_ADMIN_TOKEN")
             .ok()
             .map(|s| s.trim().to_owned())
@@ -2719,6 +2793,11 @@ async fn main() -> Result<()> {
         history_read_semaphore: Arc::new(Semaphore::new(HISTORY_READ_CONCURRENCY)),
         system_stats_cache: Arc::new(Mutex::new(None)),
     };
+    if let Some(path) = registry.settlement_blinds_path.clone() {
+        if let Err(e) = load_settlement_blinds_file(&registry, &path).await {
+            eprintln!("[settlement_blinds] load {path}: {e:#}");
+        }
+    }
     registry.validate_trust_roots().await?;
 
     let mut pending_pool_admissions = Vec::new();
@@ -2870,6 +2949,8 @@ async fn main() -> Result<()> {
         .route("/root", get(get_root))
         .route("/merkle_path", get(get_merkle_path))
         .route("/note", get(get_note))
+        .route("/note/by_nf", get(get_note_by_nf))
+        .route("/settlement/blinds", post(post_settlement_blinds).get(get_settlement_blinds))
         .route("/tx", get(get_tx))
         .route("/txs", get(get_txs))
         .route("/swap", get(get_swap))
@@ -5188,6 +5269,396 @@ async fn get_note(
     // A cursor mismatch may be detected while the archive query is in flight.
     require_canonical_context(&ctx).await?;
     Ok(Json(note))
+}
+
+#[derive(Debug, Deserialize)]
+struct NoteByNfQuery {
+    /// Nullifier of a spent note (`nf_old` on outputs of the spending tx).
+    nf: String,
+    /// Contract address of the pool to query. Omit to use the primary pool.
+    pool: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct NoteByNfOutput {
+    pool: String,
+    cmx_hex: String,
+    nf_old_hex: String,
+    enc_ciphertext_hex: String,
+    /// Settlement `blind` when present (DexSettlement / settle envelope). Null for ordinary transfers.
+    blind: Option<String>,
+    /// Pool-local action index within this pool's PrivacyCall.
+    action_index: usize,
+    /// Global settle slot j∈0..5 when blinds map is known (audit B2). Null otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settle_slot: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct NoteByNfResponse {
+    tx_hash: String,
+    outputs: Vec<NoteByNfOutput>,
+}
+
+/// Point lookup: nf → spending transaction + all output slots (docs/dex-stateful-offer-note-design.md §4.2 #4).
+///
+/// In Orchard layout, spending note N emits outputs whose `nf_old` equals N's nullifier.
+/// Blinds are filled when the indexer has ingested a settlement envelope; otherwise `null`
+/// (ordinary transfers and pre-vnote settlements).
+async fn get_note_by_nf(
+    State(reg): State<PoolRegistry>,
+    Query(q): Query<NoteByNfQuery>,
+) -> Result<Json<NoteByNfResponse>, (StatusCode, String)> {
+    let ctx = reg.resolve(q.pool.as_deref()).await?;
+    let nf = parse_hex32(&q.nf)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid nf hex".to_owned()))?;
+    let pool_lc = ctx.contract_address.to_lowercase();
+
+    let mut hit_tx: Option<String> = None;
+    let mut outputs: Vec<NoteByNfOutput> = Vec::new();
+
+    {
+        let s = ctx.state.read().await;
+        canonical_guard(s.tree_out_of_order)?;
+        for batch in s.batches.iter().rev() {
+            for (action_index, note) in batch.batch.abi_notes.iter().enumerate() {
+                if note.nf_old == nf {
+                    hit_tx = Some(note.tx_hash.clone());
+                    break;
+                }
+                let _ = action_index;
+            }
+            if hit_tx.is_some() {
+                break;
+            }
+        }
+        if let Some(ref tx) = hit_tx {
+            let want = normalize_hex_0x(tx).to_lowercase();
+            let mut idx = 0usize;
+            for batch in s.batches.iter() {
+                for note in &batch.batch.abi_notes {
+                    if normalize_hex_0x(&note.tx_hash).to_lowercase() == want {
+                        outputs.push(NoteByNfOutput {
+                            pool: pool_lc.clone(),
+                            cmx_hex: format!("0x{}", hex::encode(note.cmx)),
+                            nf_old_hex: format!("0x{}", hex::encode(note.nf_old)),
+                            enc_ciphertext_hex: format!("0x{}", hex::encode(&note.enc_ciphertext)),
+                            blind: None,
+                            action_index: idx,
+                            settle_slot: None,
+                        });
+                        idx += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if hit_tx.is_none() {
+        // Archive: primary-key style lookup on nf_old (same posture as /note by cmx).
+        if let Some(note) = ctx
+            .backend
+            .load_note_by_nf_old(&ctx.contract_address, None, nf)
+            .await
+        {
+            let tx = note.tx_hash.clone();
+            let notes = ctx
+                .backend
+                .load_notes_by_tx_hash(&ctx.contract_address, &tx)
+                .await;
+            if notes.is_empty() {
+                outputs.push(NoteByNfOutput {
+                    pool: pool_lc.clone(),
+                    cmx_hex: format!("0x{}", hex::encode(note.cmx)),
+                    nf_old_hex: format!("0x{}", hex::encode(note.nf_old)),
+                    enc_ciphertext_hex: format!("0x{}", hex::encode(&note.enc_ciphertext)),
+                    blind: None,
+                    action_index: 0,
+                    settle_slot: None,
+                });
+            } else {
+                for (idx, n) in notes.into_iter().enumerate() {
+                    outputs.push(NoteByNfOutput {
+                        pool: pool_lc.clone(),
+                        cmx_hex: format!("0x{}", hex::encode(n.cmx)),
+                        nf_old_hex: format!("0x{}", hex::encode(n.nf_old)),
+                        enc_ciphertext_hex: format!("0x{}", hex::encode(&n.enc_ciphertext)),
+                        blind: None,
+                        action_index: idx,
+                        settle_slot: None,
+                    });
+                }
+            }
+            hit_tx = Some(tx);
+        }
+    }
+
+    let tx_hash = hit_tx.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, "nf not found as nf_old of any indexed note".to_owned())
+    })?;
+    require_canonical_context(&ctx).await?;
+
+    // Attach settlement blinds when the settlement party (or event ingest) published them.
+    // Blinds are indexed by global settle slot j∈0..5 (audit B2), not pool-local action_index.
+    let blinds_rec = {
+        let key = normalize_hex_0x(&tx_hash).to_lowercase();
+        let map = reg.settlement_blinds.read().await;
+        map.get(&key).cloned()
+    };
+    if let Some(rec) = blinds_rec {
+        for output in &mut outputs {
+            if let Some(j) = settle_slot_for_pool(&output.pool, output.action_index, &rec) {
+                output.settle_slot = Some(j);
+                if let Some(b) = rec.blinds.get(j) {
+                    output.blind = Some(b.clone());
+                }
+            }
+        }
+    }
+
+    Ok(Json(NoteByNfResponse { tx_hash, outputs }))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SettlementBlindsRecord {
+    blinds: Vec<String>,
+    #[serde(default)]
+    pool_x: String,
+    #[serde(default)]
+    pool_y: String,
+    #[serde(default)]
+    fee_pool: String,
+}
+
+impl SettlementBlindsRecord {
+    fn from_blinds_only(blinds: Vec<String>) -> Self {
+        Self {
+            blinds,
+            pool_x: String::new(),
+            pool_y: String::new(),
+            fee_pool: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementBlindsBody {
+    tx_hash: String,
+    blinds: Vec<String>,
+    #[serde(default)]
+    pool_x: Option<String>,
+    #[serde(default)]
+    pool_y: Option<String>,
+    #[serde(default)]
+    fee_pool: Option<String>,
+}
+
+/// Map pool-local action_index → global settle slot j∈0..5 (audit B2).
+/// Pool X → 0..1, pool Y → 2..3, fee pool → 4..5.
+fn settle_slot_for_pool(pool: &str, action_index: usize, rec: &SettlementBlindsRecord) -> Option<usize> {
+    let p = pool.to_lowercase();
+    let x = rec.pool_x.to_lowercase();
+    let y = rec.pool_y.to_lowercase();
+    let f = rec.fee_pool.to_lowercase();
+    let base = if !x.is_empty() && p == x {
+        0usize
+    } else if !y.is_empty() && p == y {
+        2
+    } else if !f.is_empty() && p == f {
+        4
+    } else if x.is_empty() && y.is_empty() {
+        // Legacy records without pool roles — assume pool X (slots 0..1) only.
+        0
+    } else {
+        return None;
+    };
+    Some(base + action_index)
+}
+
+/// Publish blinds for a settlement tx so `/note/by_nf` can serve §4.2 recovery.
+/// Prefer [`get_settlement_blinds`] (receipt ingest) when the settlement tx is mined;
+/// this POST remains for operators / settlement-party push before logs are available.
+async fn load_settlement_blinds_file(reg: &PoolRegistry, path: &str) -> Result<()> {
+    let raw = match tokio::fs::read_to_string(path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut guard = reg.settlement_blinds.write().await;
+    // Prefer typed records; fall back to legacy `tx → blinds[]` maps.
+    if let Ok(map) = serde_json::from_str::<HashMap<String, SettlementBlindsRecord>>(&raw) {
+        for (k, v) in map {
+            guard.entry(k).or_insert(v);
+        }
+    } else if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<String>>>(&raw) {
+        for (k, v) in map {
+            guard
+                .entry(k)
+                .or_insert_with(|| SettlementBlindsRecord::from_blinds_only(v));
+        }
+    }
+    Ok(())
+}
+
+async fn persist_settlement_blinds(reg: &PoolRegistry) {
+    let Some(path) = reg.settlement_blinds_path.as_ref() else {
+        return;
+    };
+    let snapshot = {
+        let guard = reg.settlement_blinds.read().await;
+        guard.clone()
+    };
+    match serde_json::to_vec_pretty(&snapshot) {
+        Ok(bytes) => {
+            if let Err(e) = tokio::fs::write(path, bytes).await {
+                eprintln!("[settlement_blinds] persist {path}: {e}");
+            }
+        }
+        Err(e) => eprintln!("[settlement_blinds] serialize: {e}"),
+    }
+}
+
+async fn post_settlement_blinds(
+    State(reg): State<PoolRegistry>,
+    headers: HeaderMap,
+    Json(body): Json<SettlementBlindsBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Audit N5: unauthenticated pushes could poison the blinds for an arbitrary tx and break
+    // §4.2 recovery (DoS). Require the admin or relayer bearer. The GET ingest path stays
+    // public because it only mirrors the mined receipt's SettlementExecuted log.
+    if !bearer_matches(&headers, reg.admin_token.as_ref())
+        && !bearer_matches(&headers, reg.relayer_token.as_ref())
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "settlement blinds push requires admin or relayer bearer token".to_owned(),
+        ));
+    }
+    if body.blinds.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "blinds must be non-empty".to_owned()));
+    }
+    if body.blinds.len() > 32 {
+        return Err((StatusCode::BAD_REQUEST, "blinds list too long".to_owned()));
+    }
+    let key = normalize_hex_0x(&body.tx_hash).to_lowercase();
+    if key.len() < 66 {
+        return Err((StatusCode::BAD_REQUEST, "invalid tx_hash".to_owned()));
+    }
+    let rec = SettlementBlindsRecord {
+        blinds: body.blinds,
+        pool_x: body.pool_x.unwrap_or_default(),
+        pool_y: body.pool_y.unwrap_or_default(),
+        fee_pool: body.fee_pool.unwrap_or_default(),
+    };
+    reg.settlement_blinds.write().await.insert(key, rec);
+    persist_settlement_blinds(&reg).await;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct SettlementBlindsQuery {
+    /// Settlement transaction hash.
+    tx: String,
+    /// Optional DexSettlement address filter (lowercase 0x). When set, only matching logs count.
+    gateway: Option<String>,
+}
+
+/// Ingest `SettlementExecuted` blinds from a mined settlement receipt and cache them.
+async fn get_settlement_blinds(
+    State(reg): State<PoolRegistry>,
+    Query(q): Query<SettlementBlindsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let tx_hash = normalize_hex_0x(&q.tx).to_lowercase();
+    if parse_hex32(&tx_hash).is_none() {
+        return Err((StatusCode::BAD_REQUEST, "invalid tx hash".to_owned()));
+    }
+    // Cache hit — avoid a second receipt round-trip.
+    {
+        let map = reg.settlement_blinds.read().await;
+        if let Some(rec) = map.get(&tx_hash) {
+            return Ok(Json(serde_json::json!({
+                "tx_hash": tx_hash,
+                "blinds": rec.blinds,
+                "pool_x": rec.pool_x,
+                "pool_y": rec.pool_y,
+                "fee_pool": rec.fee_pool,
+                "source": "cache",
+            })));
+        }
+    }
+
+    let rpc = reg.builder.rpc.clone();
+    let receipt = rpc
+        .get_transaction_receipt_logs(&tx_hash)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("eth_getTransactionReceipt: {e:#}"),
+            )
+        })?
+        .ok_or((StatusCode::NOT_FOUND, "transaction receipt not found".to_owned()))?;
+
+    let want = settlement_executed_topic0_hex().to_lowercase();
+    let gateway_filter = q
+        .gateway
+        .as_deref()
+        .map(|g| normalize_hex_0x(g).to_lowercase());
+
+    let mut decoded: Option<DecodedSettlementExecutedBlinds> = None;
+    for log in &receipt.logs {
+        let Some(topics) = &log.topics else { continue };
+        let Some(t0) = topics.first() else { continue };
+        if t0.to_lowercase() != want {
+            continue;
+        }
+        if let Some(ref gw) = gateway_filter {
+            if normalize_hex_0x(&log.address).to_lowercase() != *gw {
+                continue;
+            }
+        }
+        match decode_settlement_executed_blinds(topics, &log.data) {
+            Ok(d) => {
+                decoded = Some(d);
+                break;
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("SettlementExecuted decode: {e:#}"),
+                ));
+            }
+        }
+    }
+    let Some(d) = decoded else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no SettlementExecuted log in receipt".to_owned(),
+        ));
+    };
+
+    let rec = SettlementBlindsRecord {
+        blinds: d.blinds.clone(),
+        pool_x: d.pool_x.clone(),
+        pool_y: d.pool_y.clone(),
+        fee_pool: d.fee_pool.clone(),
+    };
+    reg.settlement_blinds
+        .write()
+        .await
+        .insert(tx_hash.clone(), rec);
+    persist_settlement_blinds(&reg).await;
+
+    Ok(Json(serde_json::json!({
+        "tx_hash": tx_hash,
+        "blinds": d.blinds,
+        "pool_x": d.pool_x,
+        "pool_y": d.pool_y,
+        "fee_pool": d.fee_pool,
+        "fee_unshield_total": d.fee_unshield_total,
+        "source": "receipt",
+        "tx_success": receipt.success,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -7562,6 +8033,53 @@ impl StateBackend {
                     ))
                     .bind(pool_address)
                     .bind(hex::encode(cmx))
+                    .fetch_optional(pool)
+                    .await,
+                }
+                .ok()
+                .flatten();
+                row.and_then(note_row_into_note)
+            }
+        }
+    }
+
+    /// First archived note whose `nf_old` equals `nf` (spend locator for §4.2).
+    async fn load_note_by_nf_old(
+        &self,
+        pool_address: &str,
+        rebuild_generation: Option<&str>,
+        nf: [u8; 32],
+    ) -> Option<OrchardIndexedAbiNote> {
+        match self {
+            StateBackend::Json(Some(path)) => {
+                let path = match rebuild_generation {
+                    Some(_) => Self::json_rebuild_archive_path(path),
+                    None => Self::json_archive_path(path),
+                };
+                let raw = std::fs::read_to_string(path).ok()?;
+                decode_json_note_archive(&raw, pool_address)
+                    .into_iter()
+                    .find_map(|env| env.batch.abi_notes.into_iter().find(|note| note.nf_old == nf))
+            }
+            StateBackend::Json(None) => None,
+            StateBackend::Pgsql(pool) => {
+                let row: Option<NoteRow> = match rebuild_generation {
+                    Some(generation) => sqlx::query_as(&format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes_rebuild \
+                           WHERE pool_address=$1 AND rebuild_generation=$2 AND nf_old_hex=$3 \
+                           LIMIT 1"
+                    ))
+                    .bind(pool_address)
+                    .bind(generation)
+                    .bind(hex::encode(nf))
+                    .fetch_optional(pool)
+                    .await,
+                    None => sqlx::query_as(&format!(
+                        "SELECT {NOTE_SELECT_COLUMNS} FROM notes \
+                           WHERE pool_address=$1 AND nf_old_hex=$2 LIMIT 1"
+                    ))
+                    .bind(pool_address)
+                    .bind(hex::encode(nf))
                     .fetch_optional(pool)
                     .await,
                 }
