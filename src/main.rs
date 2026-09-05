@@ -12557,7 +12557,15 @@ const GETLOGS_DEFAULT_SPAN: u64 = 5_000;
 /// maximum block range", "block range is too large").
 fn is_getlogs_range_error(e: &anyhow::Error) -> bool {
     let s = format!("{e:#}").to_lowercase();
-    s.contains("block range")
+    // A mined tip can briefly be unavailable on the provider's log backend.
+    // "invalid block range params" is not evidence of a size cap: shrinking on
+    // it permanently poisoned the shared span down to one block and made every
+    // later full replay take days. Retry without advancing the cursor instead.
+    (s.contains("block range")
+        && ["up to", "maximum", "max ", "limit", "exceed", "too large", "at most"]
+            .iter()
+            .any(|qualifier| s.contains(qualifier))
+        && !s.contains("invalid block range"))
         || s.contains("range is too large")
         || s.contains("range too large")
         || s.contains("too many blocks")
@@ -16953,6 +16961,12 @@ mod tests {
         assert!(is_getlogs_range_error(&infura));
         let transport = anyhow::anyhow!("eth_getLogs send failed: connection refused");
         assert!(!is_getlogs_range_error(&transport));
+        let unavailable_tip = anyhow::anyhow!(
+            "eth_getLogs failed for [54334810, 54334810]: rpc error -32000: invalid block range params"
+        );
+        assert!(!is_getlogs_range_error(&unavailable_tip));
+        let too_large = anyhow::anyhow!("requested block range exceeds maximum allowed range");
+        assert!(is_getlogs_range_error(&too_large));
     }
 
     #[test]
