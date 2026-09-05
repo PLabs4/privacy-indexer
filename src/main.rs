@@ -1,4 +1,6 @@
 mod compact_tree;
+mod pool_verifier_sets;
+mod vnote;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -414,6 +416,9 @@ struct Cli {
     /// This is release-bound and therefore intentionally has no default.
     #[arg(long, env = "PRIVACYBTC_INDEXER_EXPECTED_VERIFIER_SET_ID")]
     expected_verifier_set_id: String,
+    /// JSON array of exact pool/verifier_set_id overrides; does not grant admission.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_VERIFIER_SET_OVERRIDES", default_value = "[]")]
+    verifier_set_overrides: String,
     /// Transaction envelope used by the crank signer. `legacy` preserves the
     /// current Monad path; Ethereum deployments must explicitly select `eip1559`.
     #[arg(
@@ -1277,6 +1282,7 @@ struct PoolAdmissionPolicy {
     implementation_codehashes: HashSet<String>,
     expected_protocol_version: u64,
     expected_verifier_set_id: [u8; 32],
+    verifier_set_overrides: pool_verifier_sets::PoolVerifierSets,
 }
 
 #[derive(Clone, Debug)]
@@ -1416,6 +1422,8 @@ impl PoolAdmissionPolicy {
                 "PRIVACYBTC_INDEXER_TRUSTED_IMPLEMENTATION_CODEHASHES",
                 &cli.trusted_implementation_codehash,
             )?,
+            verifier_set_overrides: pool_verifier_sets::PoolVerifierSets::from_json(&cli.verifier_set_overrides)
+                .context("PRIVACYBTC_INDEXER_VERIFIER_SET_OVERRIDES")?,
             expected_protocol_version: cli.expected_protocol_version,
             expected_verifier_set_id: parse_bytes32_strict(
                 "PRIVACYBTC_INDEXER_EXPECTED_VERIFIER_SET_ID",
@@ -1855,10 +1863,11 @@ impl PoolRegistry {
             .eth_call_word(pool_lc, eth_selector(b"verifierSetId()"))
             .await
             .with_context(|| format!("read verifierSetId() from pool {pool_lc}"))?;
-        if verifier_set_id != self.admission.expected_verifier_set_id {
+        let expected = self.admission.verifier_set_overrides.expected(pool_lc, &self.admission.expected_verifier_set_id);
+        if &verifier_set_id != expected {
             return Err(anyhow!(
                 "pool {pool_lc} verifierSetId mismatch: expected 0x{}, got 0x{}",
-                hex::encode(self.admission.expected_verifier_set_id),
+                hex::encode(expected),
                 hex::encode(verifier_set_id)
             ));
         }
@@ -2870,6 +2879,8 @@ async fn main() -> Result<()> {
         .route("/root", get(get_root))
         .route("/merkle_path", get(get_merkle_path))
         .route("/note", get(get_note))
+        .route("/note/by_nf", get(vnote::get_note_by_nf))
+        .route("/settlement/blinds", get(vnote::get_settlement_blinds))
         .route("/tx", get(get_tx))
         .route("/txs", get(get_txs))
         .route("/swap", get(get_swap))
@@ -4289,6 +4300,7 @@ fn public_api_access(
         && matches!(
             path,
             "/healthz" | "/merkle_path" | "/tx" | "/txs" | "/stats" | "/shield/stats"
+                | "/note/by_nf" | "/settlement/blinds"
         )
     {
         return ApiAccess::Allow;
@@ -12918,7 +12930,11 @@ impl RpcClient {
         let Some(r) = receipt else {
             return Ok(None);
         };
-        let success = r.status.as_deref().unwrap_or("0x1") == "0x1";
+        let success = match r.status.as_deref() {
+            Some("0x1") => true,
+            Some("0x0") => false,
+            _ => bail!("receipt has no valid transaction status"),
+        };
         let block_number = parse_hex_u64(&r.block_number).context("invalid receipt blockNumber")?;
         let block_hash =
             normalize_block_hash(&r.block_hash).context("invalid receipt blockHash")?;
