@@ -5311,6 +5311,8 @@ fn classify_selector(input: &[u8]) -> Option<&'static str> {
         return None;
     }
     match &input[0..4] {
+        // DexSettlement.settle: addresses and private calls, never a public amount at arg0.
+        [0xf3, 0x97, 0xfe, 0xf2] => Some("swap"),
         // Protocol 3 (Binding Groth16, PrivacyCall = (bytes,uint256[8])).
         [0x33, 0xb8, 0x54, 0xb0] => Some("shield"),
         [0x19, 0x52, 0xce, 0x65] => Some("unshield"),
@@ -14427,6 +14429,19 @@ mod tests {
             parse_tx_meta(&unshield).recipient,
             Some(format!("0x{}", "42".repeat(20)))
         );
+    }
+
+    #[test]
+    fn vnote_settlement_classifies_without_exposing_pool_addresses_as_amounts() {
+        let mut input = vec![0x42; 260];
+        input[..4].copy_from_slice(&[0xf3, 0x97, 0xfe, 0xf2]);
+        let meta = parse_tx_meta(&input);
+        assert_eq!(meta.op, Some("swap"));
+        assert!(meta.amount_hex.is_none());
+        assert!(meta.recipient.is_none());
+        assert!(meta.sender.is_none());
+        assert_eq!(classify_selector(&input[..3]), None);
+        assert_eq!(classify_selector(&[0xff, 0xff, 0xff, 0xff]), None);
     }
 
     /// The protocol-fee release changed `ERC20Shield.unshield`'s signature (it gained
