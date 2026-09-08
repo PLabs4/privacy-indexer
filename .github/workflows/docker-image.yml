@@ -1,7 +1,6 @@
-# Build and push the privacy-indexer image from the two deployment channels.
+# Build and push the privacy-indexer image only for tagged mainnet/testnet deployments.
 #
-# Production hosts then deploy with `docker compose pull && up -d` — no Rust
-# toolchain, reproducible rollbacks by immutable Stack Release (see perc20-deploy).
+# Deployment consumes immutable image digests through perc20-deploy.
 name: docker-image
 
 env:
@@ -9,40 +8,73 @@ env:
 
 on:
   push:
-    branches: [main, develop]
+    tags:
+      - 'stack-main-*'
+      - 'stack-develop-*'
   pull_request:
     branches: [main, develop]
   workflow_dispatch:
+    inputs:
+      deployment_tag:
+        description: Existing deployment tag (stack-main-* or stack-develop-*)
+        required: true
+        type: string
 
 concurrency:
-  group: docker-image-${{ github.ref_name }}-${{ github.sha }}
-  cancel-in-progress: false
+  group: docker-image-${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.deployment_tag) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  source:
+    if: github.event_name != 'pull_request' && !github.event.deleted
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      source_branch: ${{ steps.source.outputs.source_branch }}
+      source_commit: ${{ steps.source.outputs.source_commit }}
+      deployment_tag: ${{ steps.source.outputs.deployment_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and verify deployment tag
+        id: source
+        env:
+          DEPLOYMENT_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.deployment_tag || github.ref_name }}
+          EXPECTED_EVENT_COMMIT: ${{ github.event_name == 'push' && github.sha || '' }}
+        run: bash .github/scripts/resolve-deployment-tag.sh
+
   test:
+    needs: source
+    # PRs keep their existing tests; an invalid/deleted tag never starts tests.
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || needs.source.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.source_commit || github.sha }}
       - name: Test locked dependency graph
         run: cargo test --locked
 
   build-push:
-    needs: test
+    needs: [source, test]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    env:
+      PERC20_SOURCE_BRANCH: ${{ needs.source.outputs.source_branch }}
+      PERC20_SOURCE_COMMIT: ${{ needs.source.outputs.source_commit }}
+      PERC20_DEPLOYMENT_TAG: ${{ needs.source.outputs.deployment_tag }}
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Validate source channel
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$GITHUB_REF_NAME" == "main" || "$GITHUB_REF_NAME" == "develop" ]]
-
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PERC20_SOURCE_COMMIT }}
 
       - uses: docker/setup-buildx-action@v3
 
@@ -59,12 +91,13 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=raw,value=${{ github.ref_name }}-${{ github.sha }}
-            type=sha,format=long
+            type=raw,value=${{ env.PERC20_SOURCE_BRANCH }}-${{ env.PERC20_SOURCE_COMMIT }}
+            type=raw,value=sha-${{ env.PERC20_SOURCE_COMMIT }}
           labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ env.PERC20_SOURCE_COMMIT }}
             io.perc20.protocol=${{ env.PERC20_PROTOCOL_VERSION }}
-            io.perc20.source_branch=${{ github.ref_name }}
+            io.perc20.source_branch=${{ env.PERC20_SOURCE_BRANCH }}
+            io.perc20.deployment_tag=${{ env.PERC20_DEPLOYMENT_TAG }}
 
       - id: build
         uses: docker/build-push-action@v6
@@ -84,6 +117,7 @@ jobs:
       - name: Record immutable release input
         run: |
           echo "privacy-indexer=${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "source_branch=${GITHUB_REF_NAME}" >> "$GITHUB_STEP_SUMMARY"
-          echo "source_commit=${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          echo "source_branch=${PERC20_SOURCE_BRANCH}" >> "$GITHUB_STEP_SUMMARY"
+          echo "source_commit=${PERC20_SOURCE_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
+          echo "deployment_tag=${PERC20_DEPLOYMENT_TAG}" >> "$GITHUB_STEP_SUMMARY"
           echo "protocol=${PERC20_PROTOCOL_VERSION}" >> "$GITHUB_STEP_SUMMARY"
