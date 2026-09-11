@@ -5312,7 +5312,10 @@ fn classify_selector(input: &[u8]) -> Option<&'static str> {
     }
     match &input[0..4] {
         // DexSettlement.settle: addresses and private calls, never a public amount at arg0.
-        [0xf3, 0x97, 0xfe, 0xf2] => Some("swap"),
+        // "pex" (order-book match), NOT "swap" (Pons AMM / HTLC coordinator) — the web
+        // explorer keys its type label off this string and must agree with its own
+        // receipt-based classification of `SettlementExecuted`.
+        [0xf3, 0x97, 0xfe, 0xf2] => Some("pex"),
         // Protocol 3 (Binding Groth16, PrivacyCall = (bytes,uint256[8])).
         [0x33, 0xb8, 0x54, 0xb0] => Some("shield"),
         [0x19, 0x52, 0xce, 0x65] => Some("unshield"),
@@ -5373,7 +5376,7 @@ fn classify_selector(input: &[u8]) -> Option<&'static str> {
 /// unshield's recipient — are on-chain public, not part of the encrypted note.
 #[derive(Clone, Default)]
 struct TxMeta {
-    /// Op type ("shield"/"transfer"/"unshield"/"swap"), None if unrecognized.
+    /// Op type ("shield"/"transfer"/"unshield"/"swap"/"pex"), None if unrecognized.
     op: Option<&'static str>,
     /// Public amount as a 0x 32-byte hex word (client formats with pool decimals).
     /// Present for shield/mint/unshield/burn (arg0 `uint256`); None otherwise.
@@ -5381,7 +5384,7 @@ struct TxMeta {
     /// Public recipient (0x address) — unshield only (its arg1 `address`).
     recipient: Option<String>,
     /// Public sender (0x address = tx `from`) — the depositor/issuer for shield/mint.
-    /// None for private-source ops (unshield/burn/transfer/swap spend a hidden note).
+    /// None for private-source ops (unshield/burn/transfer/swap/pex spend a hidden note).
     sender: Option<String>,
 }
 
@@ -5482,7 +5485,7 @@ struct TxSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     block_time: Option<u64>,
     /// Op type from the tx's function selector ("shield"/"transfer"/"unshield"/
-    /// "swap"); omitted when unrecognized (client shows "unknown"). Public info.
+    /// "swap"/"pex"); omitted when unrecognized (client shows "unknown"). Public info.
     #[serde(skip_serializing_if = "Option::is_none")]
     tx_type: Option<String>,
     /// Public shield/unshield amount as a 0x 32-byte hex word — visible pre-decrypt
@@ -14436,7 +14439,7 @@ mod tests {
         let mut input = vec![0x42; 260];
         input[..4].copy_from_slice(&[0xf3, 0x97, 0xfe, 0xf2]);
         let meta = parse_tx_meta(&input);
-        assert_eq!(meta.op, Some("swap"));
+        assert_eq!(meta.op, Some("pex"));
         assert!(meta.amount_hex.is_none());
         assert!(meta.recipient.is_none());
         assert!(meta.sender.is_none());
