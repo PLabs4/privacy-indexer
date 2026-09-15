@@ -1,4 +1,6 @@
 mod amm;
+mod catalog_admission;
+mod asset_readiness;
 mod compact_tree;
 mod pool_verifier_sets;
 mod vnote;
@@ -1766,6 +1768,9 @@ impl PoolRegistry {
             }
             return Ok(false);
         }
+        if self.admission.is_launch_factory(&factory) {
+            catalog_admission::require(&address, "sync").map_err(|e|anyhow!(e))?;
+        }
         let start_block = effective_pool_start_block(discovered.block, self.default_start_block);
         let codehash = self.builder.rpc.runtime_codehash(&address).await?;
         if !self.admission.pool_codehashes.contains(&codehash) {
@@ -3051,6 +3056,7 @@ async fn main() -> Result<()> {
         .route("/settlement/blinds", get(vnote::get_settlement_blinds))
         .route("/amm/settlement/blinds", get(amm::get_amm_settlement_blinds))
         .route("/amm/pools", get(amm::get_amm_pools))
+        .route("/asset-readiness", get(asset_readiness::get_asset_readiness))
         .route("/tx", get(get_tx))
         .route("/txs", get(get_txs))
         .route("/swap", get(get_swap))
@@ -3726,7 +3732,7 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
                             journal.pool,
                             journal.attempts.len()
                         );
-                        match drive_crank_journal(&rpc, &cfg, &mut tx_budget, journal).await {
+                        match drive_crank_journal(&reg, &rpc, &cfg, &mut tx_budget, journal).await {
                             Ok(ok) => {
                                 println!(
                                     "[crank] recovered transaction reached terminal status={}",
@@ -3768,7 +3774,7 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
                             journal.pool,
                             journal.attempts.len()
                         );
-                        match drive_crank_journal(&rpc, &cfg, &mut tx_budget, journal).await {
+                        match drive_crank_journal(&reg, &rpc, &cfg, &mut tx_budget, journal).await {
                             Ok(ok) => println!(
                                 "[crank] recovered transaction reached terminal status={}",
                                 if ok { "confirmed" } else { "reverted" }
@@ -3795,6 +3801,13 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
         let pools: Vec<AppContext> = { reg.pools.read().await.values().cloned().collect() };
         for ctx in pools {
             let pool = ctx.contract_address.clone();
+            if !cfg.allowed_pools.contains(&pool.to_lowercase()) {
+                match catalog_admission::require(&pool.to_lowercase(), "rootConfirmation") {
+                    Ok(Some(ack)) if ack["chain_id"].as_u64() != Some(cfg.signer.chain_id) => continue,
+                    Err(_) => continue,
+                    _ => {}
+                }
+            }
             let label = pool[..10.min(pool.len())].to_string();
             if !cfg.allowed_pools.contains(&pool.to_lowercase())
                 && !(cfg.crank_launch_pools && reg.is_verified_launch_pool(&pool.to_lowercase()).await)
@@ -3836,6 +3849,7 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
             if chain_root == [0u8; 32] {
                 println!("[crank][{label}] legacy pool detected — submitting syncBatchModel()");
                 match submit_crank_tx(
+                    &reg,
                     &rpc,
                     &cfg,
                     &mut tx_budget,
@@ -3971,7 +3985,7 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
                     continue;
                 }
             };
-            match submit_crank_tx(&rpc, &cfg, &mut tx_budget, &pool, &calldata, method).await {
+            match submit_crank_tx(&reg, &rpc, &cfg, &mut tx_budget, &pool, &calldata, method).await {
                 Ok(true) => {
                     let final_input = inputs.last().expect("non-empty root update plan");
                     println!(
@@ -4081,10 +4095,21 @@ async fn prove_cmxconfirm(
     Ok(proof)
 }
 
+async fn ensure_crank_pool_admitted(reg: &PoolRegistry, cfg: &CrankConfig, pool: &str) -> Result<()> {
+    if cfg.allowed_pools.contains(&pool.to_lowercase()) { return Ok(()) }
+    if !cfg.crank_launch_pools || !reg.is_verified_launch_pool(pool).await || !reg.verify_pool_current(pool).await? {
+        return Err(anyhow!("dynamic crank provenance is no longer valid"));
+    }
+    let ack = catalog_admission::require(&pool.to_lowercase(), "rootConfirmation").map_err(|e|anyhow!(e))?;
+    if ack.as_ref().is_some_and(|a|a["chain_id"].as_u64()!=Some(cfg.signer.chain_id)) { return Err(anyhow!("catalog chain mismatch")); }
+    Ok(())
+}
+
 /// Simulate (`eth_call`), estimate and submit one crank transaction, then wait
 /// for its receipt. Estimation is mandatory: there is no fixed-limit fallback.
 /// `Ok(true)` = mined successfully, `Ok(false)` = reverted (simulation or on-chain).
 async fn submit_crank_tx(
+    reg: &PoolRegistry,
     rpc: &RpcClient,
     cfg: &CrankConfig,
     budget: &mut HourlyTxBudget,
@@ -4092,6 +4117,7 @@ async fn submit_crank_tx(
     calldata: &[u8],
     what: &str,
 ) -> Result<bool> {
+    ensure_crank_pool_admitted(reg, cfg, pool).await?;
     let from_hex = format!("0x{}", hex::encode(cfg.signer.address));
 
     // Dry-run first: a revert here costs nothing (vs. burning gas on-chain).
@@ -4116,6 +4142,7 @@ async fn submit_crank_tx(
         CrankTxType::Legacy => rpc.get_transaction_count(&from_hex).await?,
         CrankTxType::Eip1559 => rpc.get_pending_transaction_count(&from_hex).await?,
     };
+    ensure_crank_pool_admitted(reg, cfg, pool).await?;
     let (raw, dynamic_fees) = match cfg.tx_type {
         CrankTxType::Legacy => (
             build_and_sign_raw_tx(
@@ -4189,7 +4216,7 @@ async fn submit_crank_tx(
             }],
         };
         journal.save(path)?;
-        return drive_crank_journal(rpc, cfg, budget, journal).await;
+        return drive_crank_journal(reg, rpc, cfg, budget, journal).await;
     }
 
     if !budget.try_take(unix_seconds()) {
@@ -4198,6 +4225,7 @@ async fn submit_crank_tx(
             cfg.max_tx_per_hour
         ));
     }
+    ensure_crank_pool_admitted(reg, cfg, pool).await?;
     let tx_hash = rpc.send_raw_transaction(&raw).await?;
     println!("[crank] {what} submitted: {tx_hash}");
     wait_for_crank_receipt(rpc, &tx_hash, what, 90).await
@@ -4226,6 +4254,7 @@ async fn wait_for_crank_receipt(
 }
 
 async fn drive_crank_journal(
+    reg: &PoolRegistry,
     rpc: &RpcClient,
     cfg: &CrankConfig,
     budget: &mut HourlyTxBudget,
@@ -4235,12 +4264,6 @@ async fn drive_crank_journal(
         .tx_journal
         .as_deref()
         .ok_or_else(|| anyhow!("EIP-1559 crank has no durable journal path"))?;
-    if !cfg.allowed_pools.contains(&journal.pool.to_lowercase()) {
-        return Err(anyhow!(
-            "durable crank journal pool {} is not in the current allowlist",
-            journal.pool
-        ));
-    }
     validate_crank_journal_signed_payloads(&journal, &cfg.signer.signing_key)?;
     // A prepared-but-not-yet-broadcast attempt cannot have a receipt. Querying it here is
     // both wasted work and a liveness hazard: an RPC error would abort before the first
@@ -4253,6 +4276,7 @@ async fn drive_crank_journal(
     }
 
     loop {
+        ensure_crank_pool_admitted(reg, cfg, &journal.pool).await?;
         let attempt = journal
             .attempts
             .last()
@@ -4350,6 +4374,7 @@ async fn drive_crank_journal(
             ));
         }
         let calldata = hex::decode(strip_0x(&journal.calldata_hex))?;
+        ensure_crank_pool_admitted(reg, cfg, &journal.pool).await?;
         let replacement_raw = build_and_sign_eip1559_tx(
             journal.nonce,
             priority,
@@ -4490,7 +4515,7 @@ fn public_api_access(
         && matches!(
             path,
             "/healthz" | "/merkle_path" | "/tx" | "/txs" | "/stats" | "/shield/stats"
-                | "/note/by_nf" | "/settlement/blinds"
+                | "/note/by_nf" | "/settlement/blinds" | "/asset-readiness"
         )
     {
         return ApiAccess::Allow;
