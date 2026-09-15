@@ -56,7 +56,7 @@ fn settle_slot_for_pool(pool: &str, index: usize, record: &SettlementBlinds) -> 
     None
 }
 
-async fn confirmed_receipt(rpc: &RpcClient, hash: &str) -> Result<ReceiptWithLogs,ApiError> {
+pub(crate) async fn confirmed_receipt(rpc: &RpcClient, hash: &str) -> Result<ReceiptWithLogs,ApiError> {
     let receipt = rpc.get_transaction_receipt_logs(hash).await.map_err(|_|unavailable("receipt RPC unavailable"))?
         .ok_or_else(||unavailable("transaction receipt not available yet"))?;
     if !receipt.success { return Err(unavailable("spend transaction reverted")); }
@@ -137,6 +137,11 @@ pub(crate) async fn get_note_by_nf(State(reg):State<PoolRegistry>,Query(q):Query
     };
     let receipt = confirmed_receipt(&reg.builder.rpc,&tx).await?;
     let record = decode_blinds(&receipt,None).map_err(|_|unavailable("settlement event is malformed or ambiguous"))?;
+    // Privacy-AMM settlements (AmmSettlement.Settled) are a distinct venue: a spent order
+    // note is either settled there, settled on PEX, or self-redeemed by a plain transfer.
+    let amm = amm::decode_settled(&receipt, reg.amm_settlement.as_deref())
+        .map_err(|_|unavailable("AMM settlement event is malformed or ambiguous"))?;
+    if record.is_some() && amm.is_some() { return Err(unavailable("receipt carries both PEX and AMM settlement events")); }
     let note_topics = note_added_topic0_alternatives();
     let pool = ctx.contract_address.to_lowercase();
     let mut notes = Vec::new();
@@ -153,14 +158,22 @@ pub(crate) async fn get_note_by_nf(State(reg):State<PoolRegistry>,Query(q):Query
         let expected = if pool==record.fee_pool && (pool==record.pool_x || pool==record.pool_y) {4} else {2};
         if notes.len()!=expected { return Err(unavailable("settlement receipt has an incomplete output set")); }
     }
+    if let Some(amm) = &amm {
+        if notes.len()!=amm::expected_outputs(&pool,amm) { return Err(unavailable("AMM settlement receipt has an incomplete output set")); }
+    }
     let outputs = notes.into_iter().enumerate().map(|(i,(_,note))| -> Result<_,ApiError> {
-        let slot = match &record {Some(record)=>Some(settle_slot_for_pool(&pool,i,record).ok_or_else(||unavailable("settlement pool slot mapping failed"))?),None=>None};
+        let (slot,blind) = match (&record,&amm) {
+            (Some(record),_) => { let j = settle_slot_for_pool(&pool,i,record).ok_or_else(||unavailable("settlement pool slot mapping failed"))?; (Some(j),Some(record.blinds[j].clone())) }
+            (None,Some(amm)) => { let (j,b) = amm::slot_for_pool(&pool,i,amm).ok_or_else(||unavailable("AMM settlement pool slot mapping failed"))?; (Some(j),b) }
+            (None,None) => (None,None),
+        };
         Ok(serde_json::json!({"pool":pool,"cmx_hex":hex32_0x(&note.cmx),"nf_old_hex":hex32_0x(&note.nf_old),
-            "enc_ciphertext_hex":hex::encode(&note.enc_ciphertext),"action_index":i,"settle_slot":slot,
-            "blind":slot.and_then(|j|record.as_ref().map(|r|r.blinds[j].clone()))}))
+            "enc_ciphertext_hex":hex::encode(&note.enc_ciphertext),"action_index":i,"settle_slot":slot,"blind":blind}))
     }).collect::<Result<Vec<_>,_>>()?;
     require_canonical_context(&ctx).await?;
-    Ok(Json(serde_json::json!({"tx_hash":tx,"outputs":outputs,"settlement":record.is_some(),"canonical":true})))
+    let venue = if record.is_some() {"pex"} else if amm.is_some() {"amm"} else {"none"};
+    Ok(Json(serde_json::json!({"tx_hash":tx,"outputs":outputs,"settlement":record.is_some()||amm.is_some(),
+        "settlement_venue":venue,"amm":amm,"canonical":true})))
 }
 
 #[cfg(test)]

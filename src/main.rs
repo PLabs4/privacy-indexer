@@ -1,3 +1,4 @@
+mod amm;
 mod compact_tree;
 mod pool_verifier_sets;
 mod vnote;
@@ -395,6 +396,12 @@ struct Cli {
         value_delimiter = ','
     )]
     crank_allowed_pool: Vec<String>,
+    /// Also crank every pool admitted through a trusted `LaunchFactory` (privacy-AMM meme
+    /// pools). They are created permissionlessly, so they cannot be enumerated in
+    /// `--crank-allowed-pool` ahead of time; admission (clone binding + verifier set) is the
+    /// gate instead. Off by default.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_CRANK_LAUNCH_POOLS", default_value_t = false)]
+    crank_launch_pools: bool,
     /// Maximum signed crank transactions in any rolling one-hour window.
     #[arg(
         long,
@@ -516,6 +523,22 @@ struct Cli {
         value_delimiter = ','
     )]
     trusted_shield_factory: Vec<String>,
+    /// Trusted `LaunchFactory` addresses (privacy-AMM meme pools). Dynamic admission must be
+    /// proven by a `LaunchCreated` log from one of these factories, and the pool must be an
+    /// EIP-1167 clone of the factory's locked `implementation()`.
+    #[arg(
+        long,
+        env = "PRIVACYBTC_INDEXER_TRUSTED_LAUNCH_FACTORIES",
+        value_delimiter = ','
+    )]
+    trusted_launch_factory: Vec<String>,
+    /// `verifierSetId()` every Launch meme pool must report (their action verifier is the
+    /// `AmmDispatcher`, not the shared action verifier). Required when launch factories are set.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_LAUNCH_VERIFIER_SET_ID", default_value = "")]
+    launch_verifier_set_id: String,
+    /// `AmmSettlement` gateway whose `Settled` events `/amm/*` decodes by default.
+    #[arg(long, env = "PRIVACYBTC_INDEXER_AMM_SETTLEMENT", default_value = "")]
+    amm_settlement: String,
     /// Explicitly trusted standalone pools that are not factory-deployed.
     #[arg(
         long,
@@ -1154,6 +1177,8 @@ struct PoolRegistry {
     /// admission and must still pass the normal static/factory trust checks.
     required_pools: HashSet<String>,
     registry_file: Option<String>,
+    /// Default `AmmSettlement` gateway for `/amm/*` (lowercase 0x address).
+    amm_settlement: Option<String>,
     /// Global reviewed deployment floor used when a runtime registration omits
     /// its pool-specific start block.
     default_start_block: u64,
@@ -1276,6 +1301,10 @@ impl EgressBudget {
 struct PoolAdmissionPolicy {
     perc20_factories: HashSet<String>,
     shield_factories: HashSet<String>,
+    /// `LaunchFactory` addresses: pools are EIP-1167 clones (no beacon) and their
+    /// `verifierSetId()` is `launch_verifier_set_id`, never the shared default.
+    launch_factories: HashSet<String>,
+    launch_verifier_set_id: Option<[u8; 32]>,
     static_pools: HashSet<String>,
     factory_codehashes: HashSet<String>,
     pool_codehashes: HashSet<String>,
@@ -1285,10 +1314,26 @@ struct PoolAdmissionPolicy {
     verifier_set_overrides: pool_verifier_sets::PoolVerifierSets,
 }
 
+impl PoolAdmissionPolicy {
+    fn is_launch_factory(&self, factory: &str) -> bool {
+        self.launch_factories
+            .contains(&normalize_hex_0x(factory).to_lowercase())
+    }
+}
+
 #[derive(Clone, Debug)]
 enum PoolProvenance {
     Static,
     Factory(String),
+}
+
+impl PoolProvenance {
+    fn factory(&self) -> Option<&str> {
+        match self {
+            PoolProvenance::Static => None,
+            PoolProvenance::Factory(f) => Some(f.as_str()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1406,6 +1451,18 @@ impl PoolAdmissionPolicy {
                 "PRIVACYBTC_INDEXER_TRUSTED_SHIELD_FACTORIES",
                 &cli.trusted_shield_factory,
             )?,
+            launch_factories: addresses(
+                "PRIVACYBTC_INDEXER_TRUSTED_LAUNCH_FACTORIES",
+                &cli.trusted_launch_factory,
+            )?,
+            launch_verifier_set_id: if cli.launch_verifier_set_id.trim().is_empty() {
+                None
+            } else {
+                Some(parse_bytes32_strict(
+                    "PRIVACYBTC_INDEXER_LAUNCH_VERIFIER_SET_ID",
+                    &cli.launch_verifier_set_id,
+                )?)
+            },
             static_pools: addresses(
                 "PRIVACYBTC_INDEXER_TRUSTED_STATIC_POOLS",
                 &cli.trusted_static_pool,
@@ -1435,27 +1492,32 @@ impl PoolAdmissionPolicy {
                 "PRIVACYBTC_INDEXER_EXPECTED_PROTOCOL_VERSION must be 3 for Binding Groth16"
             ));
         }
-        if (!policy.perc20_factories.is_empty() || !policy.shield_factories.is_empty())
-            && policy.factory_codehashes.is_empty()
-        {
+        let any_factory = !policy.perc20_factories.is_empty()
+            || !policy.shield_factories.is_empty()
+            || !policy.launch_factories.is_empty();
+        if any_factory && policy.factory_codehashes.is_empty() {
             return Err(anyhow!(
                 "trusted factories require PRIVACYBTC_INDEXER_TRUSTED_FACTORY_CODEHASHES"
             ));
         }
-        if (!policy.perc20_factories.is_empty()
-            || !policy.shield_factories.is_empty()
-            || !policy.static_pools.is_empty())
-            && policy.pool_codehashes.is_empty()
-        {
+        if (any_factory || !policy.static_pools.is_empty()) && policy.pool_codehashes.is_empty() {
             return Err(anyhow!(
                 "trusted pools require PRIVACYBTC_INDEXER_TRUSTED_POOL_CODEHASHES"
             ));
         }
-        if (!policy.perc20_factories.is_empty() || !policy.shield_factories.is_empty())
-            && policy.implementation_codehashes.is_empty()
-        {
+        if any_factory && policy.implementation_codehashes.is_empty() {
             return Err(anyhow!(
                 "trusted factories require PRIVACYBTC_INDEXER_TRUSTED_IMPLEMENTATION_CODEHASHES"
+            ));
+        }
+        if !policy.launch_factories.is_empty() && policy.launch_verifier_set_id.is_none() {
+            return Err(anyhow!(
+                "trusted launch factories require PRIVACYBTC_INDEXER_LAUNCH_VERIFIER_SET_ID"
+            ));
+        }
+        if policy.launch_verifier_set_id == Some(policy.expected_verifier_set_id) {
+            return Err(anyhow!(
+                "PRIVACYBTC_INDEXER_LAUNCH_VERIFIER_SET_ID must differ from the shared verifier set (launch pools verify through AmmDispatcher)"
             ));
         }
         Ok(policy)
@@ -1470,7 +1532,22 @@ impl PoolAdmissionPolicy {
                     .iter()
                     .map(|f| (f.clone(), shield_pool_deployed_topic0())),
             )
+            .chain(
+                self.launch_factories
+                    .iter()
+                    .map(|f| (f.clone(), launch_created_topic0())),
+            )
             .collect()
+    }
+
+    /// Which `verifierSetId()` a pool must report given its provenance.
+    fn expected_verifier_set<'a>(&'a self, pool_lc: &str, factory: Option<&str>) -> &'a [u8; 32] {
+        match (factory, &self.launch_verifier_set_id) {
+            (Some(f), Some(id)) if self.is_launch_factory(f) => id,
+            _ => self
+                .verifier_set_overrides
+                .expected(pool_lc, &self.expected_verifier_set_id),
+        }
     }
 }
 
@@ -1493,6 +1570,60 @@ struct PoolMeta {
     symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     decimals: Option<u8>,
+    /// Present for privacy-AMM meme pools admitted through a trusted `LaunchFactory`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch: Option<LaunchMeta>,
+}
+
+/// `LaunchCreated(uint256 indexed poolId, address indexed memePool, address indexed creator,
+/// string name, string symbol, string metadataURI, bytes32 cmX0, bytes32 cmY0)`.
+#[derive(Clone, Debug, Serialize)]
+struct LaunchMeta {
+    factory: String,
+    creator: String,
+    metadata_uri: String,
+    cm_x0: String,
+    cm_y0: String,
+    block: u64,
+    tx_hash: String,
+}
+
+impl LaunchMeta {
+    fn decode(log: &EthLog, factory: &str) -> Option<Self> {
+        let topics = log.topics.as_ref()?;
+        if topics.len() != 4 {
+            return None;
+        }
+        let raw = hex::decode(strip_0x(&log.data)).ok()?;
+        let tokens = ethabi::decode(
+            &[
+                ethabi::ParamType::String,
+                ethabi::ParamType::String,
+                ethabi::ParamType::String,
+                ethabi::ParamType::FixedBytes(32),
+                ethabi::ParamType::FixedBytes(32),
+            ],
+            &raw,
+        )
+        .ok()?;
+        let metadata_uri = match tokens.get(2)? {
+            ethabi::Token::String(s) => s.clone(),
+            _ => return None,
+        };
+        let word = |i: usize| match tokens.get(i)? {
+            ethabi::Token::FixedBytes(b) if b.len() == 32 => Some(format!("0x{}", hex::encode(b))),
+            _ => None,
+        };
+        Some(LaunchMeta {
+            factory: normalize_hex_0x(factory).to_lowercase(),
+            creator: topic_to_address(&topics[3])?,
+            metadata_uri,
+            cm_x0: word(3)?,
+            cm_y0: word(4)?,
+            block: parse_hex_u64(&log.block_number).ok()?,
+            tx_hash: normalize_hex_0x(&log.transaction_hash).to_lowercase(),
+        })
+    }
 }
 
 impl PoolMeta {
@@ -1507,6 +1638,7 @@ impl PoolMeta {
             name: Some(d.name.clone()),
             symbol: Some(d.symbol.clone()),
             decimals: Some(d.decimals),
+            launch: None,
         }
     }
 
@@ -1519,6 +1651,7 @@ impl PoolMeta {
             name: None,
             symbol: None,
             decimals: None,
+            launch: None,
         }
     }
 
@@ -1556,6 +1689,7 @@ impl PoolMeta {
             name: Some(name),
             symbol: Some(symbol),
             decimals: Some(decimals),
+            launch: None,
         })
     }
 }
@@ -1567,6 +1701,7 @@ impl PoolRegistry {
             .perc20_factories
             .iter()
             .chain(self.admission.shield_factories.iter())
+            .chain(self.admission.launch_factories.iter())
         {
             let hash = self.builder.rpc.runtime_codehash(factory).await?;
             if !self.admission.factory_codehashes.contains(&hash) {
@@ -1648,21 +1783,12 @@ impl PoolRegistry {
                 "pool {address} no longer has its canonical trusted-factory deployment proof"
             ));
         }
-        if !self
-            .builder
-            .rpc
-            .pool_uses_factory_beacon(
-                &factory,
-                &address,
-                &self.admission.implementation_codehashes,
-            )
-            .await?
-        {
+        if !self.pool_bound_to_factory(&factory, &address).await? {
             return Err(anyhow!(
                 "pool {address} is not bound to the trusted factory beacon/current implementation"
             ));
         }
-        self.ensure_pool_protocol(&address).await?;
+        self.ensure_pool_protocol(&address, Some(&factory)).await?;
         self.verified_pools.write().await.insert(address.clone());
         self.verified_pool_provenance
             .write()
@@ -1741,7 +1867,7 @@ impl PoolRegistry {
         }
         let start_block = effective_pool_start_block(start_block, self.default_start_block);
         if let Some(provenance) = self.resolve_pool_provenance(pool_lc, start_block).await? {
-            self.ensure_pool_protocol(pool_lc).await?;
+            self.ensure_pool_protocol(pool_lc, provenance.factory()).await?;
             self.verified_pools
                 .write()
                 .await
@@ -1757,12 +1883,21 @@ impl PoolRegistry {
 
     /// Re-evaluate mutable trust facts (especially beacon implementation) without
     /// consulting the admission cache. The signer calls this before every crank.
+    /// True when this pool's *verified* provenance is a trusted `LaunchFactory`. Only the
+    /// cached verdict counts — an unresolved pool is not a launch pool, and the crank's own
+    /// `verify_pool_current` re-checks the clone binding before signing anything.
+    async fn is_verified_launch_pool(&self, pool_lc: &str) -> bool {
+        match self.verified_pool_provenance.read().await.get(pool_lc) {
+            Some(PoolProvenance::Factory(factory)) => self.admission.is_launch_factory(factory),
+            _ => false,
+        }
+    }
+
     async fn verify_pool_current(&self, pool_lc: &str) -> Result<bool> {
         let codehash = self.builder.rpc.runtime_codehash(pool_lc).await?;
         if !self.admission.pool_codehashes.contains(&codehash) {
             return Ok(false);
         }
-        self.ensure_pool_protocol(pool_lc).await?;
         let provenance = match self
             .verified_pool_provenance
             .read()
@@ -1785,18 +1920,29 @@ impl PoolRegistry {
                 }
             }
         };
+        self.ensure_pool_protocol(pool_lc, provenance.factory()).await?;
         match provenance {
             PoolProvenance::Static => Ok(true),
-            PoolProvenance::Factory(factory) => {
-                self.builder
-                    .rpc
-                    .pool_uses_factory_beacon(
-                        &factory,
-                        pool_lc,
-                        &self.admission.implementation_codehashes,
-                    )
-                    .await
-            }
+            PoolProvenance::Factory(factory) => self.pool_bound_to_factory(&factory, pool_lc).await,
+        }
+    }
+
+    /// Factory → pool binding proof. Beacon factories (PERC20 / Shield) pin the pool's
+    /// EIP-1967 beacon slot to the factory beacon and the beacon's implementation codehash;
+    /// `LaunchFactory` pools are EIP-1167 clones, so the pool's runtime code must be exactly
+    /// the minimal proxy for the factory's locked `implementation()` and that implementation's
+    /// codehash must be allow-listed. Both paths fail closed on any RPC error.
+    async fn pool_bound_to_factory(&self, factory: &str, pool_lc: &str) -> Result<bool> {
+        if self.admission.is_launch_factory(factory) {
+            self.builder
+                .rpc
+                .pool_is_factory_clone(factory, pool_lc, &self.admission.implementation_codehashes)
+                .await
+        } else {
+            self.builder
+                .rpc
+                .pool_uses_factory_beacon(factory, pool_lc, &self.admission.implementation_codehashes)
+                .await
         }
     }
 
@@ -1818,15 +1964,7 @@ impl PoolRegistry {
                 .rpc
                 .was_pool_deployed_by(&factory, pool_lc, &topic0, start_block)
                 .await?
-                && self
-                    .builder
-                    .rpc
-                    .pool_uses_factory_beacon(
-                        &factory,
-                        pool_lc,
-                        &self.admission.implementation_codehashes,
-                    )
-                    .await?
+                && self.pool_bound_to_factory(&factory, pool_lc).await?
             {
                 return Ok(Some(PoolProvenance::Factory(factory)));
             }
@@ -1837,7 +1975,7 @@ impl PoolRegistry {
     /// Bind every ingestion/crank target to the exact protocol/verifier set in
     /// the coordinated release. A codehash allowlist alone cannot distinguish a
     /// pool initialized with different immutable verifier addresses.
-    async fn ensure_pool_protocol(&self, pool_lc: &str) -> Result<()> {
+    async fn ensure_pool_protocol(&self, pool_lc: &str, factory: Option<&str>) -> Result<()> {
         let version_word = self
             .builder
             .rpc
@@ -1863,7 +2001,7 @@ impl PoolRegistry {
             .eth_call_word(pool_lc, eth_selector(b"verifierSetId()"))
             .await
             .with_context(|| format!("read verifierSetId() from pool {pool_lc}"))?;
-        let expected = self.admission.verifier_set_overrides.expected(pool_lc, &self.admission.expected_verifier_set_id);
+        let expected = self.admission.expected_verifier_set(pool_lc, factory);
         if &verifier_set_id != expected {
             return Err(anyhow!(
                 "pool {pool_lc} verifierSetId mismatch: expected 0x{}, got 0x{}",
@@ -1894,7 +2032,35 @@ impl PoolRegistry {
             .fetch_pool_metadata(pool_lc, start_block)
             .await
         {
-            Ok(Some(meta)) => {
+            Ok(Some(mut meta)) => {
+                // Launch meme pools: attach the trusted factory's `LaunchCreated` facts
+                // (creator, metadataURI, genesis commitments). Best-effort like the rest.
+                let launch_factory = self
+                    .verified_pool_provenance
+                    .read()
+                    .await
+                    .get(pool_lc)
+                    .and_then(|p| p.factory().map(str::to_owned))
+                    .filter(|f| self.admission.is_launch_factory(f));
+                if let Some(factory) = launch_factory {
+                    match self
+                        .builder
+                        .rpc
+                        .fetch_launch_created(&factory, pool_lc, start_block)
+                        .await
+                    {
+                        Ok(Some(launch)) => {
+                            meta.pool_type = "launch".to_string();
+                            meta.launch = Some(launch);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!("[indexer] launch metadata fetch for {pool_lc} failed: {e:#}");
+                            // Do not cache a half-populated record; retry on the next request.
+                            return Some(meta);
+                        }
+                    }
+                }
                 self.metadata
                     .write()
                     .await
@@ -2693,6 +2859,7 @@ async fn main() -> Result<()> {
             || !cli.required_pool.is_empty(),
         required_pools: parse_address_set("PRIVACYBTC_INDEXER_REQUIRED_POOLS", &cli.required_pool)?,
         registry_file: cli.pools_registry.clone(),
+        amm_settlement: amm_settlement_from_cli(&cli)?,
         default_start_block: cli.start_block,
         verified_pools: Arc::new(RwLock::new(HashSet::new())),
         verified_pool_provenance: Arc::new(RwLock::new(HashMap::new())),
@@ -2862,6 +3029,7 @@ async fn main() -> Result<()> {
                             "PRIVACYBTC_INDEXER_CRANK_ALLOWED_POOLS",
                             &cli.crank_allowed_pool,
                         )?,
+                        crank_launch_pools: cli.crank_launch_pools,
                         max_tx_per_hour: cli.crank_max_tx_per_hour,
                     },
                 ));
@@ -2881,6 +3049,8 @@ async fn main() -> Result<()> {
         .route("/note", get(get_note))
         .route("/note/by_nf", get(vnote::get_note_by_nf))
         .route("/settlement/blinds", get(vnote::get_settlement_blinds))
+        .route("/amm/settlement/blinds", get(amm::get_amm_settlement_blinds))
+        .route("/amm/pools", get(amm::get_amm_pools))
         .route("/tx", get(get_tx))
         .route("/txs", get(get_txs))
         .route("/swap", get(get_swap))
@@ -2930,6 +3100,21 @@ fn perc20_deployed_topic0() -> String {
 
 fn shield_pool_deployed_topic0() -> String {
     event_topic0(b"ShieldPoolDeployed(address,address,address,uint256)")
+}
+
+/// `LaunchFactory.LaunchCreated`. topic1 is `poolId = uint256(uint160(memePool))`, i.e. the
+/// same 32-byte word as the pool address topic, so the generic factory-log matcher applies.
+fn launch_created_topic0() -> String {
+    event_topic0(b"LaunchCreated(uint256,address,address,string,string,string,bytes32,bytes32)")
+}
+
+/// EIP-1167 minimal-proxy runtime code for `implementation` (45 bytes).
+fn eip1167_runtime_code(implementation: &[u8; 20]) -> Vec<u8> {
+    let mut code = Vec::with_capacity(45);
+    code.extend_from_slice(&hex::decode("363d3d373d3d3d363d73").expect("const"));
+    code.extend_from_slice(implementation);
+    code.extend_from_slice(&hex::decode("5af43d82803e903d91602b57fd5bf3").expect("const"));
+    code
 }
 
 /// topic0 of `FrozenRootUpdated(uint256 oldRoot, uint256 newRoot, uint256[] cmxChanged,
@@ -3234,6 +3419,9 @@ struct CrankConfig {
     replacement_after_secs: u64,
     max_replacements: u32,
     allowed_pools: HashSet<String>,
+    /// Extend `allowed_pools` with every pool whose verified provenance is a trusted
+    /// `LaunchFactory` (see `--crank-launch-pools`).
+    crank_launch_pools: bool,
     max_tx_per_hour: u64,
 }
 
@@ -3608,7 +3796,9 @@ async fn crank_task(reg: PoolRegistry, rpc: RpcClient, cfg: CrankConfig) {
         for ctx in pools {
             let pool = ctx.contract_address.clone();
             let label = pool[..10.min(pool.len())].to_string();
-            if !cfg.allowed_pools.contains(&pool.to_lowercase()) {
+            if !cfg.allowed_pools.contains(&pool.to_lowercase())
+                && !(cfg.crank_launch_pools && reg.is_verified_launch_pool(&pool.to_lowercase()).await)
+            {
                 continue;
             }
             if ctx.state.read().await.tree_out_of_order {
@@ -13097,6 +13287,52 @@ impl RpcClient {
     }
 
     /// Scan one trusted factory's canonical deployment event over [from, to].
+    /// The canonical `LaunchCreated` log a trusted `LaunchFactory` emitted for `pool`.
+    async fn fetch_launch_created(
+        &self,
+        factory: &str,
+        pool: &str,
+        start_block: u64,
+    ) -> Result<Option<LaunchMeta>> {
+        let topic0 = launch_created_topic0();
+        let (head, _) = self.confirmation_head().await?;
+        let mut lo = start_block;
+        while lo <= head {
+            let hi = getlogs_window_end(lo, head, self.getlogs_span());
+            let filter = serde_json::json!({
+                "fromBlock": format!("0x{lo:x}"),
+                "toBlock":   format!("0x{hi:x}"),
+                "address":   normalize_hex_0x(factory),
+                "topics":    [topic0.clone(), address_to_topic(pool)],
+            });
+            let logs: Vec<EthLog> = match self
+                .rpc_call("eth_getLogs", serde_json::json!([filter]))
+                .await
+            {
+                Ok(logs) => logs,
+                Err(error) if hi > lo && is_getlogs_range_error(&error) => {
+                    self.shrink_getlogs_span(hi - lo + 1);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("eth_getLogs (LaunchCreated) [{lo},{hi}] failed"))
+                }
+            };
+            self.validate_canonical_logs(&logs).await?;
+            for log in &logs {
+                if factory_log_matches(log, factory, &topic0, pool) {
+                    return Ok(LaunchMeta::decode(log, factory));
+                }
+            }
+            if hi == u64::MAX {
+                break;
+            }
+            lo = hi + 1;
+        }
+        Ok(None)
+    }
+
     async fn fetch_factory_deployed_pools(
         &self,
         from_block: u64,
@@ -13137,7 +13373,7 @@ impl RpcClient {
         Ok(out)
     }
 
-    async fn runtime_codehash(&self, address: &str) -> Result<String> {
+    async fn runtime_code(&self, address: &str) -> Result<Vec<u8>> {
         let code: String = self
             .rpc_call(
                 "eth_getCode",
@@ -13150,7 +13386,39 @@ impl RpcClient {
         if bytes.is_empty() {
             return Err(anyhow!("address {address} has no runtime code"));
         }
+        Ok(bytes)
+    }
+
+    async fn runtime_codehash(&self, address: &str) -> Result<String> {
+        let bytes = self.runtime_code(address).await?;
         Ok(format!("0x{}", hex::encode(Keccak256::digest(bytes))))
+    }
+
+    /// `LaunchFactory` binding: the pool's runtime code must be exactly the EIP-1167 minimal
+    /// proxy for the factory's locked `implementation()`, and that implementation's runtime
+    /// codehash must be allow-listed. There is no beacon, so nothing can be re-pointed later.
+    async fn pool_is_factory_clone(
+        &self,
+        factory: &str,
+        pool: &str,
+        allowed_implementation_codehashes: &HashSet<String>,
+    ) -> Result<bool> {
+        let implementation = self
+            .eth_call_word(factory, eth_selector(b"implementation()"))
+            .await
+            .with_context(|| format!("read implementation() from trusted launch factory {factory}"))?;
+        if implementation[..12].iter().any(|b| *b != 0) || !implementation[12..].iter().any(|b| *b != 0) {
+            return Ok(false);
+        }
+        let impl_addr: [u8; 20] = implementation[12..].try_into().expect("20-byte suffix");
+        let code = self.runtime_code(pool).await?;
+        if code != eip1167_runtime_code(&impl_addr) {
+            return Ok(false);
+        }
+        let hash = self
+            .runtime_codehash(&format!("0x{}", hex::encode(impl_addr)))
+            .await?;
+        Ok(allowed_implementation_codehashes.contains(&hash))
     }
 
     async fn was_pool_deployed_by(
@@ -13516,7 +13784,7 @@ struct ReceiptWithLogs {
     logs: Vec<EthLog>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct EthLog {
     /// Contract address that emitted this log.
     #[serde(default)]
@@ -13617,6 +13885,19 @@ fn validate_log_against_canonical(
         ));
     }
     Ok(())
+}
+
+fn amm_settlement_from_cli(cli: &Cli) -> Result<Option<String>> {
+    let raw = cli.amm_settlement.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if parse_address20(raw).is_none() {
+        return Err(anyhow!(
+            "PRIVACYBTC_INDEXER_AMM_SETTLEMENT must be a 20-byte hex address"
+        ));
+    }
+    Ok(Some(normalize_hex_0x(raw).to_lowercase()))
 }
 
 fn parse_bytes32_strict(name: &str, value: &str) -> Result<[u8; 32]> {
