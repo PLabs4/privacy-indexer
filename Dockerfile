@@ -2,6 +2,7 @@
 # ── Build stage ───────────────────────────────────────────────────────────────
 # Multi-arch OCI index digests verified from Docker Hub on 2026-07-30.
 FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
+ARG CARGO_BUILD_JOBS=2
 WORKDIR /app
 
 # Cache dependencies first: copy manifests, build a stub, then the real source.

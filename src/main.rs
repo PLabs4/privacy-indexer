@@ -13081,7 +13081,11 @@ impl RpcClient {
         let receipt: Option<Receipt> = self
             .rpc_call("eth_getTransactionReceipt", serde_json::json!([hash]))
             .await?;
-        Ok(receipt.map(|r| r.status.as_deref().unwrap_or("0x1") == "0x1"))
+        receipt.map(|r| match r.status.as_deref() {
+            Some("0x1") => Ok(true),
+            Some("0x0") => Ok(false),
+            _ => Err(anyhow!("receipt has no valid execution status")),
+        }).transpose()
     }
 
     /// Returns the raw EthLog entries from a mined transaction receipt.
@@ -13840,9 +13844,32 @@ struct JsonRpcError {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct JsonRpcResponse<T> {
+    // An explicit null is a valid pending receipt/transaction. Missing `result`
+    // remains malformed; Option<T> alone erases that distinction for T=Option<_>.
+    #[serde(default, deserialize_with = "present_rpc_result")]
     result: Option<T>,
     error: Option<JsonRpcError>,
+}
+
+fn present_rpc_result<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where D: serde::Deserializer<'de>, T: Deserialize<'de> {
+    T::deserialize(deserializer).map(Some)
+}
+
+#[test]
+fn rpc_response_preserves_pending_null_without_accepting_missing_results() {
+    let pending: JsonRpcResponse<Option<serde_json::Value>> = serde_json::from_str(r#"{"result":null}"#).unwrap();
+    assert!(matches!(pending.result, Some(None)));
+    let missing: JsonRpcResponse<Option<serde_json::Value>> = serde_json::from_str(r#"{}"#).unwrap();
+    assert!(missing.result.is_none());
+    let mined: JsonRpcResponse<Option<serde_json::Value>> = serde_json::from_str(r#"{"result":{"status":"0x1"}}"#).unwrap();
+    assert_eq!(mined.result.unwrap().unwrap()["status"], "0x1");
+    let failed: JsonRpcResponse<Option<serde_json::Value>> = serde_json::from_str(r#"{"error":{"code":-1,"message":"failed"}}"#).unwrap();
+    assert!(failed.result.is_none());
+    assert_eq!(failed.error.unwrap().code, -1);
+    assert!(serde_json::from_str::<JsonRpcResponse<String>>(r#"{"result":null}"#).is_err());
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
