@@ -270,18 +270,18 @@ impl Gate {
         }
         Ok(())
     }
-    fn load(&self, now: u64) -> Result<(Arc<Value>, String)> {
+    fn load(&self, now: u64, recovery: bool) -> Result<(Arc<Value>, String)> {
         let bytes = read(&self.snapshot)?;
         let mut s = self.state.lock().map_err(|_| "catalog lock poisoned")?;
         if s.encoded.as_ref() == Some(&bytes) {
             let e = s.envelope.as_ref().ok_or("empty catalog state")?;
-            if integer(&e["payload"], "expiresAt")? <= now {
+            if !recovery && integer(&e["payload"], "expiresAt")? <= now {
                 return Err("catalog expired".into());
             }
             return Ok((e.clone(), s.hash.clone().ok_or("missing catalog hash")?));
         }
         let e: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid catalog JSON")?;
-        self.verify(&e, now, false)?;
+        self.verify(&e, now, recovery)?;
         if let Some(old) = s.envelope.as_ref() {
             self.verify(old, now, true)?;
             let a = revision(&old["payload"])?;
@@ -343,7 +343,11 @@ impl Gate {
         Ok((e, h))
     }
     pub(crate) fn check(&self, pool: &str, operation: &str, now: u64) -> Result<Value> {
-        let (e, h) = self.load(now)?;
+        // Base recovery authority survives a lease outage. AMM intake and settlement
+        // still require fresh authority. On-chain pool/proof checks and gas budgets
+        // remain mandatory at each consumer; this never authorizes a new pool.
+        let recovery = matches!(operation, "sync" | "rootConfirmation" | "transfer");
+        let (e, h) = self.load(now, recovery)?;
         let p = &e["payload"];
         let a = p["assets"]
             .as_array()
@@ -353,7 +357,7 @@ impl Gate {
             .ok_or("asset is not service-admitted")?;
         if !["sync", "rootConfirmation", "transfer", "ammTrade"].contains(&operation)
             || a["capabilities"][operation] != true
-            || integer(&a["readiness"], "validUntil")? <= now
+            || (!recovery && integer(&a["readiness"], "validUntil")? <= now)
         {
             return Err("asset capability unavailable".into());
         }
@@ -438,8 +442,13 @@ mod tests {
             "1"
         );
         assert!(gate.check(pool, "ammTrade", 1800000300).is_err());
+        for op in ["sync", "rootConfirmation", "transfer"] {
+            assert!(gate.check(pool, op, 1800010000).is_ok(), "expired base recovery: {op}");
+        }
+        assert!(gate.check("0x1111111111111111111111111111111111111111", "transfer", 1800010000).is_err());
         let gate = Gate::new(config, snapshot.clone(), checkpoint).unwrap();
-        assert!(gate.check(pool, "transfer", 1800000001).is_ok());
+        assert!(gate.check(pool, "transfer", 1800010000).is_ok());
+        assert!(gate.check(pool, "ammTrade", 1800010000).is_err());
         let mut corrupt = f["envelope"].clone();
         corrupt["payload"]["assets"][0]["symbol"] = json!("ATTACK");
         fs::write(&snapshot, serde_json::to_vec(&corrupt).unwrap()).unwrap();
@@ -447,6 +456,38 @@ mod tests {
             .check(pool, "transfer", 1800000001)
             .unwrap_err()
             .contains("signature"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn expired_recovery_rejects_newest_revocation_and_checkpoint_rollback() {
+        use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
+        let f = fixture();
+        let dir = std::env::temp_dir().join(format!("catalog-recovery-revoke-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let snapshot = dir.join("snapshot.json");
+        let checkpoint = dir.join("checkpoint.json");
+        let config: Config = serde_json::from_value(json!({"trust":f["trust"],"minimumRevision":"1"})).unwrap();
+        fs::write(&snapshot, serde_json::to_vec(&f["envelope"]).unwrap()).unwrap();
+        let gate = Gate::new(config, snapshot.clone(), checkpoint).unwrap();
+        let pool = f["envelope"]["payload"]["assets"][256]["pool"].as_str().unwrap();
+        assert!(gate.check(pool, "transfer", 1800010000).is_ok());
+        let mut revoked = f["envelope"].clone();
+        revoked["payload"]["revision"] = json!("2");
+        revoked["payload"]["previousHash"] = json!(hash(&f["envelope"]["payload"]).unwrap());
+        let a = &mut revoked["payload"]["assets"][256];
+        a["securityRevision"] = json!("2");
+        a["status"] = json!("recovery-only");
+        a["capabilities"] = json!({"sync":false,"rootConfirmation":false,"transfer":false,"ammTrade":false});
+        let mut key = [0u8;32]; key[31] = 1; // Public synthetic test key.
+        let signer = SigningKey::from_bytes((&key).into()).unwrap();
+        let mut msg = b"PERC20-ASSET-CATALOG-V1\nsynthetic-1\n".to_vec();
+        msg.extend(encoded(&revoked["payload"]).unwrap());
+        let sig: Signature = signer.sign_prehash(&Sha256::digest(msg)).unwrap();
+        revoked["signature"] = json!(format!("0x{}", hex::encode(sig.to_bytes())));
+        fs::write(&snapshot, serde_json::to_vec(&revoked).unwrap()).unwrap();
+        assert!(gate.check(pool, "transfer", 1800010000).unwrap_err().contains("unavailable"));
+        fs::write(&snapshot, serde_json::to_vec(&f["envelope"]).unwrap()).unwrap();
+        assert!(gate.check(pool, "transfer", 1800010000).unwrap_err().contains("rollback"));
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
